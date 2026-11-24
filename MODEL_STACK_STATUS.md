@@ -48,7 +48,7 @@ Florence-2 uses `trust_remote_code=True`. The exact revision is pinned for the s
 
 The first checkpoint smoke attempt on GitHub Actions reached actual Depth Anything V2 CPU inference successfully (8.366 seconds on the runner; output shape and finite-value checks passed). Florence-2 then failed during model construction under Transformers 4.57.6 because the pinned remote class did not define `_supports_sdpa`, which Transformers read while selecting SDPA attention.
 
-The Florence adapter now requests `attn_implementation="eager"` explicitly, following the fallback documented by Transformers 4.57.6 for architectures that do not implement SDPA. A unit regression test verifies the eager-attention option and pinned revision are passed to the loader. The updated real-checkpoint smoke job is running to validate the actual checkpoint with this change. Grounding DINO and SAM 2 have not yet been reached in a complete successful smoke run.
+The Florence adapter now requests `attn_implementation="eager"` explicitly, following the fallback documented by Transformers 4.57.6 for architectures that do not implement SDPA. A unit regression test verifies the eager-attention option and pinned revision are passed to the loader. The updated real-checkpoint smoke job is running to validate the actual checkpoint with this change. The smoke harness now records failures per stage and continues to Grounding DINO/SAM 2 even if Florence fails; the overall job still exits non-zero if any stage failed. The CPU-only GitHub Actions job installs CPU wheels rather than the default CUDA-enabled PyTorch distribution. Grounding DINO and SAM 2 have not yet been reached in a complete successful smoke run.
 
 ## Automated validation
 
