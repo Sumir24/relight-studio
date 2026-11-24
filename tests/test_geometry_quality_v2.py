@@ -83,6 +83,7 @@ def test_invalid_depth_pixels_receive_fallback_normals_and_zero_reliability():
     )
 
     assert np.all(reliability[4:8, 6:10] == 0.0)
+    assert reliability[3, 7] < reliability[2, 7]
     assert np.all(normals[4:8, 6:10] == np.array([0.0, 0.0, -1.0]))
     assert np.isfinite(normals).all()
 
