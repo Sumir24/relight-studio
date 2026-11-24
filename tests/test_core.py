@@ -170,3 +170,81 @@ if __name__ == '__main__':
                test_moving_point_light_moves_illumination_centroid, test_invalid_shapes_fail_fast]:
         fn()
         print('PASS', fn.__name__)
+
+
+
+def test_coloured_conductor_f0_changes_specular_reflection_tint():
+    scene, camera = make_plane()
+    scene.roughness[:] = 0.2
+    scene.metalness[:] = 1.0
+    p = backproject_depth(scene.depth, camera)
+    n, _ = estimate_normals(p, scene.depth, scene.depth_confidence)
+    rig = LightingRig(
+        (1, 1, 1), 0.0,
+        (Light("white_key", "directional", strength=1.0,
+               direction=(0.0, 0.0, -1.0), casts_shadows=False),),
+    )
+
+    scene.specular_color = np.zeros((*scene.shape, 3), dtype=np.float32)
+    scene.specular_color[:] = (0.82, 0.12, 0.08)
+    _, red_conductor, _ = evaluate_rig(
+        scene, camera, p, n, rig, EngineSettings()
+    )
+
+    scene.specular_color[:] = (0.08, 0.18, 0.88)
+    _, blue_conductor, _ = evaluate_rig(
+        scene, camera, p, n, rig, EngineSettings()
+    )
+
+    red_mean = np.mean(red_conductor, axis=(0, 1))
+    blue_mean = np.mean(blue_conductor, axis=(0, 1))
+    assert red_mean[0] > red_mean[2] * 4.0
+    assert blue_mean[2] > blue_mean[0] * 4.0
+
+
+def test_zero_material_confidence_blends_supplied_maps_to_declared_priors():
+    scene, camera = make_plane()
+    scene.roughness[:] = 0.12
+    scene.metalness[:] = 1.0
+    scene.specular_level[:] = 0.9
+    scene.specular_color = np.full((*scene.shape, 3), (0.9, 0.1, 0.1), dtype=np.float32)
+    scene.material_confidence = np.zeros(scene.shape, dtype=np.float32)
+
+    prior_scene, _ = make_plane()
+    p = backproject_depth(scene.depth, camera)
+    n, _ = estimate_normals(p, scene.depth, scene.depth_confidence)
+    rig = LightingRig(
+        (1, 1, 1), 0.0,
+        (Light("key", "directional", strength=1.0,
+               direction=(0.0, 0.0, -1.0), casts_shadows=False),),
+    )
+
+    supplied_diffuse, supplied_specular, _ = evaluate_rig(
+        scene, camera, p, n, rig, EngineSettings()
+    )
+    prior_diffuse, prior_specular, _ = evaluate_rig(
+        prior_scene, camera, p, n, rig, EngineSettings()
+    )
+
+    assert np.allclose(supplied_diffuse, prior_diffuse, atol=1e-7)
+    assert np.allclose(supplied_specular, prior_specular, atol=1e-7)
+
+
+def test_scene_contract_rejects_invalid_material_map_shapes_and_values():
+    scene, _ = make_plane()
+    scene.specular_color = np.zeros((*scene.shape, 4), dtype=np.float32)
+    try:
+        scene.validate()
+    except ValueError as exc:
+        assert "specular_color" in str(exc)
+    else:
+        raise AssertionError("Expected invalid RGB specular-colour map shape to fail.")
+
+    scene, _ = make_plane()
+    scene.material_confidence = np.full((3, 3), 0.5, dtype=np.float32)
+    try:
+        scene.validate()
+    except ValueError as exc:
+        assert "material_confidence" in str(exc)
+    else:
+        raise AssertionError("Expected invalid material-confidence shape to fail.")
