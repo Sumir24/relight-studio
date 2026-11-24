@@ -15,6 +15,9 @@ import time
 import urllib.request
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 import numpy as np
 import torch
 import transformers
@@ -31,8 +34,6 @@ FIXTURE_URL = (
     "resolve/main/transformers/tasks/car.jpg?download=true"
 )
 OUTPUT_PATH = Path("model_smoke_report.json")
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 
 
 def load_fixture() -> np.ndarray:
