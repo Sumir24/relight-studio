@@ -278,3 +278,74 @@ def test_model_adapters_accept_explicit_revision_configuration():
     assert florence.revision == revision
     assert segmentation.detector_revision == revision
     assert segmentation.segmenter_revision == revision
+
+
+
+def test_grounding_dino_postprocessing_receives_the_original_input_ids():
+    from contextlib import nullcontext
+
+    class Inputs(dict):
+        def to(self, _device):
+            return self
+
+    class Box:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def tolist(self):
+            return [1.0, 2.0, 7.0, 8.0]
+
+    class Score:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def item(self):
+            return 0.91
+
+    input_ids = object()
+    seen = {}
+
+    class Processor:
+        def __call__(self, **_kwargs):
+            return Inputs(input_ids=input_ids, pixel_values=object())
+
+        def post_process_grounded_object_detection(self, outputs, **kwargs):
+            seen["outputs"] = outputs
+            seen.update(kwargs)
+            return [{
+                "boxes": [Box()],
+                "scores": [Score()],
+                "text_labels": ["car"],
+            }]
+
+    class Model:
+        def __call__(self, **_kwargs):
+            return "detector-output"
+
+    adapter = HuggingFaceGroundedSAM2(device="cpu")
+    adapter._torch = SimpleNamespace(
+        inference_mode=lambda: nullcontext()
+    )
+    adapter._device = "cpu"
+    adapter._det_processor = Processor()
+    adapter._det_model = Model()
+
+    selected = adapter._detect_candidates(
+        pil_image=object(),
+        normalized_prompts=["car"],
+        height=10,
+        width=12,
+    )
+
+    assert seen["outputs"] == "detector-output"
+    assert seen["input_ids"] is input_ids
+    assert seen["target_sizes"] == [(10, 12)]
+    assert seen["threshold"] == adapter.box_threshold
+    assert seen["text_threshold"] == adapter.text_threshold
+    assert selected == [("car", 0.91, [1.0, 2.0, 7.0, 8.0])]
