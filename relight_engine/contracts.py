@@ -198,6 +198,7 @@ class EngineSettings:
     shadow_bias_relative: float = 0.003
     min_geometry_confidence: float = 0.15
     output_exposure: float = 1.0
+    edge_aware_base: bool = True
 
     def validate(self) -> None:
         numeric = {
@@ -227,6 +228,8 @@ class EngineSettings:
             raise ValueError('shadow_steps must be an integer >= 2.')
         if not 0 <= self.min_geometry_confidence <= 1:
             raise ValueError('min_geometry_confidence must be in [0,1].')
+        if not isinstance(self.edge_aware_base, bool):
+            raise ValueError('edge_aware_base must be a boolean.')
 
 
 @dataclass

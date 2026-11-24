@@ -4,10 +4,22 @@ from scipy.ndimage import gaussian_filter
 from .color import srgb_to_linear, linear_to_srgb, luminance
 from .contracts import SceneBuffers, EngineSettings
 
+def _edge_aware_log_base(log_y: np.ndarray, sigma: float, eps_guide: float = 0.02) -> np.ndarray:
+    """Self-guided filter in log-luminance space to suppress boundary halos."""
+    mean_i = gaussian_filter(log_y, sigma, mode='reflect')
+    mean_ii = gaussian_filter(log_y * log_y, sigma, mode='reflect')
+    var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+    a = var_i / (var_i + eps_guide)
+    b = (1.0 - a) * mean_i
+    mean_a = gaussian_filter(a, sigma, mode='reflect')
+    mean_b = gaussian_filter(b, sigma, mode='reflect')
+    return mean_a * log_y + mean_b
+
+
 def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
                               target_diffuse: np.ndarray, source_specular: np.ndarray,
                               target_specular: np.ndarray, geometry_confidence: np.ndarray,
-                              shadow_visibility: np.ndarray, settings: EngineSettings) -> tuple[np.ndarray, np.ndarray]:
+                              settings: EngineSettings) -> tuple[np.ndarray, np.ndarray]:
     src = srgb_to_linear(scene.rgb_srgb)
     eps = 1e-4
     # Use a luminance ratio for stable detail preservation; carry a restrained RGB chroma shift separately.
@@ -23,7 +35,11 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
 
     y = np.maximum(luminance(src), eps)
     log_y = np.log(y)
-    base = np.exp(gaussian_filter(log_y, settings.base_blur_sigma, mode='reflect'))
+    if settings.edge_aware_base:
+        log_base = _edge_aware_log_base(log_y, settings.base_blur_sigma)
+    else:
+        log_base = gaussian_filter(log_y, settings.base_blur_sigma, mode='reflect')
+    base = np.exp(log_base)
     detail = y - base
     y_relit = base * ratio + detail * np.power(ratio, settings.detail_power)
     y_relit = np.maximum(y_relit, eps)

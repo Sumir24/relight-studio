@@ -12,6 +12,7 @@ from .calibration import (
     kelvin_to_linear_rgb,
 )
 from .engine import relight
+from .scene_policy import semantic_key
 
 
 def source_calibration_from_dict(data: dict) -> SourceLightCalibration:
@@ -132,6 +133,31 @@ def load_scene_artifacts(scene_dir: str | Path) -> tuple[SceneBuffers, CameraMod
     return scene, camera, manifest, arrays
 
 
+def _resolve_mask_array(arrays: dict[str, np.ndarray], mask_key: str) -> np.ndarray:
+    """Resolve user-supplied mask references across NPZ keys, PNG filenames, and raw labels."""
+    raw = str(mask_key).strip()
+    if not raw:
+        raise ValueError(f"Material assignment mask {mask_key!r} is not present in scene buffers.")
+    stem = raw[:-4] if raw.lower().endswith(".png") else raw
+    candidates: list[str] = [raw, stem]
+    if not stem.startswith("mask_"):
+        candidates.append(f"mask_{stem}")
+    if stem.startswith("instance_mask_"):
+        candidates.append(f"mask_instance_{stem[len('instance_mask_'):]}")
+    try:
+        normalized = semantic_key(stem)
+    except ValueError:
+        normalized = ""
+    if normalized:
+        candidates.append(f"mask_{normalized}")
+        if normalized.startswith("instance_mask_"):
+            candidates.append(f"mask_instance_{normalized[len('instance_mask_'):]}")
+    for candidate in candidates:
+        if candidate in arrays:
+            return arrays[candidate]
+    raise ValueError(f"Material assignment mask {mask_key!r} is not present in scene buffers.")
+
+
 def apply_user_material_assignments(
     scene: SceneBuffers,
     arrays: dict[str, np.ndarray],
@@ -149,12 +175,10 @@ def apply_user_material_assignments(
         if unknown:
             raise ValueError(f"Unknown material assignment fields at index {index}: {sorted(unknown)}")
         mask_key = str(item.get("mask_key", ""))
-        key = mask_key if mask_key.startswith("mask_") else f"mask_{mask_key}"
-        if key not in arrays:
-            raise ValueError(f"Material assignment mask {mask_key!r} is not present in scene buffers.")
+        mask = _resolve_mask_array(arrays, mask_key)
         color = item.get("specular_color")
         assignments.append(MaterialAssignment(
-            name=str(item["name"]), mask=arrays[key],
+            name=str(item["name"]), mask=mask,
             roughness=float(item["roughness"]), metalness=float(item.get("metalness", 0.0)),
             specular_level=float(item.get("specular_level", 0.04)),
             blend=float(item.get("blend", 1.0)),
@@ -204,7 +228,11 @@ def run_scene_relight(scene_dir: str | Path, config_path: str | Path, output_pat
     target_rig = target_rig_from_dict(config.get("target_rig"))
     material_metadata = apply_user_material_assignments(scene, arrays, config.get("material_assignments", []))
     settings = EngineSettings(**config.get("settings", {}))
-    result = relight(scene, camera, source_rig, target_rig, settings)
+    require_geometry_ready = bool(config.get("require_geometry_ready", True))
+    result = relight(
+        scene, camera, source_rig, target_rig, settings,
+        require_geometry_ready=require_geometry_ready,
+    )
 
     from PIL import Image
     out = Path(output_path)

@@ -17,8 +17,8 @@ def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
     bias = settings.shadow_bias_metric if depth_kind == 'metric' else settings.shadow_bias_relative
     origin = points + normals * bias * 2.0
     visibility = np.ones((h, w), np.float32)
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    for step in np.linspace(0.10, 0.92, max(2, settings.shadow_steps), dtype=np.float32):
+    steps = np.linspace(0.06, 0.96, max(2, settings.shadow_steps), dtype=np.float32) ** 1.8
+    for step in steps:
         q = origin + direction * (max_distance[..., None] * step)
         qz = q[..., 2]
         safe_z = np.maximum(qz, 1e-5)
@@ -45,6 +45,27 @@ def scene_shadow_visibility(scene: SceneBuffers, camera: CameraModel, points: np
         dist = np.linalg.norm(vec, axis=-1)
         return ray_visibility(points, normals, scene.depth, camera, vec, dist, scene.depth_kind, settings)
     assert directional_vectors is not None
-    max_dist = np.full((h, w), max(float(np.max(scene.depth)), 1.0) * 2.0, np.float32)
+    bias = settings.shadow_bias_metric if scene.depth_kind == 'metric' else settings.shadow_bias_relative
+    valid = scene.depth > 0
+    if np.any(valid):
+        valid_points = points[valid]
+        scene_diag = max(float(np.linalg.norm(np.max(valid_points, axis=0) - np.min(valid_points, axis=0))), 1.0)
+        z_min = float(np.min(scene.depth[valid]))
+        z_max = float(np.max(scene.depth[valid]))
+    else:
+        scene_diag = 1.0
+        z_min, z_max = 0.0, 1.0
+    direction = directional_vectors / np.maximum(np.linalg.norm(directional_vectors, axis=-1, keepdims=True), 1e-8)
+    dz = direction[..., 2]
+    max_dist = np.full((h, w), scene_diag, np.float32)
+    toward_cam = dz < -1e-4
+    away_cam = dz > 1e-4
+    if np.any(toward_cam):
+        t_exit_near = np.maximum((points[..., 2] - z_min) / np.maximum(-dz, 1e-4), 0.0) + 4.0 * bias
+        max_dist = np.where(toward_cam, np.minimum(max_dist, t_exit_near), max_dist)
+    if np.any(away_cam):
+        t_exit_far = np.maximum((z_max - points[..., 2]) / np.maximum(dz, 1e-4), 0.0) + 4.0 * bias
+        max_dist = np.where(away_cam, np.minimum(max_dist, t_exit_far), max_dist)
+    max_dist = np.maximum(max_dist, 4.0 * bias)
     return ray_visibility(points, normals, scene.depth, camera, directional_vectors, max_dist,
                           scene.depth_kind, settings)

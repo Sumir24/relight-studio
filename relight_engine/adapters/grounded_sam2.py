@@ -51,6 +51,7 @@ class HuggingFaceGroundedSAM2:
         min_area_fraction: float = 0.002,
         detector_revision: str | None = None,
         segmenter_revision: str | None = None,
+        weight_masks_by_confidence: bool = False,
     ) -> None:
         if not 0 < box_threshold < 1 or not 0 < text_threshold < 1:
             raise ValueError("Detection thresholds must be in (0,1).")
@@ -67,6 +68,7 @@ class HuggingFaceGroundedSAM2:
         self.min_area_fraction = min_area_fraction
         self.detector_revision = detector_revision
         self.segmenter_revision = segmenter_revision
+        self.weight_masks_by_confidence = bool(weight_masks_by_confidence)
 
         self._torch = None
         self._device = None
@@ -236,7 +238,10 @@ class HuggingFaceGroundedSAM2:
             mask_logits = candidate_logits[best_index].numpy().astype(np.float32)
             mask_prob = 1.0 / (1.0 + np.exp(-np.clip(mask_logits, -30.0, 30.0)))
             quality = float(iou[index, best_index].item())
-            weighted = np.clip(mask_prob * detector_score * quality, 0.0, 1.0)
+            if self.weight_masks_by_confidence:
+                weighted = np.clip(mask_prob * detector_score * quality, 0.0, 1.0)
+            else:
+                weighted = np.clip(mask_prob, 0.0, 1.0)
             if weighted.shape != (height, width):
                 raise RuntimeError(
                     f"SAM2 returned mask shape {weighted.shape}; expected {(height, width)}."
@@ -409,6 +414,11 @@ class HuggingFaceGroundedSAM2:
                 "box_threshold": self.box_threshold,
                 "text_threshold": self.text_threshold,
                 "scores_are_calibrated": False,
+                "mask_weighting": (
+                    "uncalibrated_score_weighted"
+                    if self.weight_masks_by_confidence
+                    else "sam2_sigmoid_probability"
+                ),
                 "mask_generation": "Grounding DINO open-vocabulary boxes refined by SAM2",
                 "semantic_policy": effective_policy.to_metadata(),
                 "material_maps_estimated": False,

@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
+import pytest
 from relight_engine import CameraModel, SceneBuffers, Light, LightingRig, EngineSettings, relight
 from relight_engine.geometry import backproject_depth, estimate_normals
 from relight_engine.lighting import evaluate_rig
@@ -282,3 +283,116 @@ def test_scene_factory_preserves_material_maps_confidence_and_provenance():
     assert scene.material_confidence[0, 0] == 0.75
     assert scene.material_metadata["specular_color"]["source"] == "user_authored"
     scene.validate()
+
+
+def test_directional_shadow_ray_catches_near_occluder():
+    from relight_engine.shadows import scene_shadow_visibility
+
+    h, w = 48, 64
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    # Near thin occluder step ~0.35 units closer to the camera than the background
+    depth[18:30, 22:26] = 4.65
+    scene = SceneBuffers(
+        rgb_srgb=np.full((h, w, 3), 0.5, dtype=np.float32),
+        depth=depth,
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+    )
+    points = backproject_depth(depth, camera)
+    normals = np.zeros_like(points)
+    normals[..., 2] = -1.0
+    to_light = np.zeros_like(points)
+    to_light[:] = np.array([-1.0, 0.0, -0.45], dtype=np.float32)
+    visibility = scene_shadow_visibility(
+        scene, camera, points, normals, None, to_light, EngineSettings(shadow_steps=12)
+    )
+    # Receiver just to the right of the ridge must catch the near shadow
+    assert float(visibility[24, 30]) < 0.5
+
+
+def test_area_light_aims_toward_scene_centroid():
+    from relight_engine.lighting import _area_samples
+
+    pos = (3.0, 0.0, 3.0)
+    target = np.array([0.0, 0.0, 4.5], dtype=np.float32)
+    light = Light("area", "area", position=pos, area_size=(2.0, 2.0), samples=4)
+    samples = _area_samples(light, target_point=target)
+    aim = target - np.asarray(pos, dtype=np.float32)
+    for sample in samples:
+        assert abs(float(np.dot(sample - np.asarray(pos, dtype=np.float32), aim))) < 1e-4
+
+
+def test_edge_aware_compositor_reduces_halo_across_depth_boundary():
+    h, w = 40, 64
+    rgb = np.full((h, w, 3), 0.05, dtype=np.float32)
+    rgb[:, : w // 2] = 0.85
+    depth = np.full((h, w), 5.0, dtype=np.float32)
+    depth[:, : w // 2] = 1.5
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    scene = SceneBuffers(
+        rgb_srgb=rgb,
+        depth=depth,
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    source = LightingRig(ambient_strength=0.1, lights=(
+        Light("src", "directional", strength=0.4, direction=(0.0, 0.0, -1.0), casts_shadows=False),
+    ))
+    target = LightingRig(ambient_strength=0.1, lights=(
+        Light("tgt", "directional", strength=1.4, direction=(0.0, 0.0, -1.0), casts_shadows=False),
+    ))
+    result_edge = relight(
+        scene, camera, source, target,
+        EngineSettings(base_blur_sigma=12.0, edge_aware_base=True),
+    )
+    result_gauss = relight(
+        scene, camera, source, target,
+        EngineSettings(base_blur_sigma=12.0, edge_aware_base=False),
+    )
+    # Dark side just past the step (away from foreground leak) should not suffer a bright/dark halo jump
+    edge_band_edge = result_edge.rgb_srgb[:, w // 2 + 1 : w // 2 + 5, 0]
+    far_bg_edge = result_edge.rgb_srgb[:, -8:, 0]
+    edge_band_gauss = result_gauss.rgb_srgb[:, w // 2 + 1 : w // 2 + 5, 0]
+    far_bg_gauss = result_gauss.rgb_srgb[:, -8:, 0]
+    halo_edge = float(np.max(np.abs(np.mean(edge_band_edge) - np.mean(far_bg_edge))))
+    halo_gauss = float(np.max(np.abs(np.mean(edge_band_gauss) - np.mean(far_bg_gauss))))
+    assert halo_edge < halo_gauss * 0.25
+
+
+def test_ggx_direct_lighting_schlick_k_uses_roughness():
+    from relight_engine.lighting import _ggx_specular
+
+    normals = np.array([[[0.0, 0.0, -1.0]]], dtype=np.float32)
+    view = np.array([[[0.0, 0.0, -1.0]]], dtype=np.float32)
+    light_dir = np.array([[[0.6, 0.0, -0.8]]], dtype=np.float32)
+    light_dir /= np.linalg.norm(light_dir, axis=-1, keepdims=True)
+    roughness = np.array([[0.5]], dtype=np.float32)
+    metalness = np.array([[0.0]], dtype=np.float32)
+    spec_level = np.array([[0.04]], dtype=np.float32)
+    spec_color = np.full((1, 1, 3), 0.65, dtype=np.float32)
+
+    spec = _ggx_specular(normals, view, light_dir, roughness, metalness, spec_level, spec_color)
+
+    # Compute reference UE4 direct-lighting Schlick-GGX with k = (roughness + 1)^2 / 8
+    ndotl = float(np.sum(normals * light_dir))
+    ndotv = 1.0
+    h = view + light_dir
+    h /= np.linalg.norm(h)
+    ndoth = float(np.sum(normals * h))
+    vdoth = float(np.sum(view * h))
+    alpha = 0.5 ** 2
+    alpha2 = alpha ** 2
+    d_term = alpha2 / (np.pi * (ndoth * ndoth * (alpha2 - 1.0) + 1.0) ** 2)
+    k = (0.5 + 1.0) ** 2 / 8.0
+    g_term = (ndotv / (ndotv * (1.0 - k) + k)) * (ndotl / (ndotl * (1.0 - k) + k))
+    f0 = 0.04
+    fresnel = f0 + (1.0 - f0) * (1.0 - vdoth) ** 5
+    expected = (d_term * g_term * ndotl) / (4.0 * ndotv * ndotl) * fresnel
+    assert float(spec[0, 0, 0]) == pytest.approx(expected, rel=1e-4)

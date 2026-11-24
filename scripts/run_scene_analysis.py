@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -40,8 +41,11 @@ def save_mask(path: Path, mask: np.ndarray) -> None:
 
 
 def safe_filename(label: str) -> str:
-    key = re.sub(r"[^a-z0-9_]+", "_", semantic_key(label)).strip("_")
-    return key[:72] or "region"
+    key = re.sub(r"[^a-z0-9_]+", "_", semantic_key(label)).strip("_") or "region"
+    if len(key) <= 72:
+        return key
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    return f"{key[:63].rstrip('_')}_{digest}"
 
 
 def label_color(label: str) -> np.ndarray:

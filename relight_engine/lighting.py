@@ -7,10 +7,15 @@ from .shadows import scene_shadow_visibility
 def _normalize(v: np.ndarray) -> np.ndarray:
     return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-8)
 
-def _area_samples(light: Light) -> list[np.ndarray]:
+def _area_samples(light: Light, target_point: np.ndarray | None = None) -> list[np.ndarray]:
     center = np.asarray(light.position, np.float32)
-    toward_scene = np.array([0, 0, 1], np.float32) - center
-    toward_scene /= max(float(np.linalg.norm(toward_scene)), 1e-8)
+    target = np.array([0.0, 0.0, 1.0], np.float32) if target_point is None else np.asarray(target_point, np.float32)
+    toward_scene = target - center
+    norm = float(np.linalg.norm(toward_scene))
+    if norm < 1e-6:
+        toward_scene = np.array([0.0, 0.0, 1.0], np.float32)
+    else:
+        toward_scene /= norm
     up = np.array([0, 1, 0], np.float32)
     right = np.cross(up, toward_scene)
     if np.linalg.norm(right) < 1e-5:
@@ -74,11 +79,12 @@ def _ggx_specular(normals: np.ndarray, view: np.ndarray, light_dir: np.ndarray,
     half_vec = _normalize(light_dir + view)
     ndoth = np.clip(np.sum(normals * half_vec, axis=-1), 0, 1)
     vdoth = np.clip(np.sum(view * half_vec, axis=-1), 0, 1)
-    alpha = np.maximum(roughness, 0.045) ** 2
+    r_eff = np.maximum(roughness, 0.045)
+    alpha = r_eff ** 2
     alpha2 = alpha ** 2
     denom = np.maximum(np.pi * (ndoth * ndoth * (alpha2 - 1) + 1) ** 2, 1e-7)
     D = alpha2 / denom
-    k = (alpha + 1) ** 2 / 8.0
+    k = (r_eff + 1.0) ** 2 / 8.0
     Gv = ndotv / (ndotv * (1 - k) + k)
     Gl = ndotl / (ndotl * (1 - k) + k)
     G = Gv * Gl
@@ -106,25 +112,28 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
         toward /= max(float(np.linalg.norm(toward)), 1e-8)
         dirs = [np.broadcast_to(toward, (h, w, 3))]
         positions = [None]
-        max_dists = [np.full((h, w), max(float(np.max(scene.depth)), 1.0) * 2.0, np.float32)]
     elif light.kind == 'point':
         lp = np.asarray(light.position, np.float32)
         vec = lp[None, None, :] - points
         dist = np.linalg.norm(vec, axis=-1)
         dirs = [vec / np.maximum(dist[..., None], 1e-8)]
         positions = [np.broadcast_to(lp, (h, w, 3))]
-        max_dists = [dist]
     else:
-        positions = [np.broadcast_to(p, (h, w, 3)) for p in _area_samples(light)]
-        dirs, max_dists = [], []
+        valid = scene.depth > 0
+        scene_target = np.mean(points[valid], axis=0).astype(np.float32) if np.any(valid) else None
+        positions = [np.broadcast_to(p, (h, w, 3)) for p in _area_samples(light, target_point=scene_target)]
+        dirs = []
         for pos in positions:
             vec = pos - points
             dist = np.linalg.norm(vec, axis=-1)
             dirs.append(vec / np.maximum(dist[..., None], 1e-8))
-            max_dists.append(dist)
 
     count = len(dirs)
-    for d, pos, dist in zip(dirs, positions, max_dists):
+    for d, pos in zip(dirs, positions):
+        if light.kind == 'directional':
+            dist = None
+        else:
+            dist = np.linalg.norm(pos - points, axis=-1)
         ndotl = np.clip(np.sum(normals * d, axis=-1), 0, 1)
         if light.kind == 'directional':
             attenuation = np.full((h, w), light.strength, np.float32)
@@ -155,11 +164,9 @@ def evaluate_rig(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
     diffuse = np.broadcast_to(ambient, (h, w, 3)).copy()
     specular = np.zeros((h, w, 3), np.float32)
     visibility = np.ones((h, w), np.float32)
-    vis_weight = 0
     for light in rig.lights:
         d, s, v = _light_contribution(scene, camera, points, normals, light, settings)
         diffuse += d
         specular += s
         visibility = np.minimum(visibility, v)
-        vis_weight += 1
     return diffuse, specular, visibility

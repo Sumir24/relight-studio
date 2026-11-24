@@ -466,3 +466,71 @@ def test_florence_pairs_single_prompt_and_image_as_one_item_batches():
     assert result == {"<DETAILED_CAPTION>": {"caption": "fixture description"}}
     assert seen["generate_kwargs"]["input_ids"] is not None
     assert seen["generate_kwargs"]["pixel_values"] is not None
+
+
+def test_grounded_sam2_preserves_mask_probability_for_policy_masks():
+    from contextlib import nullcontext
+    from relight_engine.scene_policy import SemanticRoutingPolicy
+
+    class FakeTensor:
+        def __init__(self, array):
+            self._array = np.asarray(array, dtype=np.float32)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self._array
+
+        def item(self):
+            return float(self._array)
+
+        def __getitem__(self, idx):
+            return FakeTensor(self._array[idx])
+
+    class FakeInputs(dict):
+        def to(self, _device):
+            return self
+
+    class FakeSamProcessor:
+        def __call__(self, **_kwargs):
+            return FakeInputs(original_sizes=[(12, 16)])
+
+        def post_process_masks(self, pred_masks, _original_sizes, *, binarize):
+            assert binarize is False
+            return pred_masks
+
+    class FakeSamModel:
+        def __call__(self, **_kwargs):
+            logits = np.full((1, 1, 12, 16), -12.0, dtype=np.float32)
+            logits[:, :, 2:10, 4:12] = 12.0
+            return SimpleNamespace(
+                pred_masks=FakeTensor(logits[None, ...]),
+                iou_scores=FakeTensor(np.array([[[0.70]]], dtype=np.float32)),
+            )
+
+    adapter = HuggingFaceGroundedSAM2(device="cpu")
+    adapter._torch = SimpleNamespace(
+        inference_mode=lambda: nullcontext(),
+        argmax=lambda tensor: FakeTensor(int(np.argmax(tensor.numpy()))),
+    )
+    adapter._device = "cpu"
+    adapter._load_detector = lambda: None
+    adapter._detect_candidates = lambda *_args: [("face", 0.35, [4.0, 2.0, 12.0, 10.0])]
+    adapter._load_segmenter = lambda: None
+    adapter._sam_processor = FakeSamProcessor()
+    adapter._sam_model = FakeSamModel()
+
+    result = adapter.estimate(
+        np.full((12, 16, 3), 0.5, dtype=np.float32),
+        prompts=["face"],
+        policy=SemanticRoutingPolicy(protected_labels=("face",)),
+    )
+
+    assert float(result.protected_mask[5, 8]) > 0.99
+    assert float(result.lightable_mask[5, 8]) < 0.01
+    assert result.detections[0].detector_score == pytest.approx(0.35)
+    assert result.detections[0].mask_quality_score == pytest.approx(0.70)

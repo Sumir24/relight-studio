@@ -15,7 +15,6 @@ from .geometry import prepare_geometry
 from .lighting import evaluate_rig
 from .composite import compose_source_preserving
 from .quality import evaluate_scene_buffers, describe_material_response
-from .color import srgb_to_linear
 
 
 def relight(
@@ -71,7 +70,6 @@ def relight(
         source_s,
         target_s,
         geometry_conf,
-        visibility,
         settings,
     )
 

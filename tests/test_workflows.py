@@ -206,3 +206,67 @@ def test_user_material_assignment_applies_rgb_f0_confidence_and_provenance():
     assert scene.material_metadata["material_confidence"]["calibrated"] is False
     assert "not a calibrated probability" in scene.material_metadata["material_confidence"]["notes"].lower()
     assert metadata["neural_material_estimation_used"] is False
+
+
+def test_user_material_assignment_resolves_instance_mask_filename_stem():
+    h, w = 6, 8
+    mask = np.zeros((h, w), np.float32)
+    mask[1:4, 2:6] = 1.0
+    scene = SceneBuffers(
+        rgb_srgb=np.zeros((h, w, 3), np.float32),
+        depth=np.ones((h, w), np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative",
+    )
+    apply_user_material_assignments(
+        scene,
+        {"mask_instance_person__001": mask},
+        [{
+            "name": "person_one",
+            "mask_key": "instance_mask_person__001.png",
+            "roughness": 0.62,
+        }],
+    )
+    assert np.allclose(scene.roughness[1:4, 2:6], 0.62)
+
+
+def test_run_scene_relight_enforces_structural_geometry_gate_by_default(tmp_path):
+    import json
+    from relight_engine.workflows import run_scene_relight
+
+    scene_dir = tmp_path / "low_conf_scene"
+    scene_dir.mkdir()
+    h, w = 16, 20
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.4, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.full((h, w), 0.05, np.float32),
+        geometry_confidence=np.full((h, w), 0.05, np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative"},
+        "geometry_confidence": {"source": "test", "calibrated": False},
+        "camera": {"fx": 20.0, "fy": 20.0, "cx": w / 2, "cy": h / 2},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    config = {
+        "approved_for_test": True,
+        "source_calibration": {"key_direction": [0.0, 0.0, -1.0]},
+        "target_rig": {"lights": [{"kind": "directional", "direction": [0.5, 0.0, -0.8]}]},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="structural gate"):
+        run_scene_relight(scene_dir, config_path, tmp_path / "blocked.png")
+
+    config["require_geometry_ready"] = False
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    report = run_scene_relight(scene_dir, config_path, tmp_path / "override.png")
+    assert report["engine_metrics"]["geometry_readiness_gate_enforced"] is False
