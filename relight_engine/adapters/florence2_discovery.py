@@ -45,11 +45,12 @@ class Florence2SceneDiscovery:
             ) from exc
         device = resolve_torch_device(torch, self.device_request)
         dtype = torch.float16 if device == "cuda" else torch.float32
+        # Retain runtime handles before loading so a partial failure can be cleaned up.
+        self._torch, self._device = torch, device
         self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, torch_dtype=dtype, trust_remote_code=True
         ).to(device).eval()
-        self._torch, self._device = torch, device
 
     def runtime_snapshot(self) -> dict:
         """Return best-effort allocator counters and loaded-model state."""
