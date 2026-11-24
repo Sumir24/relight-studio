@@ -100,6 +100,28 @@ This smoke test checks actual inference wiring and sequential cleanup on CPU. It
 
 Install the PyTorch build appropriate for the target device first. Florence-2 uses `trust_remote_code=True`; pin and audit the exact repository revision before deployment. The automatic model stack downloads checkpoints unless already cached.
 
+### User-authored material assignments
+
+Material assignments are applied to dynamic scene masks from `scene_buffers.npz`; the semantic label does not automatically imply a material. For example, add an assignment like this to `material_assignments` in the reviewed relight config:
+
+```json
+[
+  {
+    "name": "warm metal trim",
+    "mask_key": "metal_trim",
+    "roughness": 0.22,
+    "metalness": 1.0,
+    "specular_level": 0.04,
+    "specular_color": [0.78, 0.52, 0.28],
+    "blend": 1.0,
+    "confidence": 0.85
+  }
+]
+```
+
+`specular_color` is linear-RGB conductor F0, not an sRGB display colour or a light tint. `blend` controls the mask assignment mix; `confidence` is a separate caller-declared reliability weight. A missing confidence map uses authored map values as provided. The renderer's conservative fallback priors are roughness 0.75, metalness 0.0, dielectric specular level 0.04 and neutral conductor F0 [0.65, 0.65, 0.65]. These are declared fallbacks, not inferred material truth. Material provenance and supported/unsupported response families appear in the QA and render reports.
+
+
 ## Neural inference memory lifecycle
 
 Continuous Integration runs Python 3.14 compilation and unit tests for pull requests targeting `main`. A separate model-integration workflow downloads and executes the real Hugging Face checkpoints on CPU for the model-stack smoke milestone.
