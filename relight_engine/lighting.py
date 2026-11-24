@@ -28,9 +28,47 @@ def _area_samples(light: Light) -> list[np.ndarray]:
             result.append(center + right * offsets[ix] * light.area_size[0] + up_axis * offsets[iy] * light.area_size[1])
     return result
 
+def _effective_material_maps(scene: SceneBuffers) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve authored/estimated maps against explicit conservative renderer priors.
+
+    A supplied material_confidence map blends supplied properties toward the priors.
+    Without that map, supplied maps are applied as provided but their provenance remains
+    the caller's responsibility. No material is inferred from its semantic label.
+    """
+    h, w = scene.depth.shape
+    priors = {
+        "roughness": 0.75,
+        "metalness": 0.0,
+        "specular_level": 0.04,
+        "specular_color": 0.65,
+    }
+    confidence = (
+        np.clip(np.asarray(scene.material_confidence, dtype=np.float32), 0.0, 1.0)
+        if scene.material_confidence is not None else None
+    )
+
+    def resolve(name: str, supplied: np.ndarray | None, prior: float):
+        if supplied is None:
+            return np.full((h, w), prior, dtype=np.float32) if name != "specular_color" else np.full((h, w, 3), prior, dtype=np.float32)
+        values = np.asarray(supplied, dtype=np.float32)
+        if confidence is None:
+            return values
+        weight = confidence if values.ndim == 2 else confidence[..., None]
+        base = prior if values.ndim == 2 else np.full((1, 1, 3), prior, dtype=np.float32)
+        return (base + weight * (values - base)).astype(np.float32)
+
+    return (
+        resolve("roughness", scene.roughness, priors["roughness"]),
+        resolve("metalness", scene.metalness, priors["metalness"]),
+        resolve("specular_level", scene.specular_level, priors["specular_level"]),
+        resolve("specular_color", scene.specular_color, priors["specular_color"]),
+    )
+
+
 def _ggx_specular(normals: np.ndarray, view: np.ndarray, light_dir: np.ndarray,
                   roughness: np.ndarray, metalness: np.ndarray,
-                  specular_level: np.ndarray) -> np.ndarray:
+                  specular_level: np.ndarray, specular_color: np.ndarray) -> np.ndarray:
+    """GGX microfacet response with scalar dielectric F0 and RGB conductor F0."""
     ndotl = np.clip(np.sum(normals * light_dir, axis=-1), 0, 1)
     ndotv = np.clip(np.sum(normals * view, axis=-1), 1e-4, 1)
     half_vec = _normalize(light_dir + view)
@@ -44,18 +82,20 @@ def _ggx_specular(normals: np.ndarray, view: np.ndarray, light_dir: np.ndarray,
     Gv = ndotv / (ndotv * (1 - k) + k)
     Gl = ndotl / (ndotl * (1 - k) + k)
     G = Gv * Gl
-    f0 = specular_level * (1 - metalness) + metalness * 0.65
-    F = f0 + (1 - f0) * (1 - vdoth) ** 5
-    spec = (D * G * F) / np.maximum(4 * ndotv * ndotl, 1e-5)
-    return (spec * ndotl).astype(np.float32)
+
+    dielectric_f0 = np.clip(specular_level, 0.0, 1.0)[..., None]
+    conductor_f0 = np.clip(specular_color, 0.0, 1.0)
+    metal = np.clip(metalness, 0.0, 1.0)[..., None]
+    f0 = dielectric_f0 * (1.0 - metal) + conductor_f0 * metal
+    fresnel = f0 + (1.0 - f0) * (1.0 - vdoth[..., None]) ** 5
+    scalar = (D * G * ndotl) / np.maximum(4.0 * ndotv * ndotl, 1e-5)
+    return (scalar[..., None] * fresnel).astype(np.float32)
 
 def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
                         normals: np.ndarray, light: Light, settings: EngineSettings) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     h, w = scene.depth.shape
     color = np.asarray(light.color, np.float32)[None, None, :]
-    roughness = scene.roughness if scene.roughness is not None else np.full((h, w), 0.75, np.float32)
-    metalness = scene.metalness if scene.metalness is not None else np.zeros((h, w), np.float32)
-    spec_level = scene.specular_level if scene.specular_level is not None else np.full((h, w), 0.04, np.float32)
+    roughness, metalness, spec_level, specular_color = _effective_material_maps(scene)
     view = _normalize(-points)
     diffuse = np.zeros((h, w, 3), np.float32)
     specular = np.zeros((h, w, 3), np.float32)
@@ -100,8 +140,10 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
             visibility = np.ones((h, w), np.float32)
         direct = (ndotl * attenuation * visibility / count).astype(np.float32)
         diffuse += direct[..., None] * color
-        spec = _ggx_specular(normals, view, d, roughness, metalness, spec_level)
-        specular += (spec * attenuation * visibility / count)[..., None] * color
+        spec = _ggx_specular(
+            normals, view, d, roughness, metalness, spec_level, specular_color
+        )
+        specular += spec * (attenuation * visibility / count)[..., None] * color
         visibility_sum += visibility / count
     return diffuse, specular, visibility_sum
 
