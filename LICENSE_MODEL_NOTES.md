@@ -14,6 +14,20 @@ These are engineering screening notes, not legal advice. Re-check the exact chec
 | SAM 3 | Official repository uses a separate SAM License, not Apache-2.0. | Not a default commercial dependency without legal review of the full agreement. |
 | SegFormer B0 ADE20K (`nvidia/segformer-b0-finetuned-ade-512-512`) | Prior check found model page `other` and source license restrictions for non-commercial research/evaluation. | Excluded from the commercial product path unless new exact terms are cleared. |
 
+
+## Immutable revisions used by the model-stack smoke test
+
+The CPU smoke harness pins these exact Hugging Face model revisions (full commit SHAs) so the test does not follow a moving `main` branch:
+
+| Model | Repository revision |
+|---|---|
+| Depth Anything V2 Small HF | `5426e4f0f36572d16453bbda7a8389317b1bef99` |
+| Florence-2 Base | `15bd11834572457e1e8e8fec7f25c83283902db2` |
+| Grounding DINO Tiny | `a2bb814dd30d776dcf7e30523b00659f4f141c71` |
+| SAM 2.1 Hiera Tiny | `de431c4043854a71d8101e17995dfe596bf101a5` |
+
+These pins make the smoke test repeatable and preserve the exact Florence remote-code revision inspected. They do not settle the repository/file licence-scope question above.
+
 ## Architecture decision
 
 Do not rely on one closed category list or one scene-specific segmentation model. Use a small number of model adapters with explicit output contracts:
