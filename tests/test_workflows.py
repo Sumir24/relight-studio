@@ -165,7 +165,7 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     assert report["material_maps"]["neural_material_estimation_used"] is False
     assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["available"] is True
     assert report["engine_metrics"]["material_response"]["material_confidence"]["available"] is True
-    assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["source"] == "user_authored"
+    assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["source"] == "user_assignment_plus_renderer_prior"
     assert report["engine_metrics"]["mean_abs_srgb_change_active"] > 0
     assert report["physical_accuracy_notes"]
 
@@ -200,6 +200,9 @@ def test_user_material_assignment_applies_rgb_f0_confidence_and_provenance():
     assert np.allclose(scene.specular_color[2, 3], [0.88, 0.55, 0.25])
     assert scene.material_confidence[2, 3] == pytest.approx(0.7)
     assert scene.material_confidence[0, 0] == pytest.approx(0.0)
-    assert scene.material_metadata["specular_color"]["source"] == "user_authored"
+    assert scene.material_metadata["specular_color"]["source"] == "user_assignment_plus_renderer_prior"
+    assert "unassigned pixels retain" in scene.material_metadata["specular_color"]["notes"]
+    assert scene.material_metadata["roughness"]["source"] == "user_assignment_plus_renderer_prior"
     assert scene.material_metadata["material_confidence"]["calibrated"] is False
+    assert "not a calibrated probability" in scene.material_metadata["material_confidence"]["notes"]
     assert metadata["neural_material_estimation_used"] is False
