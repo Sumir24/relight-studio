@@ -69,11 +69,21 @@ Optional neural inference dependencies:
 python -m pip install -r requirements-models.txt
 ```
 
+The optional model requirements include the `einops` and `timm` packages imported by the official Florence-2 custom implementation.
+
+Run the real-checkpoint CPU smoke test (downloads the configured model checkpoints and the documented car example):
+
+```bash
+python scripts/run_model_integration_smoke.py
+```
+
+This smoke test checks actual inference wiring and sequential cleanup on CPU. It is not an Apple MPS test, depth-polarity validation, multi-domain benchmark, or visual-quality certification.
+
 Install the PyTorch build appropriate for the target device first. Florence-2 uses `trust_remote_code=True`; pin and audit the exact repository revision before deployment. The automatic model stack downloads checkpoints unless already cached.
 
 ## Neural inference memory lifecycle
 
-Continuous Integration: Python 3.14 compile and pytest checks run for pull requests targeting `feature/geometry-v2-quality-gate`.
+Continuous Integration runs Python 3.14 compilation and unit tests for pull requests targeting `main`. A separate model-integration workflow downloads and executes the real Hugging Face checkpoints on CPU for the model-stack smoke milestone.
 
 The scene-analysis command runs neural stages sequentially and releases each model
 after extracting CPU-side results:
