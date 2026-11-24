@@ -14,7 +14,7 @@ from .contracts import (
 from .geometry import prepare_geometry
 from .lighting import evaluate_rig
 from .composite import compose_source_preserving
-from .quality import evaluate_scene_buffers
+from .quality import evaluate_scene_buffers, describe_material_response
 from .color import srgb_to_linear
 
 
@@ -83,6 +83,7 @@ def relight(
     metrics = {
         "mode": "2.5D source-to-target relighting",
         "depth_kind": scene.depth_kind,
+        "material_response": describe_material_response(scene),
         "geometry_valid_fraction": float(
             np.mean(
                 (scene.depth > 0)
