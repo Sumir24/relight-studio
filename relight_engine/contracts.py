@@ -51,6 +51,12 @@ class SceneBuffers:
     protected_mask: Optional[np.ndarray] = None
     semantic_masks: dict[str, np.ndarray] = field(default_factory=dict)
     instance_masks: dict[str, np.ndarray] = field(default_factory=dict)
+    # RGB conductor F0 / specular reflectance in linear RGB, not an inferred value.
+    specular_color: Optional[np.ndarray] = None
+    # Reliability/authority for supplied material maps; not a calibrated probability by default.
+    material_confidence: Optional[np.ndarray] = None
+    # Per-map provenance, e.g. {"roughness": {"source": "user_authored"}}.
+    material_metadata: dict = field(default_factory=dict)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -79,7 +85,8 @@ class SceneBuffers:
         for name, arr in [('depth_confidence', self.depth_confidence), ('lightable_mask', self.lightable_mask),
                           ('roughness', self.roughness), ('metalness', self.metalness),
                           ('specular_level', self.specular_level), ('geometry_confidence', self.geometry_confidence),
-                          ('alpha_mask', self.alpha_mask), ('protected_mask', self.protected_mask)]:
+                          ('alpha_mask', self.alpha_mask), ('protected_mask', self.protected_mask),
+                          ('material_confidence', self.material_confidence)]:
             if arr is not None:
                 if arr.shape != (h, w):
                     raise ValueError(f'{name} must have shape {(h, w)}.')
@@ -87,6 +94,15 @@ class SceneBuffers:
                     raise ValueError(f'{name} must contain only finite values.')
                 if np.any(arr < 0) or np.any(arr > 1):
                     raise ValueError(f'{name} values must be in [0,1].')
+        if self.specular_color is not None:
+            if self.specular_color.shape != (h, w, 3):
+                raise ValueError('specular_color must have shape HxWx3.')
+            if not np.isfinite(self.specular_color).all():
+                raise ValueError('specular_color must contain only finite values.')
+            if np.any(self.specular_color < 0) or np.any(self.specular_color > 1):
+                raise ValueError('specular_color values must be in [0,1].')
+        if not isinstance(self.material_metadata, dict):
+            raise ValueError('material_metadata must be a dictionary.')
         if self.normals is not None:
             if self.normals.shape != (h, w, 3):
                 raise ValueError('normals must have shape HxWx3.')
