@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 import numpy as np
 
+from .runtime import memory_snapshot, release_device_cache, resolve_torch_device
+
 @dataclass
 class DepthPrediction:
     depth: np.ndarray
@@ -92,19 +94,44 @@ class HuggingFaceDepthAnythingV2:
             from transformers import AutoImageProcessor, AutoModelForDepthEstimation
         except ImportError as exc:
             raise RuntimeError('Install torch and transformers to use this depth adapter.') from exc
-        if self.device_request == 'auto':
-            if torch.cuda.is_available():
-                device = 'cuda'
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                device = 'mps'
-            else:
-                device = 'cpu'
-        else:
-            device = self.device_request
+        device = resolve_torch_device(torch, self.device_request)
         self._processor = AutoImageProcessor.from_pretrained(self.model_id)
         self._model = AutoModelForDepthEstimation.from_pretrained(self.model_id).to(device).eval()
         self._torch = torch
         self._device = device
+
+    def runtime_snapshot(self) -> dict:
+        """Return best-effort allocator counters and loaded-model state."""
+        return {
+            "device": self._device,
+            "model_loaded": self._model is not None,
+            "processor_loaded": self._processor is not None,
+            "memory": memory_snapshot(self._torch, self._device) if self._torch is not None else {
+                "device": self._device, "available": False
+            },
+        }
+
+    def close(self) -> dict:
+        """Release model/processor references and clear accelerator allocator cache.
+
+        Safe to call repeatedly. The adapter can be reused; the next inference lazily
+        reloads the checkpoint.
+        """
+        if self._torch is None:
+            return {"released": False, "already_closed": True, "device": self._device}
+        before = memory_snapshot(self._torch, self._device)
+        was_loaded = self._model is not None or self._processor is not None
+        self._model = None
+        self._processor = None
+        cleanup = release_device_cache(self._torch, self._device)
+        after = memory_snapshot(self._torch, self._device)
+        return {
+            "released": was_loaded,
+            "device": self._device,
+            "memory_before_release": before,
+            "memory_after_release": after,
+            "cleanup": cleanup,
+        }
 
     def predict_raw(self, rgb_srgb: np.ndarray) -> tuple[np.ndarray, dict]:
         """Return the model's raw prediction before any near/far polarity mapping."""
