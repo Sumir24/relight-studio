@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 
-from .runtime import memory_snapshot, release_device_cache, resolve_torch_device
+from .runtime import memory_snapshot, release_device_cache, resolve_torch_device, revision_descriptor
 
 
 @dataclass
@@ -22,13 +22,15 @@ class Florence2SceneDiscovery:
     DEFAULT_MODEL = "microsoft/Florence-2-base"
 
     def __init__(self, model_id: str = DEFAULT_MODEL, *, device: str = "auto",
-                 max_new_tokens: int = 1024, max_prompts: int = 32) -> None:
+                 max_new_tokens: int = 1024, max_prompts: int = 32,
+                 revision: str | None = None) -> None:
         if max_new_tokens < 32 or max_prompts < 1:
             raise ValueError("max_new_tokens must be >=32 and max_prompts >=1.")
         self.model_id = model_id
         self.device_request = device
         self.max_new_tokens = max_new_tokens
         self.max_prompts = max_prompts
+        self.revision = revision
         self._torch = None
         self._processor = None
         self._model = None
@@ -47,9 +49,12 @@ class Florence2SceneDiscovery:
         dtype = torch.float16 if device == "cuda" else torch.float32
         # Retain runtime handles before loading so a partial failure can be cleaned up.
         self._torch, self._device = torch, device
-        self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
+        revision_kwargs = {"revision": self.revision} if self.revision else {}
+        self._processor = AutoProcessor.from_pretrained(
+            self.model_id, trust_remote_code=True, **revision_kwargs
+        )
         self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_id, torch_dtype=dtype, trust_remote_code=True
+            self.model_id, torch_dtype=dtype, trust_remote_code=True, **revision_kwargs
         ).to(device).eval()
 
     def runtime_snapshot(self) -> dict:
@@ -145,8 +150,14 @@ class Florence2SceneDiscovery:
             )
         return SceneDiscoveryResult(
             caption=caption, prompts=tuple(prompts), regions=regions,
-            metadata={"model_id": self.model_id, "device": self._device,
-                      "task_sequence": ["<DETAILED_CAPTION>", "<DENSE_REGION_CAPTION>"],
-                      "license_note": "Florence-2 model card identifies MIT license; verify exact checkpoint at deployment.",
-                      "labels_are_candidate_descriptions_not_ground_truth": True},
+            metadata={
+                "model_id": self.model_id,
+                "device": self._device,
+                **revision_descriptor(self.revision),
+                "trust_remote_code": True,
+                "remote_code_revision_pinned": revision_descriptor(self.revision)["immutable_commit_pinned"],
+                "task_sequence": ["<DETAILED_CAPTION>", "<DENSE_REGION_CAPTION>"],
+                "license_note": "Review the repository LICENSE and each executed remote source file; keep the exact model revision recorded.",
+                "labels_are_candidate_descriptions_not_ground_truth": True,
+            },
         )
