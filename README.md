@@ -15,6 +15,8 @@ Relight Studio is a general-purpose 2.5D virtual lighting engine for existing ph
 - Directional, point and sampled rectangular-area lights.
 - Lambertian diffuse and GGX microfacet specular response.
 - Approximate screen-space 2.5D visibility for cast-shadow occlusion.
+- GGX specular response with optional roughness, metalness, dielectric specular-level and RGB conductor F0 maps.
+- Optional material-confidence blending toward declared conservative priors, with per-map provenance in scene QA and render metrics.
 - Source-to-target shading transfer with detail retention, confidence-aware compositing and highlight protection.
 
 ### General-purpose scene understanding path
@@ -176,7 +178,7 @@ See `LICENSE_MODEL_NOTES.md`, `ENGINE_V1_PLAN.md` and `MATERIAL_RESPONSE_ROADMAP
 - Approximate shadows cannot represent unseen backsides or true overhangs.
 - Florence-2 region labels and detector/mask outputs are proposals, not ground truth.
 - Source illumination is user-calibrated, not automatically estimated yet.
-- Materials are user-authored or generic priors; no material inference is claimed yet.
+- Material maps are user-authored or supplied by a future validated estimator; no automatic material inference is claimed. The current renderer accepts RGB conductor F0 and optional material confidence, and reports conservative priors explicitly.
 - Glass, mirrors, liquids, emissive objects, skin/hair and complex products need specialist response estimation and domain validation.
 - Neural inference and visual quality have not yet been validated across real photographs in this build environment.
 
