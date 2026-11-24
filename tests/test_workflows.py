@@ -91,6 +91,7 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     )
     manifest = {
         "depth": {"depth_kind": "relative", "model_id": "synthetic-test-fixture"},
+        "geometry_confidence": {"source": "synthetic-test-heuristic", "calibrated": False},
         "segmentation": {"model_id": "synthetic-test-fixture"},
         "camera": {"fx": 30.0, "fy": 30.0, "cx": w / 2, "cy": h / 2},
     }
@@ -102,6 +103,7 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     assert sorted(loaded_scene.instance_masks) == ["person__001"]
     assert loaded_scene.alpha_mask is not None
     assert loaded_scene.protected_mask is not None
+    assert loaded_scene.metadata["geometry_confidence_source"] == "synthetic-test-heuristic"
     assert np.all(loaded_scene.protected_mask[:2] == 1.0)
 
     config = {

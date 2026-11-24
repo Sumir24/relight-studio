@@ -49,9 +49,13 @@ def main() -> int:
         normals=arrays.get("normals"), geometry_confidence=arrays.get("geometry_confidence"),
         alpha_mask=arrays.get("alpha_mask"), protected_mask=arrays.get("protected_mask"),
         semantic_masks=semantic_masks, instance_masks=instance_masks,
-        metadata={"source_manifest": str(args.manifest.resolve()) if args.manifest else None,
-                  "source_npz": str(args.scene_npz.resolve()),
-                  "material_maps_estimated": False},
+        metadata={
+            "source_manifest": str(args.manifest.resolve()) if args.manifest else None,
+            "source_npz": str(args.scene_npz.resolve()),
+            "depth": manifest.get("depth", {}),
+            "geometry_confidence_source": manifest.get("geometry_confidence", {}).get("source"),
+            "material_maps_estimated": False,
+        },
     )
     report = evaluate_scene_buffers(scene)
     report["source_manifest_status"] = manifest.get("status")
