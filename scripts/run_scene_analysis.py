@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse
+import json
+from pathlib import Path
+import re
+import sys
+import numpy as np
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from relight_engine.geometry import backproject_depth, estimate_normals
+from relight_engine.adapters import (
+    HuggingFaceDepthAnythingV2, DepthPrediction, SemanticPrediction, build_scene_buffers,
+    HuggingFaceGroundedSAM2, Florence2SceneDiscovery, SemanticRoutingPolicy,
+    camera_from_horizontal_fov,
+)
+from relight_engine.image_io import load_image
+from relight_engine.scene_policy import semantic_key
+from relight_engine.scene_domains import SceneDomainHint, SUPPORTED_QA_DOMAINS
+from relight_engine.quality import evaluate_scene_buffers
+
+
+def save_gray(path: Path, array: np.ndarray) -> None:
+    a = np.asarray(array, dtype=np.float32)
+    valid = np.isfinite(a)
+    if not np.any(valid):
+        raise ValueError(f"No finite values to visualize: {path}")
+    lo, hi = np.quantile(a[valid], [0.02, 0.98])
+    vis = np.zeros(a.shape, dtype=np.uint8) if hi - lo < 1e-8 else np.round(np.clip((a - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
+    Image.fromarray(vis, mode="L").save(path)
+
+
+def save_mask(path: Path, mask: np.ndarray) -> None:
+    Image.fromarray(np.round(np.clip(mask, 0, 1) * 255).astype(np.uint8), mode="L").save(path)
+
+
+def safe_filename(label: str) -> str:
+    key = re.sub(r"[^a-z0-9_]+", "_", semantic_key(label)).strip("_")
+    return key[:72] or "region"
+
+
+def label_color(label: str) -> np.ndarray:
+    # Stable pseudo-random palette from the label itself; no scene class mapping.
+    seed = sum((i + 1) * ord(ch) for i, ch in enumerate(label))
+    values = []
+    for channel in range(3):
+        seed = (seed * 1664525 + 1013904223 + channel * 7919) & 0xFFFFFFFF
+        values.append(0.2 + 0.75 * ((seed >> 8) & 0xFFFF) / 65535.0)
+    return np.asarray(values, dtype=np.float32)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run domain-agnostic scene analysis. Auto-discover labels or pass image-specific prompts."
+    )
+    parser.add_argument("--image", required=True, type=Path)
+    parser.add_argument("--out", type=Path, default=Path("scene_analysis"))
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--hfov", type=float, required=True,
+                        help="Horizontal field of view. Supply calibrated/EXIF value or declare an approximation.")
+    parser.add_argument("--hfov-source", default="assumed", choices=["assumed", "exif", "camera_profile", "checkerboard", "user_calibrated"])
+    polarity = parser.add_mutually_exclusive_group(required=True)
+    polarity.add_argument("--near-is-high", action="store_true",
+                          help="Use only after verifying near/far polarity for the exact depth checkpoint.")
+    polarity.add_argument("--far-is-high", action="store_true",
+                          help="Use only after verifying near/far polarity for the exact depth checkpoint.")
+    parser.add_argument("--prompts", nargs="+", default=None,
+                        help="Optional image-specific region/object labels. If omitted, Florence-2 discovers candidates.")
+    parser.add_argument("--protected-labels", nargs="*", default=[],
+                        help="Optional labels that must be protected from relighting; no classes are protected by default.")
+    parser.add_argument("--lightable-labels", nargs="*", default=None,
+                        help="Optional allow-list. Default: all visible pixels are candidates except explicit protected labels.")
+    parser.add_argument("--box-threshold", type=float, default=0.28)
+    parser.add_argument("--text-threshold", type=float, default=0.22)
+    parser.add_argument("--max-detections", type=int, default=3)
+    parser.add_argument("--discovery-model", default=Florence2SceneDiscovery.DEFAULT_MODEL)
+    parser.add_argument("--scene-domain", default="auto", choices=["auto", *SUPPORTED_QA_DOMAINS],
+                        help="Optional QA/profile hint only; it does not switch renderer physics.")
+    parser.add_argument("--depth-model", default=HuggingFaceDepthAnythingV2.DEFAULT_RELATIVE_MODEL)
+    args = parser.parse_args()
+
+    if not args.image.is_file():
+        parser.error(f"Input image does not exist: {args.image}")
+    args.out.mkdir(parents=True, exist_ok=True)
+    image_input = load_image(args.image)
+    rgb = image_input.rgb_srgb
+    h, w = rgb.shape[:2]
+    policy = SemanticRoutingPolicy(
+        protected_labels=tuple(args.protected_labels),
+        lightable_labels=None if args.lightable_labels is None else tuple(args.lightable_labels),
+    )
+    policy.validate()
+    domain_hint = SceneDomainHint(domain=args.scene_domain, source="user_hint" if args.scene_domain != "auto" else "not_classified")
+    domain_hint.validate()
+
+    depth_backend = HuggingFaceDepthAnythingV2(
+        model_id=args.depth_model, output_kind="relative",
+        relative_near_is_high=bool(args.near_is_high), device=args.device,
+    )
+    print("[1/5] Estimating relative depth...")
+    try:
+        depth: DepthPrediction = depth_backend.estimate(rgb)
+    except Exception as exc:
+        print(f"ERROR: Depth inference failed: {exc}", file=sys.stderr)
+        print("Install requirements-models.txt and ensure the checkpoint is cached or downloadable.", file=sys.stderr)
+        return 2
+
+    discovery_metadata: dict = {"mode": "user_prompts" if args.prompts else "automatic_open_vocabulary_discovery"}
+    if args.prompts:
+        prompts = tuple(args.prompts)
+        caption = ""
+    else:
+        print("[2/5] Discovering image-specific regions with Florence-2...")
+        try:
+            discovery = Florence2SceneDiscovery(model_id=args.discovery_model, device=args.device).discover(rgb)
+        except Exception as exc:
+            print(f"ERROR: Automatic scene discovery failed: {exc}", file=sys.stderr)
+            print("Supply --prompts with visible objects/regions, or install the model dependencies and checkpoints.", file=sys.stderr)
+            return 2
+        prompts = discovery.prompts
+        caption = discovery.caption
+        discovery_metadata = {
+            **discovery.metadata,
+            "mode": "automatic_open_vocabulary_discovery",
+            "caption": caption,
+            "candidate_regions": discovery.regions,
+        }
+
+    print("[3/5] Building open-vocabulary region masks...")
+    try:
+        segmentation_backend = HuggingFaceGroundedSAM2(
+            device=args.device, box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold, max_detections_per_prompt=args.max_detections,
+        )
+        seg = segmentation_backend.estimate(rgb, prompts=prompts, policy=policy)
+    except Exception as exc:
+        print(f"ERROR: Semantic segmentation failed: {exc}", file=sys.stderr)
+        print("No fixed class list or heuristic segmentation fallback was substituted.", file=sys.stderr)
+        return 2
+
+    if float(np.mean(seg.lightable_mask > 0.05)) < 0.01:
+        print("ERROR: The current semantic policy protects nearly the entire image; review label names.", file=sys.stderr)
+        return 2
+
+    print("[4/5] Building camera-aligned geometry and generic scene buffers...")
+    calibration = camera_from_horizontal_fov(w, h, args.hfov, source=args.hfov_source)
+    points = backproject_depth(depth.depth, calibration.camera)
+    normals, normal_conf = estimate_normals(points, depth.depth, depth.confidence)
+    geometry_conf = np.clip(normal_conf, 0, 1)
+    semantics = SemanticPrediction(
+        lightable_mask=seg.lightable_mask, protected_mask=seg.protected_mask,
+        class_masks=seg.masks, instance_masks=seg.instance_masks, metadata=seg.metadata,
+    )
+    scene = build_scene_buffers(rgb, depth, semantics, alpha_mask=image_input.alpha_mask)
+    scene.geometry_confidence = geometry_conf.astype(np.float32)
+    scene.normals = normals.astype(np.float32)
+    scene.validate()
+
+    print("[5/5] Saving generic scene buffers, masks and provenance...")
+    save_gray(args.out / "depth_relative.png", depth.depth)
+    Image.fromarray(np.round(np.clip((normals + 1.0) * 0.5, 0, 1) * 255).astype(np.uint8), mode="RGB").save(args.out / "normals_camera_space.png")
+    save_gray(args.out / "geometry_confidence.png", geometry_conf)
+    save_mask(args.out / "mask_lightable.png", seg.lightable_mask)
+    save_mask(args.out / "mask_protected.png", seg.protected_mask)
+
+    overlay = rgb.copy()
+    for label, mask in seg.masks.items():
+        save_mask(args.out / f"mask_{safe_filename(label)}.png", mask)
+        alpha = (np.clip(mask, 0, 1) * 0.42)[..., None]
+        overlay = overlay * (1 - alpha) + label_color(label) * alpha
+    for instance_id, mask in seg.instance_masks.items():
+        save_mask(args.out / f"instance_mask_{safe_filename(instance_id)}.png", mask)
+    Image.fromarray(np.round(np.clip(overlay, 0, 1) * 255).astype(np.uint8), mode="RGB").save(args.out / "semantic_overlay.jpg", quality=94)
+
+    buffers = {
+        "rgb_srgb": scene.rgb_srgb,
+        "depth": scene.depth,
+        "depth_confidence": scene.depth_confidence,
+        "geometry_confidence": scene.geometry_confidence,
+        "normals": scene.normals,
+        "lightable_mask": scene.lightable_mask,
+        "protected_mask": seg.protected_mask,
+    }
+    if image_input.alpha_mask is not None:
+        buffers["alpha_mask"] = image_input.alpha_mask
+    buffers.update({f"mask_{safe_filename(k)}": v for k, v in seg.masks.items()})
+    buffers.update({f"mask_instance_{safe_filename(k)}": v for k, v in seg.instance_masks.items()})
+    np.savez_compressed(args.out / "scene_buffers.npz", **buffers)
+
+    # Structural QA catches degenerate model outputs but does not claim ground-truth accuracy.
+    quality_report = evaluate_scene_buffers(scene)
+    (args.out / "scene_quality_report.json").write_text(
+        json.dumps(quality_report, indent=2), encoding="utf-8"
+    )
+
+    manifest = {
+        "status": "generic_scene_analysis_complete_not_relighting",
+        "image": str(args.image.resolve()),
+        "image_input": image_input.metadata,
+        "resolution": [w, h],
+        "scene_domain_hint": domain_hint.to_metadata(),
+        "scene_discovery": discovery_metadata,
+        "semantic_labels": sorted(seg.masks.keys()),
+        "instance_masks": sorted(seg.instance_masks.keys()),
+        "depth": depth.metadata,
+        "segmentation": seg.metadata,
+        "detections": [d.__dict__ for d in seg.detections],
+        "semantic_policy": policy.to_metadata(),
+        "camera": {
+            "fx": calibration.camera.fx, "fy": calibration.camera.fy,
+            "cx": calibration.camera.cx, "cy": calibration.camera.cy,
+            "source": calibration.source,
+            "horizontal_fov_degrees": calibration.horizontal_fov_degrees,
+            "calibrated": calibration.calibrated,
+            "note": calibration.note,
+        },
+        "scene_quality_report": "scene_quality_report.json",
+        "structural_quality_status": quality_report["status"],
+        "metrics": {
+            "lightable_fraction": float(np.mean(seg.lightable_mask > 0.05)),
+            "protected_fraction": float(np.mean(seg.protected_mask > 0.05)),
+            "valid_depth_fraction": float(np.mean(depth.depth > 0)),
+            "geometry_confidence_mean": float(np.mean(geometry_conf)),
+            "detections_count": len(seg.detections),
+        },
+        "material_estimation": "not implemented; no physical material labels are inferred by segmentation",
+        "source_light_estimation": "not implemented; requires user calibration or a separately validated estimator",
+        "limitations": [
+            "Depth is relative, not metric; no physical distance claims are valid.",
+            "Camera intrinsics are FOV-derived unless calibrated metadata was supplied.",
+            "Open-vocabulary region discovery is a candidate list, not exhaustive semantic ground truth.",
+            "Detector and mask-quality scores are not calibrated probabilities.",
+            "No material maps or original-light estimate are produced by this analysis pass.",
+            "All image pixels are candidates by default; only explicit protected labels are excluded.",
+            "No relit output is generated by this scene-analysis command.",
+        ],
+    }
+    (args.out / "scene_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(json.dumps(manifest["metrics"], indent=2))
+    print(f"Discovered/used labels: {', '.join(prompts)}")
+    print(f"Saved scene analysis to: {args.out.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

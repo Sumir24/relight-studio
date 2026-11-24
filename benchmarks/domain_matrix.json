@@ -1,0 +1,158 @@
+{
+  "benchmark_name": "Relight Studio Cross-Domain Image Matrix",
+  "status": "input_preflight_completed_neural_scene_inference_pending",
+  "shared_renderer": true,
+  "scene_categories_are_test_groups_not_renderer_branches": true,
+  "domains": [
+    {
+      "name": "portrait",
+      "cases": [
+        "single face",
+        "hair flyaways",
+        "glasses",
+        "skin highlights",
+        "clothing edge"
+      ]
+    },
+    {
+      "name": "group_photo",
+      "cases": [
+        "overlapping people",
+        "multiple depths",
+        "mixed skin and clothing",
+        "occlusion"
+      ]
+    },
+    {
+      "name": "product",
+      "cases": [
+        "glossy packaging",
+        "transparent glass",
+        "metallic accents",
+        "white seamless background"
+      ]
+    },
+    {
+      "name": "food",
+      "cases": [
+        "wet/oily surface",
+        "liquid",
+        "fine garnish",
+        "mixed roughness"
+      ]
+    },
+    {
+      "name": "interior",
+      "cases": [
+        "furniture",
+        "window",
+        "mirror",
+        "mixed daylight and artificial light"
+      ]
+    },
+    {
+      "name": "architecture",
+      "cases": [
+        "glass facade",
+        "repeated edges",
+        "large planar surfaces",
+        "deep shadows"
+      ]
+    },
+    {
+      "name": "landscape",
+      "cases": [
+        "foliage",
+        "water",
+        "sky",
+        "distant terrain",
+        "thin branches"
+      ]
+    },
+    {
+      "name": "street",
+      "cases": [
+        "vehicles",
+        "pedestrians",
+        "signage",
+        "wet reflections"
+      ]
+    },
+    {
+      "name": "vehicle",
+      "cases": [
+        "curved paint",
+        "windows",
+        "chrome",
+        "rubber"
+      ]
+    },
+    {
+      "name": "animal",
+      "cases": [
+        "fur",
+        "whiskers",
+        "eyes",
+        "limb occlusion"
+      ]
+    },
+    {
+      "name": "macro",
+      "cases": [
+        "shallow depth of field",
+        "translucency",
+        "micro-texture"
+      ]
+    },
+    {
+      "name": "still_life",
+      "cases": [
+        "multiple objects",
+        "mixed materials",
+        "contact shadows"
+      ]
+    },
+    {
+      "name": "artwork",
+      "cases": [
+        "painting",
+        "illustration",
+        "stylized geometry",
+        "non-photoreal shading"
+      ]
+    },
+    {
+      "name": "other",
+      "cases": [
+        "mixed/unseen object categories",
+        "unusual lighting",
+        "ambiguous geometry"
+      ]
+    }
+  ],
+  "required_metrics": [
+    "depth edge alignment",
+    "mask boundary recall/precision",
+    "source-light estimation error",
+    "light-direction response correctness",
+    "shadow displacement and leakage",
+    "texture/detail retention",
+    "highlight clipping",
+    "protected-region leakage",
+    "user correction effort",
+    "runtime and peak memory"
+  ],
+  "completed_checks": [
+    "Input decoding and RGB normalization across 8 auxiliary sample fixtures plus the user-supplied landscape photograph",
+    "Grayscale-to-RGB conversion",
+    "RGBA alpha preservation preflight using a synthetic cutout fixture",
+    "Shared renderer invariance to scene-domain metadata",
+    "Scene-buffer structural QA unit tests for flat depth, confidence, normals, mask coverage and duplicate instances"
+  ],
+  "not_yet_completed": [
+    "Florence-2 discovery and Grounding DINO/SAM2 mask inference on real photographs",
+    "Depth Anything V2 versus Depth Anything 3 geometry comparison on real photographs",
+    "Ground-truth mask/depth/normal scoring",
+    "Material response estimation and perceptual relighting evaluation"
+  ]
+}

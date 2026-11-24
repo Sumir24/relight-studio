@@ -1,0 +1,7 @@
+# Optional inference stack for real scene estimation.
+# Install after creating an isolated Python environment. Check PyTorch's platform-specific
+# installation selector for CUDA/CPU/Apple Silicon before installing these packages.
+torch>=2.5.1
+torchvision>=0.20.1
+transformers>=4.57.3,<5
+safetensors>=0.4

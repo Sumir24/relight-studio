@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import numpy as np
+
+from .contracts import CameraModel, EngineSettings, LightingRig, Light, SceneBuffers
+from .calibration import (
+    MaterialAssignment,
+    SourceLightCalibration,
+    build_material_maps,
+    kelvin_to_linear_rgb,
+)
+from .engine import relight
+
+
+def source_calibration_from_dict(data: dict) -> SourceLightCalibration:
+    if not isinstance(data, dict):
+        raise ValueError("source_calibration must be an object.")
+    allowed = {
+        "key_direction", "key_strength", "key_temperature_kelvin", "ambient_strength",
+        "ambient_temperature_kelvin", "casts_shadows", "name",
+    }
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"Unknown source-calibration fields: {sorted(unknown)}")
+    if "key_direction" not in data:
+        raise ValueError("source_calibration.key_direction is required.")
+    calibration = SourceLightCalibration(**data)
+    calibration.validate()
+    return calibration
+
+
+def target_rig_from_dict(data: dict) -> LightingRig:
+    if not isinstance(data, dict):
+        raise ValueError("target_rig must be an object.")
+    allowed = {"ambient_strength", "ambient_temperature_kelvin", "ambient_color", "lights"}
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValueError(f"Unknown target-rig fields: {sorted(unknown)}")
+    ambient_strength = float(data.get("ambient_strength", 0.10))
+    if "ambient_temperature_kelvin" in data:
+        ambient_color = kelvin_to_linear_rgb(float(data["ambient_temperature_kelvin"]))
+    else:
+        ambient_color = tuple(data.get("ambient_color", (1.0, 1.0, 1.0)))
+    lights = []
+    for index, item in enumerate(data.get("lights", [])):
+        if not isinstance(item, dict):
+            raise ValueError(f"target_rig.lights[{index}] must be an object.")
+        allowed = {
+            "name", "kind", "strength", "color", "color_temperature_kelvin", "direction",
+            "position", "area_size", "samples", "casts_shadows",
+        }
+        unknown = set(item) - allowed
+        if unknown:
+            raise ValueError(f"Unknown target light fields at index {index}: {sorted(unknown)}")
+        if "color_temperature_kelvin" in item and "color" in item:
+            raise ValueError("Specify either color_temperature_kelvin or linear-RGB color, not both.")
+        color = (kelvin_to_linear_rgb(float(item["color_temperature_kelvin"]))
+                 if "color_temperature_kelvin" in item else tuple(item.get("color", (1.0, 1.0, 1.0))))
+        lights.append(Light(
+            name=str(item.get("name", f"target_light_{index + 1}")),
+            kind=item["kind"],
+            strength=float(item.get("strength", 1.0)),
+            color=color,
+            direction=None if item.get("direction") is None else tuple(item["direction"]),
+            position=None if item.get("position") is None else tuple(item["position"]),
+            area_size=tuple(item.get("area_size", (0.5, 0.5))),
+            samples=int(item.get("samples", 4)),
+            casts_shadows=bool(item.get("casts_shadows", True)),
+        ))
+    rig = LightingRig(ambient_color=ambient_color, ambient_strength=ambient_strength, lights=tuple(lights))
+    rig.validate()
+    return rig
+
+
+def load_scene_artifacts(scene_dir: str | Path) -> tuple[SceneBuffers, CameraModel, dict, dict[str, np.ndarray]]:
+    scene_dir = Path(scene_dir)
+    manifest_path = scene_dir / "scene_manifest.json"
+    buffers_path = scene_dir / "scene_buffers.npz"
+    if not manifest_path.is_file() or not buffers_path.is_file():
+        raise FileNotFoundError("scene_dir must contain scene_manifest.json and scene_buffers.npz from run_scene_analysis.py")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    with np.load(buffers_path, allow_pickle=False) as data:
+        arrays = {key: data[key].copy() for key in data.files}
+    required = {"rgb_srgb", "depth", "depth_confidence", "geometry_confidence", "normals", "lightable_mask"}
+    missing = required - set(arrays)
+    if missing:
+        raise ValueError(f"scene_buffers.npz missing arrays: {sorted(missing)}")
+    depth_kind = manifest.get("depth", {}).get("depth_kind")
+    if depth_kind not in ("metric", "relative"):
+        raise ValueError("Scene manifest must declare depth.depth_kind as metric or relative.")
+    scene = SceneBuffers(
+        rgb_srgb=arrays["rgb_srgb"],
+        depth=arrays["depth"],
+        depth_confidence=arrays["depth_confidence"],
+        lightable_mask=arrays["lightable_mask"],
+        depth_kind=depth_kind,
+        normals=arrays["normals"],
+        geometry_confidence=arrays["geometry_confidence"],
+        alpha_mask=arrays.get("alpha_mask"),
+        protected_mask=arrays.get("protected_mask", arrays.get("mask_protected")),
+        semantic_masks={
+            key[len("mask_"):]: value for key, value in arrays.items()
+            if key.startswith("mask_") and key not in ("mask_lightable", "mask_protected")
+            and not key.startswith("mask_instance_")
+        },
+        instance_masks={
+            key[len("mask_instance_"):]: value for key, value in arrays.items()
+            if key.startswith("mask_instance_")
+        },
+        metadata={"source_manifest": str(manifest_path), "depth": manifest.get("depth", {}),
+                  "segmentation": manifest.get("segmentation", {})},
+    )
+    camera_data = manifest.get("camera", {})
+    camera = CameraModel(
+        fx=float(camera_data["fx"]), fy=float(camera_data["fy"]),
+        cx=float(camera_data["cx"]), cy=float(camera_data["cy"]),
+    )
+    camera.validate()
+    scene.validate()
+    return scene, camera, manifest, arrays
+
+
+def apply_user_material_assignments(
+    scene: SceneBuffers,
+    arrays: dict[str, np.ndarray],
+    config: list[dict],
+) -> dict:
+    assignments: list[MaterialAssignment] = []
+    for index, item in enumerate(config):
+        if not isinstance(item, dict):
+            raise ValueError(f"material_assignments[{index}] must be an object.")
+        allowed = {"name", "mask_key", "roughness", "metalness", "specular_level", "blend"}
+        unknown = set(item) - allowed
+        if unknown:
+            raise ValueError(f"Unknown material assignment fields at index {index}: {sorted(unknown)}")
+        mask_key = str(item.get("mask_key", ""))
+        key = mask_key if mask_key.startswith("mask_") else f"mask_{mask_key}"
+        if key not in arrays:
+            raise ValueError(f"Material assignment mask {mask_key!r} is not present in scene buffers.")
+        assignments.append(MaterialAssignment(
+            name=str(item["name"]), mask=arrays[key],
+            roughness=float(item["roughness"]), metalness=float(item.get("metalness", 0.0)),
+            specular_level=float(item.get("specular_level", 0.04)), blend=float(item.get("blend", 1.0)),
+        ))
+    maps = build_material_maps(scene.shape, assignments)
+    if assignments:
+        scene.roughness = maps.roughness
+        scene.metalness = maps.metalness
+        scene.specular_level = maps.specular_level
+    return maps.metadata
+
+
+def run_scene_relight(scene_dir: str | Path, config_path: str | Path, output_path: str | Path) -> dict:
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if config.get("approved_for_test") is not True:
+        raise ValueError("Set approved_for_test=true only after reviewing source and target calibration values.")
+    scene, camera, manifest, arrays = load_scene_artifacts(scene_dir)
+    source_calibration = source_calibration_from_dict(config.get("source_calibration"))
+    source_rig = source_calibration.to_rig()
+    target_rig = target_rig_from_dict(config.get("target_rig"))
+    material_metadata = apply_user_material_assignments(scene, arrays, config.get("material_assignments", []))
+    settings = EngineSettings(**config.get("settings", {}))
+    result = relight(scene, camera, source_rig, target_rig, settings)
+
+    from PIL import Image
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rgb_u8 = np.round(np.clip(result.rgb_srgb, 0, 1) * 255).astype(np.uint8)
+    if scene.alpha_mask is not None:
+        rgba_u8 = np.dstack([rgb_u8, np.round(np.clip(scene.alpha_mask, 0, 1) * 255).astype(np.uint8)])
+        Image.fromarray(rgba_u8, mode="RGBA").save(out)
+    else:
+        Image.fromarray(rgb_u8, mode="RGB").save(out)
+    relative_depth_point_area = (
+        scene.depth_kind == "relative"
+        and any(light.kind in ("point", "area") for light in target_rig.lights)
+    )
+    report = {
+        "status": "rendered_with_explicit_user_calibration",
+        "output": str(out.resolve()),
+        "source_calibration": source_calibration.to_metadata(),
+        "material_maps": material_metadata,
+        "target_rig": config["target_rig"],
+        "scene_manifest": str((Path(scene_dir) / "scene_manifest.json").resolve()),
+        "engine_metrics": result.metrics,
+        "physical_accuracy_notes": [
+            "Directional lights are the recommended first target-light type while depth is relative.",
+            "Point/area light distance falloff uses normalized scene units when depth is relative; it is not metric inverse-square falloff."
+        ] if relative_depth_point_area else [
+            "The target rig uses directional lighting or metric depth for point/area placement."
+        ],
+        "limitations": [
+            "Source-light parameters were supplied by the user; they were not inferred automatically.",
+            "Material assignments were supplied by the user; generic base material values remain priors.",
+            "Depth, camera, segmentation and source-light assumptions must be reviewed before treating the image as physically relit.",
+        ],
+    }
+    Path(str(out) + ".report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report

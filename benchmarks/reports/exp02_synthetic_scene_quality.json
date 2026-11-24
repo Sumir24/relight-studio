@@ -1,0 +1,77 @@
+{
+  "schema_version": "1.0",
+  "status": "structurally_valid",
+  "assessment_scope": "structural_and_degeneracy_checks_only_not_ground_truth_quality",
+  "image": {
+    "width": 40,
+    "height": 32,
+    "pixels": 1280,
+    "depth_kind": "relative",
+    "visible_fraction": 1.0,
+    "alpha_present": false
+  },
+  "depth": {
+    "valid_fraction_of_visible_pixels": 1.0,
+    "p02": 1.1269892454147339,
+    "p50": 1.75,
+    "p98": 2.3730108737945557,
+    "relative_or_metric_spread": 0.7120123590741839,
+    "occupied_quantile_bins_64": 64,
+    "log_gradient_p95": 0.01952357403934002,
+    "confidence_mean": 0.8000000715255737,
+    "confidence_below_0_2_fraction": 0.0
+  },
+  "geometry": {
+    "normals": {
+      "available": true,
+      "mean_length_on_valid_depth": 1.0,
+      "p95_unit_length_error": 0.0,
+      "degenerate_fraction_on_valid_depth": 0.0
+    },
+    "geometry_confidence_mean": 0.75,
+    "geometry_confidence_below_0_2_fraction": 0.0
+  },
+  "masks": {
+    "lightable_fraction_above_0_5": 1.0,
+    "protected_fraction_above_0_5": 0.0,
+    "semantic_class_count": 1,
+    "instance_count": 1,
+    "semantic": {
+      "sample_object": {
+        "mean_soft_coverage": 0.38671875,
+        "binary_coverage_fraction": 0.4296875,
+        "minimum": 0.0,
+        "maximum": 0.8999999761581421
+      }
+    },
+    "instances": {
+      "sample_object__001": {
+        "mean_soft_coverage": 0.16875000298023224,
+        "binary_coverage_fraction": 0.1875,
+        "minimum": 0.0,
+        "maximum": 0.8999999761581421
+      }
+    },
+    "near_duplicate_instances": []
+  },
+  "materials": {
+    "roughness_available": false,
+    "metalness_available": false,
+    "specular_level_available": false,
+    "material_estimation_claimed": false
+  },
+  "warnings": [],
+  "errors": [],
+  "metadata": {
+    "source_manifest": "/tmp/relight_exp02_synthetic_scene/scene_manifest.json",
+    "source_npz": "/tmp/relight_exp02_synthetic_scene/scene_buffers.npz",
+    "material_maps_estimated": false
+  },
+  "non_claims": [
+    "A structurally valid depth map may still be geometrically wrong.",
+    "No ground-truth depth, mask, normal, material, or lighting comparison is performed.",
+    "Relative depth is not metric distance.",
+    "A detector confidence or mask score is not a calibrated probability unless separately calibrated."
+  ],
+  "source_manifest_status": "synthetic_test_fixture"
+}

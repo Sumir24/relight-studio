@@ -1,0 +1,36 @@
+# Third-party model licence and architecture notes — checked 2026-11-24
+
+These are engineering screening notes, not legal advice. Re-check the exact checkpoint revision, model card, code terms, dependencies and training-data provenance before commercial distribution.
+
+| Candidate | Official evidence found | Engineering decision |
+|---|---|---|
+| Florence-2 Base (`microsoft/Florence-2-base`) | Hugging Face model card lists MIT. Tasks include detailed caption, object detection, dense-region caption, region proposal and phrase grounding. The model uses `trust_remote_code=True`. | Candidate for per-image scene discovery and adaptive prompt generation. Pin/audit remote code; not proof of exhaustive discovery. |
+| Grounding DINO Tiny (`IDEA-Research/grounding-dino-tiny`) | Official repository lists Apache-2.0. | Candidate open-vocabulary detection stage; labels come from image discovery/user prompts, not a fixed taxonomy. |
+| SAM 2.1 Hiera Tiny (`facebook/sam2.1-hiera-tiny`) | Official Meta SAM 2 repository says checkpoints and code are Apache-2.0. | Candidate to turn region proposals into soft pixel masks. |
+| Depth Anything V2 Small HF relative | Prior checked model card lists Apache-2.0. | Current implemented baseline depth model, relative depth only. |
+| Depth Anything 3 Small / Base | Official DA3 repository lists DA3-SMALL and DA3-BASE checkpoints as Apache 2.0. DA3 provides single-view geometry and multi-view/pose functions. | Evaluation target against DA2 across portrait/product/interior/landscape before replacing current adapter. |
+| Depth Anything 3 Metric Large / Mono Large | Official DA3 repository lists DA3METRIC-LARGE and DA3MONO-LARGE as Apache 2.0. | Candidate metric/monocular estimators; test model memory, domain generalization and calibration. |
+| Depth Anything 3 Giant/Large / Nested Giant-Large | Official DA3 table lists these original larger variants as CC BY-NC 4.0. | Excluded from commercial default path unless independently licensed. |
+| SAM 3 | Official repository uses a separate SAM License, not Apache-2.0. | Not a default commercial dependency without legal review of the full agreement. |
+| SegFormer B0 ADE20K (`nvidia/segformer-b0-finetuned-ade-512-512`) | Prior check found model page `other` and source license restrictions for non-commercial research/evaluation. | Excluded from the commercial product path unless new exact terms are cleared. |
+
+## Architecture decision
+
+Do not rely on one closed category list or one scene-specific segmentation model. Use a small number of model adapters with explicit output contracts:
+
+1. Florence-2 Base proposes labels/regions for the current image.
+2. Grounding DINO proposes boxes from those labels or explicit user prompts.
+3. SAM 2 refines proposals into dynamic soft masks.
+4. Depth estimator produces geometry with units and confidence.
+5. The renderer consumes a common scene representation, independent of semantic names.
+
+The first-stage labels can miss objects; all mask/detection scores remain uncalibrated ranking/quality signals unless independently calibrated.
+
+## Primary sources
+
+- Florence-2 Base model card and tasks: https://huggingface.co/microsoft/Florence-2-base
+- Grounding DINO official repository: https://github.com/IDEA-Research/GroundingDINO
+- SAM 2 official repository and licensing: https://github.com/facebookresearch/sam2
+- Depth Anything 3 official repository/model table: https://github.com/ByteDance-Seed/Depth-Anything-3
+- SAM 3 official repository and custom license: https://github.com/facebookresearch/sam3
+- Depth Anything V2: https://github.com/DepthAnything/Depth-Anything-V2

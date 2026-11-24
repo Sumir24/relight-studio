@@ -1,0 +1,43 @@
+{
+  "approved_for_test": false,
+  "source_calibration": {
+    "name": "user_calibrated_source_key",
+    "key_direction": [
+      0.0,
+      1.0,
+      -1.0
+    ],
+    "key_strength": 1.0,
+    "key_temperature_kelvin": 5600,
+    "ambient_strength": 0.15,
+    "ambient_temperature_kelvin": 6500,
+    "casts_shadows": true
+  },
+  "target_rig": {
+    "ambient_strength": 0.12,
+    "ambient_temperature_kelvin": 6500,
+    "lights": [
+      {
+        "name": "target_key",
+        "kind": "directional",
+        "direction": [
+          0.6,
+          0.7,
+          -0.4
+        ],
+        "strength": 1.0,
+        "color_temperature_kelvin": 4800,
+        "casts_shadows": true
+      }
+    ]
+  },
+  "material_assignments": [],
+  "settings": {
+    "base_blur_sigma": 18.0,
+    "detail_power": 0.78,
+    "ratio_min": 0.25,
+    "ratio_max": 4.0,
+    "shadow_steps": 12
+  },
+  "template_warning": "These numeric values are illustrative starting points only, not measured or recommended values. Review every direction, strength and material value. Set approved_for_test=true only after calibration. Relative-depth scene scale is not metric. Material assignments are intentionally empty: add image-specific mask keys only after reviewing the discovered masks."
+}

@@ -1,0 +1,458 @@
+{
+  "schema_version": "1.0",
+  "benchmark": "Relight Studio arbitrary-image input preflight",
+  "status": "passed",
+  "case_count": 9,
+  "failure_count": 0,
+  "labels_affect_processing": false,
+  "fixture_note": "Seven auxiliary samples are temporary scikit-image 0.26.0 skimage.data QA fixtures; the alpha image is synthetic. These are input-decoder checks only and are not redistributed in the project ZIP.",
+  "cases": [
+    {
+      "label": "landscape_user",
+      "source_file": "henrique-paim-IwgODdGlgWY-unsplash.jpeg",
+      "sha256": "0178736c3ed2a9f8c8fc81609f6a25c4ef1125d5fadfaf1633ed37ccf9735949",
+      "status": "decoded_and_validated",
+      "format": "JPEG",
+      "original_mode": "RGB",
+      "width": 1536,
+      "height": 1152,
+      "aspect_ratio": 1.3333333333333333,
+      "megapixels": 1.769472,
+      "rgb_range": [
+        0.0,
+        1.0
+      ],
+      "channel_std": [
+        0.25252553820610046,
+        0.23367904126644135,
+        0.29300567507743835
+      ],
+      "luminance_percentiles": [
+        0.05356784537434578,
+        0.47211140394210815,
+        0.943615734577179
+      ],
+      "near_black_fraction": 0.0003153483072916667,
+      "near_white_fraction": 0.0008087158203125,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/mnt/data/henrique-paim-IwgODdGlgWY-unsplash.jpeg",
+        "format": "JPEG",
+        "original_mode": "RGB",
+        "original_size": [
+          1536,
+          1152
+        ],
+        "oriented_size": [
+          1536,
+          1152
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "portrait_sample",
+      "source_file": "portrait_sample.png",
+      "sha256": "2418889d0d83962d51facc3832b55cf1849690018a1e873d1c551146555cd02f",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "RGB",
+      "width": 512,
+      "height": 512,
+      "aspect_ratio": 1.0,
+      "megapixels": 0.262144,
+      "rgb_range": [
+        0.0,
+        1.0
+      ],
+      "channel_std": [
+        0.3217632472515106,
+        0.3003813326358795,
+        0.3052012026309967
+      ],
+      "luminance_percentiles": [
+        0.0,
+        0.4834110140800476,
+        0.9729553270339983
+      ],
+      "near_black_fraction": 0.13109588623046875,
+      "near_white_fraction": 0.007709503173828125,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/portrait_sample.png",
+        "format": "PNG",
+        "original_mode": "RGB",
+        "original_size": [
+          512,
+          512
+        ],
+        "oriented_size": [
+          512,
+          512
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "food_sample",
+      "source_file": "food_sample.png",
+      "sha256": "1b334876bab6bccddc821520b67fad5bceaaf3c454885b75cdc126b7ebfe9576",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "RGB",
+      "width": 600,
+      "height": 400,
+      "aspect_ratio": 1.5,
+      "megapixels": 0.24,
+      "rgb_range": [
+        0.0,
+        1.0
+      ],
+      "channel_std": [
+        0.2469417154788971,
+        0.2390231490135193,
+        0.2075696736574173
+      ],
+      "luminance_percentiles": [
+        0.02650902047753334,
+        0.37965020537376404,
+        0.9393898248672485
+      ],
+      "near_black_fraction": 4.1666666666666665e-05,
+      "near_white_fraction": 0.002675,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/food_sample.png",
+        "format": "PNG",
+        "original_mode": "RGB",
+        "original_size": [
+          600,
+          400
+        ],
+        "oriented_size": [
+          600,
+          400
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "animal_sample",
+      "source_file": "animal_sample.png",
+      "sha256": "9540e8d656047041ae92c8c19f8aeb2baa4ede5a17030470e8a1cfc7bb26182a",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "RGB",
+      "width": 451,
+      "height": 300,
+      "aspect_ratio": 1.5033333333333334,
+      "megapixels": 0.1353,
+      "rgb_range": [
+        0.0,
+        0.9058823585510254
+      ],
+      "channel_std": [
+        0.12647517025470734,
+        0.12674827873706818,
+        0.14676964282989502
+      ],
+      "luminance_percentiles": [
+        0.1032571043074131,
+        0.4691247344017029,
+        0.7032321691513062
+      ],
+      "near_black_fraction": 0.0,
+      "near_white_fraction": 0.0,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/animal_sample.png",
+        "format": "PNG",
+        "original_mode": "RGB",
+        "original_size": [
+          451,
+          300
+        ],
+        "oriented_size": [
+          451,
+          300
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "still_life_objects_sample",
+      "source_file": "still_life_objects_sample.png",
+      "sha256": "f8d773fc9cfa6f4d8e5942dc34d0a0788fcaed2a4fefbbed0aef5398d7ef4cba",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "L",
+      "width": 384,
+      "height": 303,
+      "aspect_ratio": 1.2673267326732673,
+      "megapixels": 0.116352,
+      "rgb_range": [
+        0.003921568859368563,
+        0.9882352948188782
+      ],
+      "channel_std": [
+        0.2073623538017273,
+        0.2073623538017273,
+        0.2073623538017273
+      ],
+      "luminance_percentiles": [
+        0.09019608050584793,
+        0.33725491166114807,
+        0.8470588326454163
+      ],
+      "near_black_fraction": 2.5783828382838284e-05,
+      "near_white_fraction": 0.0,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/still_life_objects_sample.png",
+        "format": "PNG",
+        "original_mode": "L",
+        "original_size": [
+          384,
+          303
+        ],
+        "oriented_size": [
+          384,
+          303
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "vehicle_scene_sample",
+      "source_file": "vehicle_scene_sample.png",
+      "sha256": "7a88c634b209f0edd7aa95dc8cd5a9f2cb8d09dd3fb176669dd389572846819c",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "RGB",
+      "width": 640,
+      "height": 427,
+      "aspect_ratio": 1.4988290398126465,
+      "megapixels": 0.27328,
+      "rgb_range": [
+        0.0,
+        1.0
+      ],
+      "channel_std": [
+        0.14288896322250366,
+        0.11887428909540176,
+        0.11792290955781937
+      ],
+      "luminance_percentiles": [
+        0.058765743486583234,
+        0.2156117707490921,
+        0.7425937014818197
+      ],
+      "near_black_fraction": 0.0008526053864168618,
+      "near_white_fraction": 0.0006367096018735363,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/vehicle_scene_sample.png",
+        "format": "PNG",
+        "original_mode": "RGB",
+        "original_size": [
+          640,
+          427
+        ],
+        "oriented_size": [
+          640,
+          427
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "architecture_texture_sample",
+      "source_file": "architecture_texture_sample.png",
+      "sha256": "d32ff0d873686e35f790015002d85b1e59cecd993b2c025433414b84d22c6758",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "L",
+      "width": 512,
+      "height": 512,
+      "aspect_ratio": 1.0,
+      "megapixels": 0.262144,
+      "rgb_range": [
+        0.24705882370471954,
+        0.8117647171020508
+      ],
+      "channel_std": [
+        0.10214397311210632,
+        0.10214397311210632,
+        0.10214397311210632
+      ],
+      "luminance_percentiles": [
+        0.32156863808631897,
+        0.3921568691730499,
+        0.7411764860153198
+      ],
+      "near_black_fraction": 0.0,
+      "near_white_fraction": 0.0,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/architecture_texture_sample.png",
+        "format": "PNG",
+        "original_mode": "L",
+        "original_size": [
+          512,
+          512
+        ],
+        "oriented_size": [
+          512,
+          512
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "monochrome_photo_sample",
+      "source_file": "monochrome_photo_sample.png",
+      "sha256": "4cfbba3559df4e7d6765b5aac6e8cd5d3309f728f3eb35e155e644c48a6fcca7",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "L",
+      "width": 512,
+      "height": 512,
+      "aspect_ratio": 1.0,
+      "megapixels": 0.262144,
+      "rgb_range": [
+        0.0,
+        1.0
+      ],
+      "channel_std": [
+        0.28880417346954346,
+        0.28880417346954346,
+        0.28880417346954346
+      ],
+      "luminance_percentiles": [
+        0.01568627543747425,
+        0.5960784554481506,
+        0.9019607901573181
+      ],
+      "near_black_fraction": 8.392333984375e-05,
+      "near_white_fraction": 0.002536773681640625,
+      "alpha_present": false,
+      "transparent_fraction": 0.0,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/monochrome_photo_sample.png",
+        "format": "PNG",
+        "original_mode": "L",
+        "original_size": [
+          512,
+          512
+        ],
+        "oriented_size": [
+          512,
+          512
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": false,
+        "alpha_preserved_separately": false
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    },
+    {
+      "label": "synthetic_alpha_cutout",
+      "source_file": "synthetic_alpha_cutout.png",
+      "sha256": "5393551b58936814e079913027a072e16b6b78170ec647524bc251d3d7acc65d",
+      "status": "decoded_and_validated",
+      "format": "PNG",
+      "original_mode": "RGBA",
+      "width": 128,
+      "height": 96,
+      "aspect_ratio": 1.3333333333333333,
+      "megapixels": 0.012288,
+      "rgb_range": [
+        0.0,
+        0.8627451062202454
+      ],
+      "channel_std": [
+        0.37883615493774414,
+        0.15497255325317383,
+        0.06887736916542053
+      ],
+      "luminance_percentiles": [
+        0.0,
+        0.0,
+        0.44716858863830566
+      ],
+      "near_black_fraction": 0.7391764322916666,
+      "near_white_fraction": 0.0,
+      "alpha_present": true,
+      "transparent_fraction": 0.7391764322916666,
+      "image_io_metadata": {
+        "source_path": "/tmp/relight_exp02_inputs/synthetic_alpha_cutout.png",
+        "format": "PNG",
+        "original_mode": "RGBA",
+        "original_size": [
+          128,
+          96
+        ],
+        "oriented_size": [
+          128,
+          96
+        ],
+        "exif_orientation_applied": true,
+        "icc_profile_present": false,
+        "icc_to_srgb_applied": false,
+        "alpha_present": true,
+        "alpha_preserved_separately": true
+      },
+      "scope": "input_decode_color_orientation_alpha_only_no_scene_or_relighting_validation"
+    }
+  ],
+  "failures": [],
+  "non_claims": [
+    "Successful decoding does not establish successful depth or segmentation inference.",
+    "This preflight does not evaluate geometry, masks, materials, source lighting or rendered quality.",
+    "Labels are descriptive QA metadata and do not select a renderer branch."
+  ]
+}
