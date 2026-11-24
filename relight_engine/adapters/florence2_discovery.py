@@ -1,8 +1,16 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+import re
 import numpy as np
 
-from .runtime import memory_snapshot, release_device_cache, resolve_torch_device, revision_descriptor
+from ..scene_policy import semantic_key
+from .runtime import memory_snapshot, release_device_cache, release_model_from_device, resolve_torch_device, revision_descriptor
+
+_LEADING_ARTICLE_RE = re.compile(r"^(?:a|an|the)\s+", re.IGNORECASE)
+_META_PHRASES = frozenset({
+    "view", "image", "picture", "photo", "photograph", "scene", "body",
+    "background", "foreground", "top", "bottom", "left", "right", "side",
+})
 
 
 @dataclass
@@ -81,6 +89,7 @@ class Florence2SceneDiscovery:
             return {"released": False, "already_closed": True, "device": self._device}
         before = memory_snapshot(self._torch, self._device)
         was_loaded = self._model is not None or self._processor is not None
+        release_model_from_device(self._model)
         self._model = None
         self._processor = None
         cleanup = release_device_cache(self._torch, self._device)
@@ -114,11 +123,23 @@ class Florence2SceneDiscovery:
             generated = self._model.generate(
                 input_ids=moved["input_ids"], pixel_values=moved["pixel_values"],
                 max_new_tokens=self.max_new_tokens, do_sample=False, num_beams=3,
+                use_cache=False,
             )
         text = self._processor.batch_decode(generated, skip_special_tokens=False)[0]
-        return self._processor.post_process_generation(
-            text, task=task, image_size=(pil_image.width, pil_image.height)
+        post_task = (
+            "<CAPTION_TO_PHRASE_GROUNDING>"
+            if task.startswith("<CAPTION_TO_PHRASE_GROUNDING>")
+            else task
         )
+        return self._processor.post_process_generation(
+            text, task=post_task, image_size=(pil_image.width, pil_image.height)
+        )
+
+    @staticmethod
+    def _clean_label(raw_label: str) -> str:
+        phrase = " ".join(str(raw_label).strip().split())
+        phrase = _LEADING_ARTICLE_RE.sub("", phrase).strip()
+        return phrase
 
     def discover(self, rgb_srgb: np.ndarray) -> SceneDiscoveryResult:
         if rgb_srgb.ndim != 3 or rgb_srgb.shape[-1] != 3:
@@ -130,30 +151,63 @@ class Florence2SceneDiscovery:
         from PIL import Image
         pil = Image.fromarray(np.round(rgb_srgb * 255).astype(np.uint8), mode="RGB")
         caption_result = self._run_task(pil, "<DETAILED_CAPTION>")
-        dense_result = self._run_task(pil, "<DENSE_REGION_CAPTION>")
         caption = str(caption_result.get("<DETAILED_CAPTION>", "")).strip()
-        dense = dense_result.get("<DENSE_REGION_CAPTION>", {})
-        labels = dense.get("labels", []) if isinstance(dense, dict) else []
-        boxes = dense.get("bboxes", []) if isinstance(dense, dict) else []
+
+        task_sequence = ["<DETAILED_CAPTION>"]
+        raw_pairs: list[tuple[str, list]] = []
+
+        if caption:
+            task_sequence.append("<CAPTION_TO_PHRASE_GROUNDING>")
+            pg_result = self._run_task(pil, f"<CAPTION_TO_PHRASE_GROUNDING>{caption}")
+            pg = pg_result.get("<CAPTION_TO_PHRASE_GROUNDING>", {})
+            if isinstance(pg, dict):
+                raw_pairs.append((pg.get("labels", []), pg.get("bboxes", [])))
+
+        task_sequence.append("<OD>")
+        od_result = self._run_task(pil, "<OD>")
+        od = od_result.get("<OD>", {})
+        if isinstance(od, dict):
+            raw_pairs.append((od.get("labels", []), od.get("bboxes", [])))
+
         prompts: list[str] = []
         regions: list[dict] = []
-        seen: set[str] = set()
-        for index, label in enumerate(labels):
-            phrase = " ".join(str(label).strip().split())
-            key = phrase.casefold()
-            if not phrase or key in seen:
-                continue
-            seen.add(key)
-            prompts.append(phrase)
-            region = {"label": phrase}
-            if index < len(boxes):
-                region["box_xyxy"] = [float(v) for v in boxes[index]]
-            regions.append(region)
+        seen_keys: set[str] = set()
+
+        def collect_candidates(labels_list, boxes_list) -> None:
+            for index, label in enumerate(labels_list):
+                phrase = self._clean_label(label)
+                if not phrase or phrase.casefold() in _META_PHRASES:
+                    continue
+                try:
+                    norm_key = semantic_key(phrase)
+                except ValueError:
+                    continue
+                if norm_key in seen_keys:
+                    continue
+                seen_keys.add(norm_key)
+                prompts.append(phrase)
+                region = {"label": phrase}
+                if index < len(boxes_list):
+                    region["box_xyxy"] = [float(v) for v in boxes_list[index]]
+                regions.append(region)
+                if len(prompts) >= self.max_prompts:
+                    return
+
+        for labels_list, boxes_list in raw_pairs:
+            collect_candidates(labels_list, boxes_list)
             if len(prompts) >= self.max_prompts:
                 break
+
+        if not prompts:
+            task_sequence.append("<DENSE_REGION_CAPTION>")
+            dense_result = self._run_task(pil, "<DENSE_REGION_CAPTION>")
+            dense = dense_result.get("<DENSE_REGION_CAPTION>", {})
+            if isinstance(dense, dict):
+                collect_candidates(dense.get("labels", []), dense.get("bboxes", []))
+
         if not prompts:
             raise RuntimeError(
-                "Florence-2 did not return dense region labels for this image. "
+                "Florence-2 did not return region labels for this image. "
                 "Provide explicit --prompts or review the image manually; do not insert scene-specific defaults."
             )
         return SceneDiscoveryResult(
@@ -164,7 +218,7 @@ class Florence2SceneDiscovery:
                 **revision_descriptor(self.revision),
                 "trust_remote_code": True,
                 "remote_code_revision_pinned": revision_descriptor(self.revision)["immutable_commit_pinned"],
-                "task_sequence": ["<DETAILED_CAPTION>", "<DENSE_REGION_CAPTION>"],
+                "task_sequence": task_sequence,
                 "license_note": "Review the repository LICENSE and each executed remote source file; keep the exact model revision recorded.",
                 "labels_are_candidate_descriptions_not_ground_truth": True,
             },

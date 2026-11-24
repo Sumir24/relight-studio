@@ -270,3 +270,137 @@ def test_run_scene_relight_enforces_structural_geometry_gate_by_default(tmp_path
     config_path.write_text(json.dumps(config), encoding="utf-8")
     report = run_scene_relight(scene_dir, config_path, tmp_path / "override.png")
     assert report["engine_metrics"]["geometry_readiness_gate_enforced"] is False
+
+
+def test_load_scene_artifacts_preserves_neural_scene_estimation_flag(tmp_path):
+    import json
+    from relight_engine.workflows import load_scene_artifacts
+
+    scene_dir = tmp_path / "neural_scene"
+    scene_dir.mkdir()
+    h, w = 8, 10
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.4, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.full((h, w), 0.45, np.float32),
+        geometry_confidence=np.full((h, w), 0.45, np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative", "model_id": "depth-anything/Depth-Anything-V2-Small-hf"},
+        "segmentation": {"detector_id": "IDEA-Research/grounding-dino-tiny"},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "camera": {"fx": 10.0, "fy": 10.0, "cx": 5.0, "cy": 4.0},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    scene, _, _, _ = load_scene_artifacts(scene_dir)
+    assert scene.metadata["neural_scene_estimation_used"] is True
+
+
+def test_load_scene_artifacts_restores_intrinsic_buffers_and_metadata(tmp_path):
+    import json
+    from relight_engine.workflows import load_scene_artifacts
+
+    scene_dir = tmp_path / "intrinsic_scene"
+    scene_dir.mkdir()
+    h, w = 8, 10
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    albedo = np.full((h, w, 3), 0.55, np.float32)
+    source_shading = np.full((h, w), 0.72, np.float32)
+    residual = np.full((h, w, 3), 0.04, np.float32)
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.4, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.full((h, w), 0.45, np.float32),
+        geometry_confidence=np.full((h, w), 0.45, np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+        albedo=albedo,
+        source_shading=source_shading,
+        non_diffuse_residual=residual,
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative"},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "intrinsic_metadata": {"source": "test_intrinsic_estimator", "calibrated": False},
+        "camera": {"fx": 10.0, "fy": 10.0, "cx": 5.0, "cy": 4.0},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    scene, _, _, _ = load_scene_artifacts(scene_dir)
+    assert scene.albedo is not None and np.allclose(scene.albedo, albedo)
+    assert scene.source_shading is not None and np.allclose(scene.source_shading, source_shading)
+    assert scene.non_diffuse_residual is not None and np.allclose(scene.non_diffuse_residual, residual)
+    assert scene.intrinsic_metadata["source"] == "test_intrinsic_estimator"
+
+
+def test_run_scene_relight_supports_intrinsic_and_registered_relighter(tmp_path, monkeypatch):
+    import json
+    from relight_engine.adapters.protocols import NeuralRelightPrediction
+    from relight_engine.adapters import registry
+    from relight_engine.adapters.registry import register_relighter_backend
+    from relight_engine.workflows import run_scene_relight
+
+    monkeypatch.setattr(registry, "_RELIGHTER_BACKENDS", dict(registry._RELIGHTER_BACKENDS))
+
+    class _TestRelighter:
+        def render(self, sc, target_d, target_s, target_rig, settings):
+            return NeuralRelightPrediction(
+                rgb_srgb=np.full_like(sc.rgb_srgb, 0.7),
+                metadata={"backend": "test_relighter"},
+            )
+
+        def runtime_snapshot(self):
+            return {"device": "cpu"}
+
+        def close(self):
+            return {"released": False}
+
+    register_relighter_backend("test_registered_relighter", lambda **_kw: _TestRelighter())
+
+    scene_dir = tmp_path / "hybrid_scene"
+    scene_dir.mkdir()
+    h, w = 16, 20
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.35, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        geometry_confidence=np.ones((h, w), np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+        albedo=np.full((h, w, 3), 0.6, np.float32),
+        source_shading=np.full((h, w), 0.25, np.float32),
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative"},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "camera": {"fx": 20.0, "fy": 20.0, "cx": 10.0, "cy": 8.0},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    cfg = {
+        "approved_for_test": True,
+        "source_calibration": {"key_direction": [0.0, 0.0, -1.0]},
+        "target_rig": {"lights": [{"kind": "directional", "direction": [0.0, 0.0, -1.0], "casts_shadows": False}]},
+        "settings": {"base_blur_sigma": 3.0},
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    rep_intr = run_scene_relight(scene_dir, cfg_path, tmp_path / "out_intr.png", renderer_mode="intrinsic")
+    assert rep_intr["engine_metrics"]["renderer_mode"] == "intrinsic"
+
+    rep_hyb = run_scene_relight(
+        scene_dir, cfg_path, tmp_path / "out_hyb.png",
+        renderer_mode="hybrid_neural", relighter_backend="test_registered_relighter",
+    )
+    assert rep_hyb["engine_metrics"]["renderer_mode"] == "hybrid_neural"
+    assert rep_hyb["engine_metrics"]["neural_relighter"]["backend"] == "test_relighter"

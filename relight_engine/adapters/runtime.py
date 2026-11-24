@@ -98,6 +98,18 @@ def memory_snapshot(torch: Any, device: str | None) -> dict[str, Any]:
     return result
 
 
+def release_model_from_device(model: Any) -> None:
+    """Move an accelerator-resident model back to CPU before dropping references."""
+    if model is None:
+        return
+    to_fn = getattr(model, "to", None)
+    if callable(to_fn):
+        try:
+            to_fn("cpu")
+        except Exception:
+            pass
+
+
 def release_device_cache(torch: Any, device: str | None) -> dict[str, Any]:
     """Collect Python objects and ask the active accelerator allocator to release cache."""
     gc.collect()
@@ -108,6 +120,12 @@ def release_device_cache(torch: Any, device: str | None) -> dict[str, Any]:
     }
     if device == "mps":
         mps = getattr(torch, "mps", None)
+        synchronize = getattr(mps, "synchronize", None)
+        if callable(synchronize):
+            try:
+                synchronize()
+            except Exception as exc:
+                result["synchronize_error"] = str(exc)
         empty_cache = getattr(mps, "empty_cache", None)
         if callable(empty_cache):
             try:

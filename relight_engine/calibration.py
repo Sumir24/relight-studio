@@ -44,7 +44,7 @@ class SourceLightCalibration:
     key_temperature_kelvin: float = 5600.0
     ambient_strength: float = 0.15
     ambient_temperature_kelvin: float = 6500.0
-    casts_shadows: bool = True
+    casts_shadows: bool = False
     name: str = "user_calibrated_source_key"
 
     def validate(self) -> None:

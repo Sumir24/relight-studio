@@ -81,3 +81,33 @@ def test_scene_buffers_validate_dynamic_semantic_and_instance_maps():
     scene.instance_masks["ceramic_mug__001"][0, 0] = 1.2
     with pytest.raises(ValueError, match="instance mask"):
         scene.validate()
+
+
+def test_scene_buffers_validates_intrinsic_maps_and_rejects_bad_shapes_or_negatives():
+    scene = make_scene()
+    scene.albedo = np.full((*scene.shape, 3), 0.5, dtype=np.float32)
+    scene.source_shading = np.full(scene.shape, 0.8, dtype=np.float32)
+    scene.non_diffuse_residual = np.zeros((*scene.shape, 3), dtype=np.float32)
+    scene.validate()
+
+    bad = make_scene()
+    bad.albedo = np.full((*scene.shape, 4), 0.5, dtype=np.float32)
+    with pytest.raises(ValueError, match="albedo"):
+        bad.validate()
+
+    bad_shading = make_scene()
+    bad_shading.source_shading = np.full(scene.shape, -0.1, dtype=np.float32)
+    with pytest.raises(ValueError, match="source_shading"):
+        bad_shading.validate()
+
+
+def test_engine_settings_validates_renderer_mode_and_detail_lock_strength():
+    defaults = EngineSettings()
+    assert defaults.color_ratio_min <= 0.25 and defaults.color_ratio_max >= 3.0
+    EngineSettings(renderer_mode="intrinsic", detail_lock_strength=0.9, preserve_source_lighting=True).validate()
+    with pytest.raises(ValueError, match="renderer_mode"):
+        EngineSettings(renderer_mode="unknown").validate()
+    with pytest.raises(ValueError, match="detail_lock_strength"):
+        EngineSettings(detail_lock_strength=1.5).validate()
+    with pytest.raises(ValueError, match="preserve_source_lighting"):
+        EngineSettings(preserve_source_lighting="yes").validate()

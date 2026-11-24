@@ -10,3 +10,7 @@ safetensors>=0.4
 # Verified from the upstream Florence-2 implementation imports.
 einops>=0.7.0
 timm>=1.0.0
+
+# Optional hybrid normal/intrinsic & neural relighting stack
+diffusers>=0.32
+accelerate>=0.34

@@ -13,6 +13,10 @@ class SemanticPrediction:
     specular_color: np.ndarray | None = None
     material_confidence: np.ndarray | None = None
     material_metadata: dict = field(default_factory=dict)
+    albedo: np.ndarray | None = None
+    source_shading: np.ndarray | None = None
+    non_diffuse_residual: np.ndarray | None = None
+    intrinsic_metadata: dict = field(default_factory=dict)
     protected_mask: np.ndarray | None = None
     class_masks: dict[str, np.ndarray] = field(default_factory=dict)
     instance_masks: dict[str, np.ndarray] = field(default_factory=dict)
@@ -44,6 +48,12 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
             raise ValueError(f"{name} must exactly match RGB resolution.")
     if semantics.specular_color is not None and np.asarray(semantics.specular_color).shape != (h, w, 3):
         raise ValueError("specular_color must exactly match RGB resolution with three channels.")
+    if semantics.albedo is not None and np.asarray(semantics.albedo).shape != (h, w, 3):
+        raise ValueError("albedo must exactly match RGB resolution with three channels.")
+    if semantics.source_shading is not None and np.asarray(semantics.source_shading).shape not in ((h, w), (h, w, 3)):
+        raise ValueError("source_shading must exactly match RGB resolution (HxW or HxWx3).")
+    if semantics.non_diffuse_residual is not None and np.asarray(semantics.non_diffuse_residual).shape != (h, w, 3):
+        raise ValueError("non_diffuse_residual must exactly match RGB resolution with three channels.")
     if alpha_mask is not None and np.asarray(alpha_mask).shape != (h, w):
         raise ValueError("alpha_mask must exactly match RGB resolution.")
     for family_name, masks in (("class", semantics.class_masks), ("instance", semantics.instance_masks)):
@@ -70,6 +80,10 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
         specular_color=None if semantics.specular_color is None else semantics.specular_color.astype(np.float32),
         material_confidence=None if semantics.material_confidence is None else semantics.material_confidence.astype(np.float32),
         material_metadata=dict(semantics.material_metadata),
+        albedo=None if semantics.albedo is None else np.asarray(semantics.albedo, dtype=np.float32),
+        source_shading=None if semantics.source_shading is None else np.asarray(semantics.source_shading, dtype=np.float32),
+        non_diffuse_residual=None if semantics.non_diffuse_residual is None else np.asarray(semantics.non_diffuse_residual, dtype=np.float32),
+        intrinsic_metadata=dict(semantics.intrinsic_metadata),
         metadata={
             'depth': depth.metadata,
             'semantics': semantics.metadata,

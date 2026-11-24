@@ -32,7 +32,14 @@ def save_gray(path: Path, array: np.ndarray) -> None:
     if not np.any(valid):
         raise ValueError(f"No finite values to visualize: {path}")
     lo, hi = np.quantile(a[valid], [0.02, 0.98])
-    vis = np.zeros(a.shape, dtype=np.uint8) if hi - lo < 1e-8 else np.round(np.clip((a - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
+    if hi - lo < 1e-8:
+        lo = float(np.min(a[valid]))
+        hi = float(np.max(a[valid]))
+    if hi - lo < 1e-8:
+        const_val = float(np.clip(lo, 0.0, 1.0)) if 0.0 <= lo <= 1.0 else 0.5
+        vis = np.full(a.shape, int(round(const_val * 255)), dtype=np.uint8)
+    else:
+        vis = np.round(np.clip((a - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
     Image.fromarray(vis, mode="L").save(path)
 
 
@@ -115,6 +122,14 @@ def main() -> int:
                         help="Optional Grounding DINO revision; use a full 40-character commit SHA for immutable pinning.")
     parser.add_argument("--segmenter-revision", default=None,
                         help="Optional SAM2 revision; use a full 40-character commit SHA for immutable pinning.")
+    parser.add_argument("--normal-backend", default="depth_derived",
+                        help="Surface normal backend: 'depth_derived' or a registered normal backend (e.g. 'marigold_normals').")
+    parser.add_argument("--normal-revision", default=None,
+                        help="Optional Hugging Face revision for external normal backend.")
+    parser.add_argument("--intrinsic-backend", default="none",
+                        help="Optional intrinsic backend: 'none' or a registered backend (e.g. 'marigold_intrinsics_lighting').")
+    parser.add_argument("--intrinsic-revision", default=None,
+                        help="Optional Hugging Face revision for intrinsic backend.")
     parser.add_argument("--strict-model-revisions", action="store_true",
                         help="Require full 40-character commit SHAs for every model used in this run.")
     args = parser.parse_args()
@@ -127,6 +142,10 @@ def main() -> int:
         }
         if not args.prompts:
             required_revisions["Florence-2"] = args.discovery_revision
+        if args.normal_backend != "depth_derived":
+            required_revisions[f"Normals ({args.normal_backend})"] = args.normal_revision
+        if args.intrinsic_backend != "none":
+            required_revisions[f"Intrinsics ({args.intrinsic_backend})"] = args.intrinsic_revision
         missing = [
             model_name for model_name, revision in required_revisions.items()
             if not is_full_commit_sha(revision)
@@ -160,6 +179,16 @@ def main() -> int:
             ),
             "detector": revision_descriptor(args.detector_revision),
             "segmenter": revision_descriptor(args.segmenter_revision),
+            "normals": (
+                revision_descriptor(args.normal_revision)
+                if args.normal_backend != "depth_derived"
+                else {"revision": None, "revision_kind": "depth_derived_analytic"}
+            ),
+            "intrinsics": (
+                revision_descriptor(args.intrinsic_revision)
+                if args.intrinsic_backend != "none"
+                else {"revision": None, "revision_kind": "disabled"}
+            ),
         },
         "allocator_metric_scope": "PyTorch backend allocator counters; not total process/system memory",
         "stages": [],
@@ -252,23 +281,92 @@ def main() -> int:
     points = backproject_depth(depth.depth, calibration.camera)
     normals, normal_conf = estimate_normals(points, depth.depth, depth.confidence)
     geometry_conf = np.clip(normal_conf, 0, 1)
+    geometry_conf_source = "edge-aware log-depth curvature and normal-validity heuristic; not calibrated"
+
+    normal_meta: dict = {
+        "backend": args.normal_backend,
+        "source": "depth_derived_analytic" if args.normal_backend == "depth_derived" else "model_estimated",
+    }
+    if args.normal_backend != "depth_derived":
+        from relight_engine.adapters.registry import create_normal_backend
+        print(f"[4b/5] Estimating surface normals with {args.normal_backend}...")
+        norm_kwargs = {"device": args.device}
+        if args.normal_revision:
+            norm_kwargs["revision"] = args.normal_revision
+        normal_backend = create_normal_backend(args.normal_backend, **norm_kwargs)
+        norm_started = perf_counter()
+        try:
+            norm_pred = normal_backend.estimate(rgb, depth=depth.depth)
+            normals = norm_pred.normals.astype(np.float32)
+            geometry_conf = np.clip(norm_pred.confidence * np.where(depth.depth > 0, 1.0, 0.0), 0.0, 1.0).astype(np.float32)
+            geometry_conf_source = str(norm_pred.metadata.get("confidence_source", f"normal backend {args.normal_backend}"))
+            normal_meta = {
+                "backend": args.normal_backend,
+                **dict(norm_pred.metadata),
+            }
+        except Exception as exc:
+            print(f"ERROR: Normal estimation failed: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            inference_runtime["stages"].append(
+                close_model_stage("normals", args.normal_backend, norm_started, normal_backend)
+            )
+
+    intr_albedo = None
+    intr_shading = None
+    intr_residual = None
+    intr_roughness = None
+    intr_metalness = None
+    intr_spec_level = None
+    intr_meta: dict = {}
+    mat_meta: dict = {}
+    if args.intrinsic_backend != "none":
+        from relight_engine.adapters.registry import create_intrinsic_backend
+        print(f"[4c/5] Estimating intrinsic buffers with {args.intrinsic_backend}...")
+        intr_kwargs = {"device": args.device}
+        if args.intrinsic_revision:
+            intr_kwargs["revision"] = args.intrinsic_revision
+        intrinsic_backend = create_intrinsic_backend(args.intrinsic_backend, **intr_kwargs)
+        intr_started = perf_counter()
+        try:
+            intr_pred = intrinsic_backend.estimate(rgb)
+            intr_albedo = intr_pred.albedo
+            intr_shading = intr_pred.source_shading
+            intr_residual = intr_pred.non_diffuse_residual
+            intr_roughness = intr_pred.roughness
+            intr_metalness = intr_pred.metalness
+            intr_spec_level = intr_pred.specular_level
+            intr_meta = dict(intr_pred.metadata)
+            for mname, marr in (("roughness", intr_roughness), ("metalness", intr_metalness), ("specular_level", intr_spec_level)):
+                if marr is not None:
+                    mat_meta[mname] = {"source": "model_estimated", "calibrated": False}
+        except Exception as exc:
+            print(f"ERROR: Intrinsic decomposition failed: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            inference_runtime["stages"].append(
+                close_model_stage("intrinsics", args.intrinsic_backend, intr_started, intrinsic_backend)
+            )
+
     semantics = SemanticPrediction(
         lightable_mask=seg.lightable_mask, protected_mask=seg.protected_mask,
         class_masks=seg.masks, instance_masks=seg.instance_masks, metadata=seg.metadata,
+        roughness=intr_roughness, metalness=intr_metalness, specular_level=intr_spec_level,
+        material_metadata=mat_meta,
+        albedo=intr_albedo, source_shading=intr_shading, non_diffuse_residual=intr_residual,
+        intrinsic_metadata=intr_meta,
     )
     scene = build_scene_buffers(rgb, depth, semantics, alpha_mask=image_input.alpha_mask)
     scene.geometry_confidence = geometry_conf.astype(np.float32)
     scene.normals = normals.astype(np.float32)
-    scene.metadata["geometry_confidence_source"] = (
-        "edge-aware log-depth curvature and normal-validity heuristic; not calibrated"
-    )
+    scene.metadata["geometry_confidence_source"] = geometry_conf_source
     scene.metadata["geometry_confidence_calibrated"] = False
     scene.validate()
 
     print("[5/5] Saving generic scene buffers, masks and provenance...")
     save_gray(args.out / "depth_relative.png", depth.depth)
     Image.fromarray(np.round(np.clip((normals + 1.0) * 0.5, 0, 1) * 255).astype(np.uint8), mode="RGB").save(args.out / "normals_camera_space.png")
-    save_gray(args.out / "geometry_confidence.png", geometry_conf)
+    save_mask(args.out / "geometry_confidence.png", geometry_conf)
     save_mask(args.out / "mask_lightable.png", seg.lightable_mask)
     save_mask(args.out / "mask_protected.png", seg.protected_mask)
 
@@ -292,6 +390,19 @@ def main() -> int:
     }
     if image_input.alpha_mask is not None:
         buffers["alpha_mask"] = image_input.alpha_mask
+    if scene.albedo is not None:
+        buffers["albedo"] = scene.albedo
+        Image.fromarray(np.round(np.clip(scene.albedo, 0, 1) * 255).astype(np.uint8), mode="RGB").save(args.out / "intrinsic_albedo.png")
+    if scene.source_shading is not None:
+        buffers["source_shading"] = scene.source_shading
+        sh_vis = scene.source_shading if scene.source_shading.ndim == 2 else np.mean(scene.source_shading, axis=-1)
+        save_gray(args.out / "intrinsic_shading.png", sh_vis)
+    if scene.non_diffuse_residual is not None:
+        buffers["non_diffuse_residual"] = scene.non_diffuse_residual
+    for mname in ("roughness", "metalness", "specular_level"):
+        mval = getattr(scene, mname)
+        if mval is not None:
+            buffers[mname] = mval
     buffers.update({f"mask_{safe_filename(k)}": v for k, v in seg.masks.items()})
     buffers.update({f"mask_instance_{safe_filename(k)}": v for k, v in seg.instance_masks.items()})
     np.savez_compressed(args.out / "scene_buffers.npz", **buffers)
@@ -312,6 +423,9 @@ def main() -> int:
         "semantic_labels": sorted(seg.masks.keys()),
         "instance_masks": sorted(seg.instance_masks.keys()),
         "depth": depth.metadata,
+        "normals": normal_meta,
+        "intrinsic_metadata": scene.intrinsic_metadata,
+        "material_metadata": scene.material_metadata,
         "geometry_confidence": {
             "source": scene.metadata["geometry_confidence_source"],
             "calibrated": False,
@@ -338,14 +452,22 @@ def main() -> int:
             "geometry_confidence_mean": float(np.mean(geometry_conf)),
             "detections_count": len(seg.detections),
         },
-        "material_estimation": "not implemented; no physical material labels are inferred by segmentation",
+        "material_estimation": (
+            f"model-estimated rough/metal/specular priors from {args.intrinsic_backend} (uncalibrated)"
+            if mat_meta
+            else "not implemented; no physical material labels are inferred by segmentation"
+        ),
         "source_light_estimation": "not implemented; requires user calibration or a separately validated estimator",
         "limitations": [
             "Depth is relative, not metric; no physical distance claims are valid.",
             "Camera intrinsics are FOV-derived unless calibrated metadata was supplied.",
             "Open-vocabulary region discovery is a candidate list, not exhaustive semantic ground truth.",
             "Detector and mask-quality scores are not calibrated probabilities.",
-            "No material maps or original-light estimate are produced by this analysis pass.",
+            *(
+                ["Material maps from intrinsic appearance inference are uncalibrated; original light remains user-calibrated."]
+                if mat_meta
+                else ["No material maps or original-light estimate are produced by this analysis pass."]
+            ),
             "All image pixels are candidates by default; only explicit protected labels are excluded.",
             "No relit output is generated by this scene-analysis command.",
         ],

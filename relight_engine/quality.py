@@ -488,6 +488,12 @@ def evaluate_scene_buffers(scene: SceneBuffers) -> dict[str, Any]:
             "near_duplicate_instances": duplicate_instances,
         },
         "materials": material_report,
+        "intrinsics": {
+            "albedo_available": scene.albedo is not None,
+            "source_shading_available": scene.source_shading is not None,
+            "non_diffuse_residual_available": scene.non_diffuse_residual is not None,
+            "metadata": dict(scene.intrinsic_metadata),
+        },
         "warnings": warnings,
         "errors": errors,
         "metadata": scene.metadata,

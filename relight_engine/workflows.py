@@ -116,11 +116,21 @@ def load_scene_artifacts(scene_dir: str | Path) -> tuple[SceneBuffers, CameraMod
         specular_color=arrays.get("specular_color"),
         material_confidence=arrays.get("material_confidence"),
         material_metadata=manifest.get("material_metadata", {}),
+        albedo=arrays.get("albedo"),
+        source_shading=arrays.get("source_shading"),
+        non_diffuse_residual=arrays.get("non_diffuse_residual"),
+        intrinsic_metadata=manifest.get("intrinsic_metadata", {}),
         metadata={
             "source_manifest": str(manifest_path),
             "depth": manifest.get("depth", {}),
             "segmentation": manifest.get("segmentation", {}),
+            "scene_discovery": manifest.get("scene_discovery", {}),
             "geometry_confidence_source": manifest.get("geometry_confidence", {}).get("source"),
+            "neural_scene_estimation_used": bool(
+                manifest.get("depth", {}).get("model_id")
+                or manifest.get("segmentation", {}).get("detector_id")
+                or manifest.get("scene_discovery", {}).get("model_id")
+            ),
         },
     )
     camera_data = manifest.get("camera", {})
@@ -218,7 +228,15 @@ def apply_user_material_assignments(
     return maps.metadata
 
 
-def run_scene_relight(scene_dir: str | Path, config_path: str | Path, output_path: str | Path) -> dict:
+def run_scene_relight(
+    scene_dir: str | Path,
+    config_path: str | Path,
+    output_path: str | Path,
+    *,
+    renderer_mode: str | None = None,
+    relighter_backend: str | None = None,
+    device: str = "auto",
+) -> dict:
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     if config.get("approved_for_test") is not True:
         raise ValueError("Set approved_for_test=true only after reviewing source and target calibration values.")
@@ -227,12 +245,36 @@ def run_scene_relight(scene_dir: str | Path, config_path: str | Path, output_pat
     source_rig = source_calibration.to_rig()
     target_rig = target_rig_from_dict(config.get("target_rig"))
     material_metadata = apply_user_material_assignments(scene, arrays, config.get("material_assignments", []))
-    settings = EngineSettings(**config.get("settings", {}))
+    raw_settings = dict(config.get("settings", {}))
+    if renderer_mode is not None:
+        raw_settings["renderer_mode"] = renderer_mode
+    settings = EngineSettings(**raw_settings)
     require_geometry_ready = bool(config.get("require_geometry_ready", True))
-    result = relight(
-        scene, camera, source_rig, target_rig, settings,
-        require_geometry_ready=require_geometry_ready,
-    )
+
+    chosen_relighter = relighter_backend if relighter_backend is not None else config.get("relighter_backend")
+    relighter = None
+    if settings.renderer_mode == "hybrid_neural":
+        from .adapters.registry import available_backends, create_relighter_backend
+
+        if not chosen_relighter or str(chosen_relighter).strip().lower() == "none":
+            choices = ", ".join(available_backends()["relighters"])
+            raise ValueError(
+                f"renderer_mode='hybrid_neural' requires a relighter_backend (available: {choices})."
+            )
+        relighter_kwargs = dict(config.get("relighter_options", {}))
+        if device != "auto" or "device" not in relighter_kwargs:
+            relighter_kwargs["device"] = device
+        relighter = create_relighter_backend(str(chosen_relighter), **relighter_kwargs)
+
+    try:
+        result = relight(
+            scene, camera, source_rig, target_rig, settings,
+            require_geometry_ready=require_geometry_ready,
+            neural_relighter=relighter,
+        )
+    finally:
+        if relighter is not None:
+            relighter.close()
 
     from PIL import Image
     out = Path(output_path)

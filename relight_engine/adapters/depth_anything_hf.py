@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 import numpy as np
 
-from .runtime import memory_snapshot, release_device_cache, resolve_torch_device, revision_descriptor
+from .runtime import memory_snapshot, release_device_cache, release_model_from_device, resolve_torch_device, revision_descriptor
 
 @dataclass
 class DepthPrediction:
@@ -29,8 +29,29 @@ def normalize_relative_depth(raw_score: np.ndarray, *, near_is_high: bool,
         raise ValueError("Require finite 0 < near_value < far_value.")
     lo, hi = np.quantile(raw, [0.02, 0.98])
     if hi - lo < 1e-6:
-        raise ValueError("Relative depth prediction has insufficient dynamic range.")
-    unit = np.clip((raw - lo) / (hi - lo), 0.0, 1.0)
+        lo = float(np.min(raw))
+        hi = float(np.max(raw))
+        if hi - lo < 1e-6:
+            raise ValueError("Relative depth prediction has insufficient dynamic range.")
+    raw_min = float(np.min(raw))
+    raw_max = float(np.max(raw))
+    # Preserve strictly monotonic gradients in the extreme 2% tails instead of flat clipping.
+    low_anchor = 0.04 if raw_min < lo - 1e-7 else 0.0
+    high_anchor = 0.96 if raw_max > hi + 1e-7 else 1.0
+    unit = np.zeros_like(raw, dtype=np.float32)
+    mid_mask = (raw >= lo) & (raw <= hi)
+    unit[mid_mask] = low_anchor + (high_anchor - low_anchor) * (raw[mid_mask] - lo) / (hi - lo)
+    low_mask = raw < lo
+    if low_anchor > 0.0:
+        unit[low_mask] = low_anchor * (raw[low_mask] - raw_min) / max(float(lo - raw_min), 1e-8)
+    else:
+        unit[low_mask] = 0.0
+    high_mask = raw > hi
+    if high_anchor < 1.0:
+        unit[high_mask] = high_anchor + (1.0 - high_anchor) * (raw[high_mask] - hi) / max(float(raw_max - hi), 1e-8)
+    else:
+        unit[high_mask] = 1.0
+    unit = np.clip(unit, 0.0, 1.0)
     if near_is_high:
         unit = 1.0 - unit
     return (near_value + (far_value - near_value) * unit).astype(np.float32)
@@ -128,6 +149,7 @@ class HuggingFaceDepthAnythingV2:
             return {"released": False, "already_closed": True, "device": self._device}
         before = memory_snapshot(self._torch, self._device)
         was_loaded = self._model is not None or self._processor is not None
+        release_model_from_device(self._model)
         self._model = None
         self._processor = None
         cleanup = release_device_cache(self._torch, self._device)

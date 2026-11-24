@@ -154,3 +154,14 @@ def test_material_report_warns_for_unsourced_or_unconfident_estimated_maps():
     scene.material_metadata = {}
     report_without_source = evaluate_scene_buffers(scene)
     assert any("lack declared provenance" in w.lower() for w in report_without_source["warnings"])
+
+
+def test_quality_report_records_intrinsic_availability_and_provenance():
+    scene = make_scene()
+    scene.albedo = np.full((*scene.shape, 3), 0.5, dtype=np.float32)
+    scene.source_shading = np.full(scene.shape, 0.7, dtype=np.float32)
+    scene.intrinsic_metadata = {"source": "test_intrinsic_estimator", "calibrated": False}
+    report = evaluate_scene_buffers(scene)
+    assert report["intrinsics"]["albedo_available"] is True
+    assert report["intrinsics"]["source_shading_available"] is True
+    assert report["intrinsics"]["metadata"]["source"] == "test_intrinsic_estimator"

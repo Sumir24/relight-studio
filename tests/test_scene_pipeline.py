@@ -181,3 +181,15 @@ def test_scene_factory_rejects_misaligned_or_invalid_instance_masks():
     invalid = np.zeros((h, w), np.float32); invalid[0, 0] = 1.5
     with pytest.raises(ValueError, match=r"finite and in \[0,1\]"):
         build_scene_buffers(rgb, depth, SemanticPrediction(instance_masks={"object__001": invalid}))
+
+
+def test_normalize_relative_depth_preserves_gradients_in_extreme_quantiles():
+    raw = np.linspace(0.0, 100.0, 1000, dtype=np.float32).reshape(10, 100)
+    depth = normalize_relative_depth(raw, near_is_high=True)
+    assert float(depth.min()) == pytest.approx(1.0)
+    assert float(depth.max()) == pytest.approx(5.0)
+    # Bottom 2% and top 2% columns must still preserve nonzero gradient (not flat-clipped)
+    row_diffs = np.diff(depth[0, :])
+    assert np.all(row_diffs < 0.0)
+    far_high = normalize_relative_depth(raw, near_is_high=False)
+    assert np.allclose(depth + far_high, 6.0)
