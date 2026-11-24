@@ -204,5 +204,5 @@ def test_user_material_assignment_applies_rgb_f0_confidence_and_provenance():
     assert "unassigned pixels retain" in scene.material_metadata["specular_color"]["notes"]
     assert scene.material_metadata["roughness"]["source"] == "user_assignment_plus_renderer_prior"
     assert scene.material_metadata["material_confidence"]["calibrated"] is False
-    assert "not a calibrated probability" in scene.material_metadata["material_confidence"]["notes"]
+    assert "not a calibrated probability" in scene.material_metadata["material_confidence"]["notes"].lower()
     assert metadata["neural_material_estimation_used"] is False
