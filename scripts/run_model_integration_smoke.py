@@ -11,6 +11,7 @@ import gc
 import json
 import sys
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 
@@ -62,14 +63,17 @@ def timed_stage(name: str, fn):
 
 
 def failed_stage(report: dict, name: str, exc: Exception, elapsed: float) -> None:
+    trace = traceback.format_exc()
     message = f"{type(exc).__name__}: {exc}"
     print(f"[FAIL] {name}: {message}", file=sys.stderr, flush=True)
+    print(trace, file=sys.stderr, flush=True)
     report["stages"].append({
         "name": name,
         "status": "failed",
         "elapsed_seconds": round(elapsed, 3),
         "error_type": type(exc).__name__,
         "error": str(exc),
+        "traceback": trace,
     })
 
 
