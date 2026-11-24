@@ -4,7 +4,7 @@ These are engineering screening notes, not legal advice. Re-check the exact chec
 
 | Candidate | Official evidence found | Engineering decision |
 |---|---|---|
-| Florence-2 Base (`microsoft/Florence-2-base`) | Hugging Face model card lists MIT. Tasks include detailed caption, object detection, dense-region caption, region proposal and phrase grounding. The model uses `trust_remote_code=True`. | Candidate for per-image scene discovery and adaptive prompt generation. Pin/audit remote code; not proof of exhaustive discovery. |
+| Florence-2 Base (`microsoft/Florence-2-base`) | Hugging Face model card and repository `LICENSE` file list MIT. The current `modeling_florence2.py` source file carries an Apache-2.0 header. Tasks include detailed caption, object detection, dense-region caption, region proposal and phrase grounding. The model uses `trust_remote_code=True`. | Candidate for per-image scene discovery and adaptive prompt generation. Treat the differing repository/file notices as a provenance item to resolve; pin and audit the exact remote code before deployment or redistribution. Not proof of exhaustive discovery. |
 | Grounding DINO Tiny (`IDEA-Research/grounding-dino-tiny`) | Official repository lists Apache-2.0. | Candidate open-vocabulary detection stage; labels come from image discovery/user prompts, not a fixed taxonomy. |
 | SAM 2.1 Hiera Tiny (`facebook/sam2.1-hiera-tiny`) | Official Meta SAM 2 repository says checkpoints and code are Apache-2.0. | Candidate to turn region proposals into soft pixel masks. |
 | Depth Anything V2 Small HF relative | Prior checked model card lists Apache-2.0. | Current implemented baseline depth model, relative depth only. |
@@ -25,6 +25,10 @@ Do not rely on one closed category list or one scene-specific segmentation model
 5. The renderer consumes a common scene representation, independent of semantic names.
 
 The first-stage labels can miss objects; all mask/detection scores remain uncalibrated ranking/quality signals unless independently calibrated.
+
+## Florence-2 provenance follow-up
+
+The Hub repository's `LICENSE` file is MIT, while the current `modeling_florence2.py` file contains an Apache-2.0 header. This note records the observed notices; it does not determine which terms govern each component. Before shipping, retain the exact model revision, inspect all executed remote files and their notices, and obtain a legal interpretation if the component scope remains ambiguous.
 
 ## Primary sources
 
