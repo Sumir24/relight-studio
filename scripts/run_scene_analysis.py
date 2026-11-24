@@ -22,6 +22,7 @@ from relight_engine.image_io import load_image
 from relight_engine.scene_policy import semantic_key
 from relight_engine.scene_domains import SceneDomainHint, SUPPORTED_QA_DOMAINS
 from relight_engine.quality import evaluate_scene_buffers
+from relight_engine.adapters.runtime import is_full_commit_sha, revision_descriptor
 
 
 def save_gray(path: Path, array: np.ndarray) -> None:
@@ -102,7 +103,35 @@ def main() -> int:
     parser.add_argument("--scene-domain", default="auto", choices=["auto", *SUPPORTED_QA_DOMAINS],
                         help="Optional QA/profile hint only; it does not switch renderer physics.")
     parser.add_argument("--depth-model", default=HuggingFaceDepthAnythingV2.DEFAULT_RELATIVE_MODEL)
+    parser.add_argument("--depth-revision", default=None,
+                        help="Optional Hugging Face revision; use a full 40-character commit SHA for immutable pinning.")
+    parser.add_argument("--discovery-revision", default=None,
+                        help="Optional Florence-2 revision; use a full commit SHA to pin executed remote code.")
+    parser.add_argument("--detector-revision", default=None,
+                        help="Optional Grounding DINO revision; use a full 40-character commit SHA for immutable pinning.")
+    parser.add_argument("--segmenter-revision", default=None,
+                        help="Optional SAM2 revision; use a full 40-character commit SHA for immutable pinning.")
+    parser.add_argument("--strict-model-revisions", action="store_true",
+                        help="Require full 40-character commit SHAs for every model used in this run.")
     args = parser.parse_args()
+
+    if args.strict_model_revisions:
+        required_revisions = {
+            "Depth Anything": args.depth_revision,
+            "Grounding DINO": args.detector_revision,
+            "SAM2": args.segmenter_revision,
+        }
+        if not args.prompts:
+            required_revisions["Florence-2"] = args.discovery_revision
+        missing = [
+            model_name for model_name, revision in required_revisions.items()
+            if not is_full_commit_sha(revision)
+        ]
+        if missing:
+            parser.error(
+                "--strict-model-revisions requires full 40-character commit SHAs for: "
+                + ", ".join(missing)
+            )
 
     if not args.image.is_file():
         parser.error(f"Input image does not exist: {args.image}")
@@ -119,6 +148,15 @@ def main() -> int:
     domain_hint.validate()
     inference_runtime: dict = {
         "device_requested": args.device,
+        "model_revisions": {
+            "depth": revision_descriptor(args.depth_revision),
+            "discovery": (
+                revision_descriptor(args.discovery_revision)
+                if not args.prompts else {"revision": None, "revision_kind": "skipped_user_prompts"}
+            ),
+            "detector": revision_descriptor(args.detector_revision),
+            "segmenter": revision_descriptor(args.segmenter_revision),
+        },
         "allocator_metric_scope": "PyTorch backend allocator counters; not total process/system memory",
         "stages": [],
     }
@@ -126,6 +164,7 @@ def main() -> int:
     depth_backend = HuggingFaceDepthAnythingV2(
         model_id=args.depth_model, output_kind="relative",
         relative_near_is_high=bool(args.near_is_high), device=args.device,
+        revision=args.depth_revision,
     )
     print("[1/5] Estimating relative depth...")
     depth_started = perf_counter()
@@ -152,7 +191,8 @@ def main() -> int:
     else:
         print("[2/5] Discovering image-specific regions with Florence-2...")
         discovery_backend = Florence2SceneDiscovery(
-            model_id=args.discovery_model, device=args.device
+            model_id=args.discovery_model, device=args.device,
+            revision=args.discovery_revision,
         )
         discovery_started = perf_counter()
         try:
@@ -181,6 +221,8 @@ def main() -> int:
     segmentation_backend = HuggingFaceGroundedSAM2(
         device=args.device, box_threshold=args.box_threshold,
         text_threshold=args.text_threshold, max_detections_per_prompt=args.max_detections,
+        detector_revision=args.detector_revision,
+        segmenter_revision=args.segmenter_revision,
     )
     segmentation_started = perf_counter()
     try:
