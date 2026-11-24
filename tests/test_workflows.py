@@ -88,8 +88,22 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
         geometry_confidence=conf, normals=normals, lightable_mask=lightable,
         mask_surface_panel=surface_a, mask_fabric=surface_b,
         mask_instance_person__001=person_1, alpha_mask=alpha, protected_mask=protected,
+        roughness=np.full((h, w), 0.42, np.float32),
+        metalness=np.full((h, w), 0.25, np.float32),
+        specular_level=np.full((h, w), 0.06, np.float32),
+        specular_color=np.broadcast_to(
+            np.array([0.72, 0.38, 0.18], np.float32), (h, w, 3)
+        ).copy(),
+        material_confidence=np.full((h, w), 0.6, np.float32),
     )
     manifest = {
+        "material_metadata": {
+            "roughness": {"source": "user_authored", "calibrated": False},
+            "metalness": {"source": "user_authored", "calibrated": False},
+            "specular_level": {"source": "user_authored", "calibrated": False},
+            "specular_color": {"source": "user_authored", "calibrated": False},
+            "material_confidence": {"source": "user_reviewed", "calibrated": False},
+        },
         "depth": {"depth_kind": "relative", "model_id": "synthetic-test-fixture"},
         "geometry_confidence": {"source": "synthetic-test-heuristic", "calibrated": False},
         "segmentation": {"model_id": "synthetic-test-fixture"},
@@ -103,6 +117,10 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     assert sorted(loaded_scene.instance_masks) == ["person__001"]
     assert loaded_scene.alpha_mask is not None
     assert loaded_scene.protected_mask is not None
+    assert loaded_scene.specular_color is not None
+    assert np.allclose(loaded_scene.specular_color[0, 0], [0.72, 0.38, 0.18])
+    assert loaded_scene.material_confidence[0, 0] == pytest.approx(0.6)
+    assert loaded_scene.material_metadata["specular_color"]["source"] == "user_authored"
     assert loaded_scene.metadata["geometry_confidence_source"] == "synthetic-test-heuristic"
     assert np.all(loaded_scene.protected_mask[:2] == 1.0)
 
