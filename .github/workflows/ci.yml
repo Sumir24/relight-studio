@@ -5,8 +5,6 @@ on:
     branches:
       - feature/model-lifecycle-v2
   pull_request:
-    branches:
-      - feature/geometry-v2-quality-gate
 
 permissions:
   contents: read
