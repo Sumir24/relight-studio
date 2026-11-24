@@ -206,7 +206,7 @@ def test_zero_material_confidence_blends_supplied_maps_to_declared_priors():
     scene, camera = make_plane()
     scene.roughness[:] = 0.12
     scene.metalness[:] = 1.0
-    scene.specular_level[:] = 0.9
+    scene.specular_level = np.full(scene.shape, 0.9, dtype=np.float32)
     scene.specular_color = np.full((*scene.shape, 3), (0.9, 0.1, 0.1), dtype=np.float32)
     scene.material_confidence = np.zeros(scene.shape, dtype=np.float32)
 
