@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""CPU integration smoke test for the real Hugging Face scene-analysis checkpoints.
+"""Run real Hugging Face checkpoint inference stages independently on CPU.
 
-This script is intentionally separate from unit tests: it downloads real model
-weights and a public example photograph, then exercises actual inference. It is
-designed for GitHub Actions or a developer machine with network access. It does
-not validate Apple MPS behaviour or visual-quality ground truth.
+A stage failure is recorded and does not prevent later independent model stages
+from running. The command still exits non-zero if any stage fails. It downloads
+real weights and a public fixture photograph; it is not an MPS or quality benchmark.
 """
 from __future__ import annotations
 
@@ -35,7 +34,7 @@ FIXTURE_URL = (
 )
 OUTPUT_PATH = Path("model_smoke_report.json")
 
-# Immutable Hugging Face revisions recorded for reproducible smoke inference.
+# Immutable Hugging Face revisions recorded in LICENSE_MODEL_NOTES.md.
 DEPTH_REVISION = "5426e4f0f36572d16453bbda7a8389317b1bef99"
 FLORENCE_REVISION = "15bd11834572457e1e8e8fec7f25c83283902db2"
 GROUNDING_DINO_REVISION = "a2bb814dd30d776dcf7e30523b00659f4f141c71"
@@ -49,7 +48,6 @@ def load_fixture() -> np.ndarray:
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         image = Image.open(response).convert("RGB")
-    # Bound CPU integration-test cost while retaining an actual natural image.
     image.thumbnail((768, 768), Image.Resampling.LANCZOS)
     return np.asarray(image, dtype=np.float32) / 255.0
 
@@ -61,6 +59,18 @@ def timed_stage(name: str, fn):
     elapsed = round(time.perf_counter() - started, 3)
     print(f"[PASS] {name}: {elapsed:.3f}s", flush=True)
     return result, elapsed
+
+
+def failed_stage(report: dict, name: str, exc: Exception, elapsed: float) -> None:
+    message = f"{type(exc).__name__}: {exc}"
+    print(f"[FAIL] {name}: {message}", file=sys.stderr, flush=True)
+    report["stages"].append({
+        "name": name,
+        "status": "failed",
+        "elapsed_seconds": round(elapsed, 3),
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    })
 
 
 def main() -> int:
@@ -77,20 +87,28 @@ def main() -> int:
             "width": width,
             "height": height,
         },
+        "model_revisions": {
+            "depth": DEPTH_REVISION,
+            "florence2": FLORENCE_REVISION,
+            "grounding_dino": GROUNDING_DINO_REVISION,
+            "sam2": SAM2_REVISION,
+        },
         "stages": [],
         "limitations": [
             "This is real CPU checkpoint inference on GitHub Actions, not Apple MPS validation.",
             "Successful inference does not establish depth, mask, normal, material, or relighting ground-truth accuracy.",
             "The fixture is a car photograph; this smoke test is not a multi-domain benchmark.",
+            "The fixture-specific fallback prompt 'car' is used only to test the known public car fixture when Florence discovery fails; production prompts remain image-specific.",
         ],
     }
 
-    # 1. Depth Anything V2: test actual processor/model loading and raw inference.
+    # 1. Depth Anything V2, independent raw-depth checkpoint check.
     depth_adapter = HuggingFaceDepthAnythingV2(
         device="cpu",
-        relative_near_is_high=True,  # Only used by estimate(); polarity is not evaluated here.
+        relative_near_is_high=True,  # Polarity is not assessed in this smoke test.
         revision=DEPTH_REVISION,
     )
+    started = time.perf_counter()
     try:
         (raw_depth, depth_metadata), elapsed = timed_stage(
             "Depth Anything V2 raw inference",
@@ -103,60 +121,53 @@ def main() -> int:
             "status": "passed",
             "elapsed_seconds": elapsed,
             "model_id": depth_metadata["model_id"],
-            "model_revision": {
-                "revision": depth_metadata.get("revision"),
-                "revision_kind": depth_metadata.get("revision_kind"),
-                "immutable_commit_pinned": depth_metadata.get("immutable_commit_pinned"),
-            },
+            "model_revision": depth_metadata,
             "output_shape": list(raw_depth.shape),
-            "raw_range": [
-                float(np.min(raw_depth)),
-                float(np.max(raw_depth)),
-            ],
+            "raw_range": [float(np.min(raw_depth)), float(np.max(raw_depth))],
         })
+    except Exception as exc:
+        failed_stage(report, "depth", exc, time.perf_counter() - started)
     finally:
         depth_adapter.close()
         del depth_adapter
         gc.collect()
 
-    # 2. Florence-2: exercise both detailed caption and dense-region discovery.
+    # 2. Florence-2. Continue to segmentation using the known fixture label if it fails.
+    discovered_prompts: list[str] = []
     discovery_adapter = Florence2SceneDiscovery(
         device="cpu",
         max_new_tokens=256,
         max_prompts=16,
         revision=FLORENCE_REVISION,
     )
+    started = time.perf_counter()
     try:
-        discovery, elapsed = timed_stage(
+        (discovery, elapsed) = timed_stage(
             "Florence-2 scene discovery",
             lambda: discovery_adapter.discover(rgb),
         )
         if not discovery.prompts:
             raise RuntimeError("Florence-2 returned no region prompts.")
+        discovered_prompts = list(discovery.prompts)
         report["stages"].append({
             "name": "florence2",
             "status": "passed",
             "elapsed_seconds": elapsed,
             "model_id": discovery.metadata["model_id"],
-            "model_revision": {
-                "revision": discovery.metadata.get("revision"),
-                "revision_kind": discovery.metadata.get("revision_kind"),
-                "immutable_commit_pinned": discovery.metadata.get("immutable_commit_pinned"),
-            },
-            "remote_code_revision_pinned": discovery.metadata.get("remote_code_revision_pinned"),
+            "model_revision": discovery.metadata,
             "prompt_count": len(discovery.prompts),
-            "prompts": list(discovery.prompts),
+            "prompts": discovered_prompts,
             "caption_present": bool(discovery.caption),
         })
-        discovered_prompts = list(discovery.prompts)
+    except Exception as exc:
+        failed_stage(report, "florence2", exc, time.perf_counter() - started)
     finally:
         discovery_adapter.close()
         del discovery_adapter
         gc.collect()
 
-    # 3. Grounding DINO + SAM2: use the documented car fixture label alongside
-    # Florence's discovered labels. This label belongs only to this smoke fixture,
-    # not to the universal runtime's scene taxonomy.
+    # 3. Grounding DINO + SAM2, independently tested even if Florence failed.
+    # "car" is an explicit label for this known test fixture only, not a production taxonomy.
     prompts = list(dict.fromkeys(["car", *discovered_prompts]))[:16]
     segmentation_adapter = HuggingFaceGroundedSAM2(
         device="cpu",
@@ -167,8 +178,9 @@ def main() -> int:
         detector_revision=GROUNDING_DINO_REVISION,
         segmenter_revision=SAM2_REVISION,
     )
+    started = time.perf_counter()
     try:
-        segmentation, elapsed = timed_stage(
+        (segmentation, elapsed) = timed_stage(
             "Grounding DINO + SAM2 segmentation",
             lambda: segmentation_adapter.estimate(rgb, prompts=prompts),
         )
@@ -193,20 +205,26 @@ def main() -> int:
             "detector_revision": segmentation.metadata["detector_model_revision"],
             "segmenter_id": segmentation.metadata["segmenter_id"],
             "segmenter_revision": segmentation.metadata["segmenter_model_revision"],
+            "prompt_source": "fixture_label_plus_florence_discovery" if discovered_prompts else "known_fixture_label_only",
             "detection_count": len(segmentation.detections),
             "instance_mask_count": len(segmentation.instance_masks),
             "lifecycle": lifecycle,
         })
+    except Exception as exc:
+        failed_stage(report, "grounding_dino_sam2", exc, time.perf_counter() - started)
     finally:
         segmentation_adapter.close()
         del segmentation_adapter
         gc.collect()
 
-    report["status"] = "passed"
+    failures = [stage for stage in report["stages"] if stage["status"] != "passed"]
+    report["status"] = "passed" if not failures else "failed"
+    report["passed_stage_count"] = len(report["stages"]) - len(failures)
+    report["failed_stage_count"] = len(failures)
     OUTPUT_PATH.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2), flush=True)
     print(f"Saved report: {OUTPUT_PATH.resolve()}", flush=True)
-    return 0
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":
