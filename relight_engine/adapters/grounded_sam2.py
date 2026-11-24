@@ -146,6 +146,7 @@ class HuggingFaceGroundedSAM2:
             det_outputs = self._det_model(**det_inputs)
         det_results = self._det_processor.post_process_grounded_object_detection(
             det_outputs,
+            input_ids=det_inputs["input_ids"],
             threshold=self.box_threshold,
             text_threshold=self.text_threshold,
             target_sizes=[(height, width)],
