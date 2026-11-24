@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gc
 import json
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -30,6 +31,8 @@ FIXTURE_URL = (
     "resolve/main/transformers/tasks/car.jpg?download=true"
 )
 OUTPUT_PATH = Path("model_smoke_report.json")
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
 def load_fixture() -> np.ndarray:
