@@ -95,7 +95,11 @@ class Florence2SceneDiscovery:
 
     def _run_task(self, pil_image, task: str) -> dict:
         torch = self._torch
-        inputs = self._processor(text=task, images=pil_image, return_tensors="pt")
+        # The pinned Florence-2 remote processor batches text and images together.
+        # Pass one-item lists so it constructs exactly one prompt for exactly one image.
+        inputs = self._processor(
+            text=[task], images=[pil_image], return_tensors="pt"
+        )
         moved = {}
         for key, value in inputs.items():
             if hasattr(value, "to"):
