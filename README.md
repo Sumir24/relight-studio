@@ -73,6 +73,8 @@ Install the PyTorch build appropriate for the target device first. Florence-2 us
 
 ## Neural inference memory lifecycle
 
+Continuous Integration: Python 3.14 compile and pytest checks run for pull requests targeting `feature/geometry-v2-quality-gate`.
+
 The scene-analysis command runs neural stages sequentially and releases each model
 after extracting CPU-side results:
 
