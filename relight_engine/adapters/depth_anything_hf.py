@@ -95,10 +95,12 @@ class HuggingFaceDepthAnythingV2:
         except ImportError as exc:
             raise RuntimeError('Install torch and transformers to use this depth adapter.') from exc
         device = resolve_torch_device(torch, self.device_request)
-        self._processor = AutoImageProcessor.from_pretrained(self.model_id)
-        self._model = AutoModelForDepthEstimation.from_pretrained(self.model_id).to(device).eval()
+        # Store the runtime before checkpoint loading so close() can clean up even
+        # when processor/model initialization fails part-way through.
         self._torch = torch
         self._device = device
+        self._processor = AutoImageProcessor.from_pretrained(self.model_id)
+        self._model = AutoModelForDepthEstimation.from_pretrained(self.model_id).to(device).eval()
 
     def runtime_snapshot(self) -> dict:
         """Return best-effort allocator counters and loaded-model state."""
