@@ -12,9 +12,11 @@ from relight_engine.adapters.grounded_sam2 import (
     HuggingFaceGroundedSAM2,
 )
 from relight_engine.adapters.runtime import (
+    is_full_commit_sha,
     memory_snapshot,
     release_device_cache,
     resolve_torch_device,
+    revision_descriptor,
 )
 
 
@@ -231,3 +233,48 @@ def test_grounded_sam_releases_partially_loaded_segmenter_when_load_fails():
     assert adapter._sam_processor is None
     assert adapter._sam_model is None
     assert adapter.runtime_snapshot()["sam2_loaded"] is False
+
+
+
+def test_full_commit_sha_is_distinguished_from_branch_or_short_ref():
+    full_sha = "a" * 40
+    assert is_full_commit_sha(full_sha) is True
+    assert is_full_commit_sha("a" * 7) is False
+    assert is_full_commit_sha("main") is False
+    assert is_full_commit_sha(None) is False
+
+
+def test_revision_descriptor_marks_default_and_named_refs_as_mutable():
+    default = revision_descriptor(None)
+    named = revision_descriptor("main")
+
+    assert default["revision_kind"] == "default_model_ref"
+    assert default["immutable_commit_pinned"] is False
+    assert named["revision_kind"] == "named_ref"
+    assert named["immutable_commit_pinned"] is False
+
+
+def test_revision_descriptor_marks_full_commit_sha_as_immutable_pin():
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    descriptor = revision_descriptor(revision)
+
+    assert descriptor["revision"] == revision
+    assert descriptor["revision_kind"] == "full_commit_sha"
+    assert descriptor["immutable_commit_pinned"] is True
+
+
+def test_model_adapters_accept_explicit_revision_configuration():
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    depth = HuggingFaceDepthAnythingV2(
+        relative_near_is_high=True, revision=revision
+    )
+    florence = Florence2SceneDiscovery(revision=revision)
+    segmentation = HuggingFaceGroundedSAM2(
+        detector_revision=revision,
+        segmenter_revision=revision,
+    )
+
+    assert depth.revision == revision
+    assert florence.revision == revision
+    assert segmentation.detector_revision == revision
+    assert segmentation.segmenter_revision == revision
