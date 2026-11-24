@@ -98,6 +98,31 @@ def _log_depth_curvature(log_depth: np.ndarray, valid: np.ndarray) -> np.ndarray
     return curvature
 
 
+def _neighbour_support_fraction(valid: np.ndarray) -> np.ndarray:
+    """Measure the fraction of in-image 4-neighbour samples that have valid depth."""
+    left = _shifted(valid, 1, axis=1).copy()
+    right = _shifted(valid, -1, axis=1).copy()
+    up = _shifted(valid, 1, axis=0).copy()
+    down = _shifted(valid, -1, axis=0).copy()
+    left[:, 0] = False
+    right[:, -1] = False
+    up[0, :] = False
+    down[-1, :] = False
+
+    observed = (
+        left.astype(np.float32)
+        + right.astype(np.float32)
+        + up.astype(np.float32)
+        + down.astype(np.float32)
+    )
+    expected = np.full(valid.shape, 4.0, dtype=np.float32)
+    expected[:, 0] -= 1.0
+    expected[:, -1] -= 1.0
+    expected[0, :] -= 1.0
+    expected[-1, :] -= 1.0
+    return np.divide(observed, expected, out=np.zeros_like(observed), where=expected > 0)
+
+
 def estimate_normals(
     points: np.ndarray,
     depth: np.ndarray,
@@ -171,9 +196,11 @@ def estimate_normals(
     edge_consistency = np.exp(-edge_excess * edge_decay)
 
     # This is a reliability heuristic, not a probability or calibrated uncertainty.
+    neighbour_support = _neighbour_support_fraction(valid)
     confidence = (
         np.clip(depth_confidence, 0.0, 1.0)
         * edge_consistency
+        * neighbour_support
         * normal_valid.astype(np.float32)
     )
 
