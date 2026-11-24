@@ -210,6 +210,10 @@ def main() -> int:
         "semantic_labels": sorted(seg.masks.keys()),
         "instance_masks": sorted(seg.instance_masks.keys()),
         "depth": depth.metadata,
+        "geometry_confidence": {
+            "source": scene.metadata["geometry_confidence_source"],
+            "calibrated": False,
+        },
         "segmentation": seg.metadata,
         "detections": [d.__dict__ for d in seg.detections],
         "semantic_policy": policy.to_metadata(),
