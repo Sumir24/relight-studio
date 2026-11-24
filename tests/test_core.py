@@ -211,6 +211,8 @@ def test_zero_material_confidence_blends_supplied_maps_to_declared_priors():
     scene.material_confidence = np.zeros(scene.shape, dtype=np.float32)
 
     prior_scene, _ = make_plane()
+    prior_scene.roughness[:] = 0.75
+    prior_scene.metalness[:] = 0.0
     p = backproject_depth(scene.depth, camera)
     n, _ = estimate_normals(p, scene.depth, scene.depth_confidence)
     rig = LightingRig(
