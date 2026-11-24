@@ -71,6 +71,23 @@ python -m pip install -r requirements-models.txt
 
 The optional model requirements include the `einops` and `timm` packages imported by the official Florence-2 custom implementation.
 
+For repeatable runs, pass a full 40-character Hugging Face commit SHA for each model:
+
+```bash
+python scripts/run_scene_analysis.py \
+  --image path/to/photo.jpg \
+  --out scene_analysis \
+  --hfov 60 \
+  --near-is-high \
+  --depth-revision FULL_DEPTH_COMMIT_SHA \
+  --discovery-revision FULL_FLORENCE_COMMIT_SHA \
+  --detector-revision FULL_GROUNDING_DINO_COMMIT_SHA \
+  --segmenter-revision FULL_SAM2_COMMIT_SHA \
+  --strict-model-revisions
+```
+
+The `--strict-model-revisions` option rejects missing, branch, tag, or abbreviated revisions. It requires full 40-character commit IDs for every model used by the selected run. If the user supplies `--prompts`, Florence-2 is skipped and does not require a revision. Without strict mode, the runner records whether each model uses the default ref, a named ref, or a full commit SHA in the manifest.
+
 Run the real-checkpoint CPU smoke test (downloads the configured model checkpoints and the documented car example):
 
 ```bash
