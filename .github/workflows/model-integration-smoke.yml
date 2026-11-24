@@ -1,9 +1,6 @@
 name: Relight Studio Model Integration Smoke
 
 on:
-  push:
-    branches:
-      - feature/model-stack-smoke-v2
   pull_request:
     branches:
       - feature/model-lifecycle-v2
