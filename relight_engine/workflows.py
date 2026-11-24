@@ -169,20 +169,26 @@ def apply_user_material_assignments(
         scene.material_confidence = maps.confidence
         if maps.specular_color is not None:
             scene.specular_color = maps.specular_color
+        scalar_map_metadata = {
+            "source": "user_assignment_plus_renderer_prior",
+            "calibrated": False,
+            "notes": "Per-mask user overrides blended over conservative renderer priors; unassigned pixels retain the prior.",
+        }
         scene.material_metadata = {
-            "roughness": {"source": "user_authored", "calibrated": False},
-            "metalness": {"source": "user_authored", "calibrated": False},
-            "specular_level": {"source": "user_authored", "calibrated": False},
+            "roughness": dict(scalar_map_metadata),
+            "metalness": dict(scalar_map_metadata),
+            "specular_level": dict(scalar_map_metadata),
             "material_confidence": {
                 "source": "user_declared_assignment_confidence",
                 "calibrated": False,
+                "notes": "Caller-supplied reliability weight; zero outside assigned mask coverage. Not a calibrated probability.",
             },
         }
         if maps.specular_color is not None:
             scene.material_metadata["specular_color"] = {
-                "source": "user_authored",
+                "source": "user_assignment_plus_renderer_prior",
                 "calibrated": False,
-                "notes": "Linear-RGB conductor F0/specular-colour map.",
+                "notes": "Linear-RGB conductor F0 user overrides; unassigned pixels retain the neutral 0.65 RGB prior.",
             }
         scene.metadata["material_maps_estimated"] = False
     return maps.metadata
