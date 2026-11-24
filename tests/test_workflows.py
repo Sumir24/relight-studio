@@ -124,7 +124,8 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
         },
         "material_assignments": [{
             "name": "panel_test_material", "mask_key": "surface_panel",
-            "roughness": 0.9, "metalness": 0.0, "specular_level": 0.04,
+            "roughness": 0.9, "metalness": 1.0, "specular_level": 0.04,
+            "specular_color": [0.78, 0.32, 0.14], "confidence": 0.85,
         }],
         "settings": {"base_blur_sigma": 3.0, "shadow_steps": 4},
     }
@@ -144,5 +145,43 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     assert report["status"] == "rendered_with_explicit_user_calibration"
     assert report["source_calibration"]["source"] == "user_calibration_not_automatic_estimation"
     assert report["material_maps"]["neural_material_estimation_used"] is False
+    assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["available"] is True
+    assert report["engine_metrics"]["material_response"]["material_confidence"]["available"] is True
+    assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["source"] == "user_authored"
     assert report["engine_metrics"]["mean_abs_srgb_change_active"] > 0
     assert report["physical_accuracy_notes"]
+
+
+
+def test_user_material_assignment_applies_rgb_f0_confidence_and_provenance():
+    h, w = 6, 8
+    mask = np.zeros((h, w), np.float32)
+    mask[1:5, 2:6] = 1.0
+    scene = SceneBuffers(
+        rgb_srgb=np.zeros((h, w, 3), np.float32),
+        depth=np.ones((h, w), np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative",
+    )
+    metadata = apply_user_material_assignments(
+        scene,
+        {"mask_metal_trim": mask},
+        [{
+            "name": "metal trim",
+            "mask_key": "metal_trim",
+            "roughness": 0.18,
+            "metalness": 1.0,
+            "specular_level": 0.04,
+            "specular_color": [0.88, 0.55, 0.25],
+            "confidence": 0.7,
+        }],
+    )
+
+    assert scene.specular_color is not None
+    assert np.allclose(scene.specular_color[2, 3], [0.88, 0.55, 0.25])
+    assert scene.material_confidence[2, 3] == pytest.approx(0.7)
+    assert scene.material_confidence[0, 0] == pytest.approx(0.0)
+    assert scene.material_metadata["specular_color"]["source"] == "user_authored"
+    assert scene.material_metadata["material_confidence"]["calibrated"] is False
+    assert metadata["neural_material_estimation_used"] is False
