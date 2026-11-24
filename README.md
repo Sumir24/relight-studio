@@ -96,7 +96,7 @@ Run the real-checkpoint CPU smoke test (downloads the configured model checkpoin
 python scripts/run_model_integration_smoke.py
 ```
 
-This smoke test checks actual inference wiring and sequential cleanup on CPU. It is not an Apple MPS test, depth-polarity validation, multi-domain benchmark, or visual-quality certification.
+This smoke test checks actual inference wiring and sequential cleanup on CPU. It pins immutable model commits recorded in `LICENSE_MODEL_NOTES.md`. It is not an Apple MPS test, depth-polarity validation, multi-domain benchmark, or visual-quality certification.
 
 Install the PyTorch build appropriate for the target device first. Florence-2 uses `trust_remote_code=True`; pin and audit the exact repository revision before deployment. The automatic model stack downloads checkpoints unless already cached.
 
