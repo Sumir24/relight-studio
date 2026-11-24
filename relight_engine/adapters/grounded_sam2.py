@@ -354,8 +354,8 @@ class HuggingFaceGroundedSAM2:
 
         # Phase A: detection. The helper returns only ordinary Python values; its
         # tensor locals have gone out of scope before the detector is unloaded.
-        self._load_detector()
         try:
+            self._load_detector()
             selected = self._detect_candidates(
                 pil_image, normalized_prompts, height, width
             )
@@ -364,8 +364,8 @@ class HuggingFaceGroundedSAM2:
 
         # Phase B: segmentation. SAM2 is not loaded until Grounding DINO is released.
         if selected:
-            self._load_segmenter()
             try:
+                self._load_segmenter()
                 masks_by_label, instance_masks, detections = self._generate_masks(
                     pil_image, selected, height, width
                 )
