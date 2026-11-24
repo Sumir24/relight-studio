@@ -109,8 +109,12 @@ def load_scene_artifacts(scene_dir: str | Path) -> tuple[SceneBuffers, CameraMod
             key[len("mask_instance_"):]: value for key, value in arrays.items()
             if key.startswith("mask_instance_")
         },
-        metadata={"source_manifest": str(manifest_path), "depth": manifest.get("depth", {}),
-                  "segmentation": manifest.get("segmentation", {})},
+        metadata={
+            "source_manifest": str(manifest_path),
+            "depth": manifest.get("depth", {}),
+            "segmentation": manifest.get("segmentation", {}),
+            "geometry_confidence_source": manifest.get("geometry_confidence", {}).get("source"),
+        },
     )
     camera_data = manifest.get("camera", {})
     camera = CameraModel(
