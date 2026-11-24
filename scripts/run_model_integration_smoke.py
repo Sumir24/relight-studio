@@ -35,6 +35,12 @@ FIXTURE_URL = (
 )
 OUTPUT_PATH = Path("model_smoke_report.json")
 
+# Immutable Hugging Face revisions recorded for reproducible smoke inference.
+DEPTH_REVISION = "5426e4f0f36572d16453bbda7a8389317b1bef99"
+FLORENCE_REVISION = "15bd11834572457e1e8e8fec7f25c83283902db2"
+GROUNDING_DINO_REVISION = "a2bb814dd30d776dcf7e30523b00659f4f141c71"
+SAM2_REVISION = "de431c4043854a71d8101e17995dfe596bf101a5"
+
 
 def load_fixture() -> np.ndarray:
     request = urllib.request.Request(
@@ -83,6 +89,7 @@ def main() -> int:
     depth_adapter = HuggingFaceDepthAnythingV2(
         device="cpu",
         relative_near_is_high=True,  # Only used by estimate(); polarity is not evaluated here.
+        revision=DEPTH_REVISION,
     )
     try:
         (raw_depth, depth_metadata), elapsed = timed_stage(
@@ -117,6 +124,7 @@ def main() -> int:
         device="cpu",
         max_new_tokens=256,
         max_prompts=16,
+        revision=FLORENCE_REVISION,
     )
     try:
         discovery, elapsed = timed_stage(
@@ -156,6 +164,8 @@ def main() -> int:
         text_threshold=0.15,
         max_detections_per_prompt=2,
         min_area_fraction=0.0005,
+        detector_revision=GROUNDING_DINO_REVISION,
+        segmenter_revision=SAM2_REVISION,
     )
     try:
         segmentation, elapsed = timed_stage(
