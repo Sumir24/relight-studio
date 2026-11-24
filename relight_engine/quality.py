@@ -40,11 +40,13 @@ def _confidence_kind(source: Any) -> str:
     text = str(source).casefold()
     if "constant" in text and "prior" in text:
         return "constant_prior"
+    if "not calibrated" in text or "uncalibrated" in text:
+        return "heuristic" if "heuristic" in text else "uncalibrated_score"
     if "calibrated" in text:
         return "calibrated"
     if "heuristic" in text:
         return "heuristic"
-    if "uncalibrated" in text or "ranking" in text or "score" in text:
+    if "ranking" in text or "score" in text:
         return "uncalibrated_score"
     return "declared_source_unclassified"
 
