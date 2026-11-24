@@ -404,3 +404,65 @@ def test_florence_load_uses_eager_attention_and_pinned_revision(monkeypatch):
     assert seen["model"]["attn_implementation"] == "eager"
     assert seen["model"]["torch_dtype"] == "float32"
     assert adapter.runtime_snapshot()["model_loaded"] is True
+
+
+
+def test_florence_pairs_single_prompt_and_image_as_one_item_batches():
+    from contextlib import nullcontext
+
+    seen = {}
+
+    class FakeTensor:
+        def __init__(self, floating=False):
+            self.floating = floating
+            self.to_calls = []
+
+        def is_floating_point(self):
+            return self.floating
+
+        def to(self, **kwargs):
+            self.to_calls.append(kwargs)
+            return self
+
+    class FakeProcessor:
+        def __call__(self, *, text, images, return_tensors):
+            seen["text"] = text
+            seen["images"] = images
+            seen["return_tensors"] = return_tensors
+            return {
+                "input_ids": FakeTensor(floating=False),
+                "pixel_values": FakeTensor(floating=True),
+            }
+
+        def batch_decode(self, generated, skip_special_tokens):
+            seen["generated"] = generated
+            seen["skip_special_tokens"] = skip_special_tokens
+            return ["decoded"]
+
+        def post_process_generation(self, decoded, *, task, image_size):
+            seen["post_process"] = (decoded, task, image_size)
+            return {task: {"caption": "fixture description"}}
+
+    class FakeModel:
+        def parameters(self):
+            yield SimpleNamespace(dtype="float32")
+
+        def generate(self, **kwargs):
+            seen["generate_kwargs"] = kwargs
+            return ["generated_tokens"]
+
+    adapter = Florence2SceneDiscovery(device="cpu")
+    adapter._torch = SimpleNamespace(inference_mode=lambda: nullcontext())
+    adapter._device = "cpu"
+    adapter._processor = FakeProcessor()
+    adapter._model = FakeModel()
+    image = SimpleNamespace(width=10, height=8)
+
+    result = adapter._run_task(image, "<DETAILED_CAPTION>")
+
+    assert seen["text"] == ["<DETAILED_CAPTION>"]
+    assert seen["images"] == [image]
+    assert seen["return_tensors"] == "pt"
+    assert result == {"<DETAILED_CAPTION>": {"caption": "fixture description"}}
+    assert seen["generate_kwargs"]["input_ids"] is not None
+    assert seen["generate_kwargs"]["pixel_values"] is not None
