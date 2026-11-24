@@ -248,3 +248,35 @@ def test_scene_contract_rejects_invalid_material_map_shapes_and_values():
         assert "material_confidence" in str(exc)
     else:
         raise AssertionError("Expected invalid material-confidence shape to fail.")
+
+
+
+def test_scene_factory_preserves_material_maps_confidence_and_provenance():
+    h, w = 10, 12
+    rgb = np.full((h, w, 3), 0.4, np.float32)
+    depth = DepthPrediction(
+        np.full((h, w), 2.0, np.float32),
+        np.ones((h, w), np.float32),
+        "relative",
+    )
+    semantics = SemanticPrediction(
+        lightable_mask=np.ones((h, w), np.float32),
+        roughness=np.full((h, w), 0.35, np.float32),
+        metalness=np.full((h, w), 0.9, np.float32),
+        specular_level=np.full((h, w), 0.04, np.float32),
+        specular_color=np.broadcast_to(
+            np.array([0.8, 0.4, 0.2], np.float32), (h, w, 3)
+        ).copy(),
+        material_confidence=np.full((h, w), 0.75, np.float32),
+        material_metadata={
+            "specular_color": {"source": "user_authored", "calibrated": False}
+        },
+    )
+
+    scene = build_scene_buffers(rgb, depth, semantics)
+
+    assert scene.specular_color is not None
+    assert np.allclose(scene.specular_color[0, 0], [0.8, 0.4, 0.2])
+    assert scene.material_confidence[0, 0] == 0.75
+    assert scene.material_metadata["specular_color"]["source"] == "user_authored"
+    scene.validate()
