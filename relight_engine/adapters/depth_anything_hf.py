@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 import numpy as np
 
-from .runtime import memory_snapshot, release_device_cache, resolve_torch_device
+from .runtime import memory_snapshot, release_device_cache, resolve_torch_device, revision_descriptor
 
 @dataclass
 class DepthPrediction:
@@ -73,7 +73,8 @@ class HuggingFaceDepthAnythingV2:
                  output_kind: Literal['relative', 'metric'] = 'relative',
                  relative_near_is_high: Optional[bool] = None,
                  device: str = 'auto',
-                 metric_license_reviewed: bool = False) -> None:
+                 metric_license_reviewed: bool = False,
+                 revision: str | None = None) -> None:
         if output_kind == 'relative' and relative_near_is_high is None:
             raise ValueError('Set relative_near_is_high explicitly for the chosen checkpoint.')
         if output_kind == 'metric' and not metric_license_reviewed:
@@ -83,6 +84,7 @@ class HuggingFaceDepthAnythingV2:
         self.relative_near_is_high = relative_near_is_high
         self.device_request = device
         self.metric_license_reviewed = metric_license_reviewed
+        self.revision = revision
         self._processor = None
         self._model = None
         self._torch = None
@@ -99,8 +101,11 @@ class HuggingFaceDepthAnythingV2:
         # when processor/model initialization fails part-way through.
         self._torch = torch
         self._device = device
-        self._processor = AutoImageProcessor.from_pretrained(self.model_id)
-        self._model = AutoModelForDepthEstimation.from_pretrained(self.model_id).to(device).eval()
+        revision_kwargs = {"revision": self.revision} if self.revision else {}
+        self._processor = AutoImageProcessor.from_pretrained(self.model_id, **revision_kwargs)
+        self._model = AutoModelForDepthEstimation.from_pretrained(
+            self.model_id, **revision_kwargs
+        ).to(device).eval()
 
     def runtime_snapshot(self) -> dict:
         """Return best-effort allocator counters and loaded-model state."""
@@ -160,7 +165,11 @@ class HuggingFaceDepthAnythingV2:
             raise RuntimeError('Depth model returned non-finite values.')
         if float(np.max(raw) - np.min(raw)) < 1e-6:
             raise RuntimeError('Depth model returned insufficient dynamic range.')
-        return raw, {'model_id': self.model_id, 'device': self._device}
+        return raw, {
+            'model_id': self.model_id,
+            'device': self._device,
+            **revision_descriptor(self.revision),
+        }
 
     def estimate(self, rgb_srgb: np.ndarray) -> DepthPrediction:
         raw, raw_metadata = self.predict_raw(rgb_srgb)
