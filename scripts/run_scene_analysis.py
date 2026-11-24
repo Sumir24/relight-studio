@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import sys
+from time import perf_counter
 import numpy as np
 from PIL import Image
 
@@ -52,6 +53,27 @@ def label_color(label: str) -> np.ndarray:
     return np.asarray(values, dtype=np.float32)
 
 
+def close_model_stage(stage: str, model_id: str, started: float, backend) -> dict:
+    """Capture allocator counters and close an inference adapter safely."""
+    before = {}
+    cleanup = {}
+    try:
+        before = backend.runtime_snapshot()
+    except Exception as exc:
+        before = {"diagnostic_error": str(exc)}
+    try:
+        cleanup = backend.close()
+    except Exception as exc:
+        cleanup = {"cleanup_error": str(exc)}
+    return {
+        "stage": stage,
+        "model_id": model_id,
+        "elapsed_seconds": round(perf_counter() - started, 3),
+        "runtime_before_release": before,
+        "cleanup": cleanup,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Run domain-agnostic scene analysis. Auto-discover labels or pass image-specific prompts."
@@ -95,31 +117,57 @@ def main() -> int:
     policy.validate()
     domain_hint = SceneDomainHint(domain=args.scene_domain, source="user_hint" if args.scene_domain != "auto" else "not_classified")
     domain_hint.validate()
+    inference_runtime: dict = {
+        "device_requested": args.device,
+        "allocator_metric_scope": "PyTorch backend allocator counters; not total process/system memory",
+        "stages": [],
+    }
 
     depth_backend = HuggingFaceDepthAnythingV2(
         model_id=args.depth_model, output_kind="relative",
         relative_near_is_high=bool(args.near_is_high), device=args.device,
     )
     print("[1/5] Estimating relative depth...")
+    depth_started = perf_counter()
     try:
         depth: DepthPrediction = depth_backend.estimate(rgb)
     except Exception as exc:
         print(f"ERROR: Depth inference failed: {exc}", file=sys.stderr)
         print("Install requirements-models.txt and ensure the checkpoint is cached or downloadable.", file=sys.stderr)
         return 2
+    finally:
+        inference_runtime["stages"].append(
+            close_model_stage("depth", args.depth_model, depth_started, depth_backend)
+        )
 
     discovery_metadata: dict = {"mode": "user_prompts" if args.prompts else "automatic_open_vocabulary_discovery"}
     if args.prompts:
+        inference_runtime["stages"].append({
+            "stage": "scene_discovery",
+            "status": "skipped_user_prompts_supplied",
+            "elapsed_seconds": 0.0,
+        })
         prompts = tuple(args.prompts)
         caption = ""
     else:
         print("[2/5] Discovering image-specific regions with Florence-2...")
+        discovery_backend = Florence2SceneDiscovery(
+            model_id=args.discovery_model, device=args.device
+        )
+        discovery_started = perf_counter()
         try:
-            discovery = Florence2SceneDiscovery(model_id=args.discovery_model, device=args.device).discover(rgb)
+            discovery = discovery_backend.discover(rgb)
         except Exception as exc:
             print(f"ERROR: Automatic scene discovery failed: {exc}", file=sys.stderr)
             print("Supply --prompts with visible objects/regions, or install the model dependencies and checkpoints.", file=sys.stderr)
             return 2
+        finally:
+            inference_runtime["stages"].append(
+                close_model_stage(
+                    "scene_discovery", args.discovery_model,
+                    discovery_started, discovery_backend
+                )
+            )
         prompts = discovery.prompts
         caption = discovery.caption
         discovery_metadata = {
@@ -130,16 +178,24 @@ def main() -> int:
         }
 
     print("[3/5] Building open-vocabulary region masks...")
+    segmentation_backend = HuggingFaceGroundedSAM2(
+        device=args.device, box_threshold=args.box_threshold,
+        text_threshold=args.text_threshold, max_detections_per_prompt=args.max_detections,
+    )
+    segmentation_started = perf_counter()
     try:
-        segmentation_backend = HuggingFaceGroundedSAM2(
-            device=args.device, box_threshold=args.box_threshold,
-            text_threshold=args.text_threshold, max_detections_per_prompt=args.max_detections,
-        )
         seg = segmentation_backend.estimate(rgb, prompts=prompts, policy=policy)
     except Exception as exc:
         print(f"ERROR: Semantic segmentation failed: {exc}", file=sys.stderr)
         print("No fixed class list or heuristic segmentation fallback was substituted.", file=sys.stderr)
         return 2
+    finally:
+        inference_runtime["stages"].append(
+            close_model_stage(
+                "segmentation", f"{segmentation_backend.detector_id} + {segmentation_backend.segmenter_id}",
+                segmentation_started, segmentation_backend
+            )
+        )
 
     if float(np.mean(seg.lightable_mask > 0.05)) < 0.01:
         print("ERROR: The current semantic policy protects nearly the entire image; review label names.", file=sys.stderr)
@@ -215,6 +271,7 @@ def main() -> int:
             "calibrated": False,
         },
         "segmentation": seg.metadata,
+        "inference_runtime": inference_runtime,
         "detections": [d.__dict__ for d in seg.detections],
         "semantic_policy": policy.to_metadata(),
         "camera": {

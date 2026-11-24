@@ -71,6 +71,33 @@ python -m pip install -r requirements-models.txt
 
 Install the PyTorch build appropriate for the target device first. Florence-2 uses `trust_remote_code=True`; pin and audit the exact repository revision before deployment. The automatic model stack downloads checkpoints unless already cached.
 
+## Neural inference memory lifecycle
+
+Continuous Integration: Python 3.14 compile and pytest checks run for pull requests targeting `feature/geometry-v2-quality-gate`.
+
+The scene-analysis command runs neural stages sequentially and releases each model
+after extracting CPU-side results:
+
+1. Depth Anything V2 produces the depth and confidence arrays, then its model is released.
+2. Florence-2 produces candidate labels/regions, then its model is released.
+3. Grounding DINO produces Python box/score records and is released before SAM 2 loads.
+4. SAM 2 produces NumPy masks and is released before geometry/scene-buffer construction.
+
+The scene manifest records an `inference_runtime` section with stage duration,
+resolved device, best-effort backend allocator counters before release, and cleanup
+results. Grounding DINO/SAM 2 stage-level counters are also recorded in the
+segmentation metadata.
+
+**Memory diagnostic limitation:** MPS and CUDA allocator counters are not total
+process RAM, unified-memory pressure, or a complete peak-memory profile. CPU-side
+arrays, processors, image buffers, Python allocations, and macOS shared-memory
+accounting are not fully represented. Treat these values as debugging diagnostics,
+not a guarantee that the complete pipeline fits a particular machine.
+
+Adapters expose `close()` for deterministic cleanup and can lazily reload if reused.
+The command invokes cleanup in `finally` blocks so failures during inference also
+release partially loaded model state where possible.
+
 ## Run scene analysis
 
 Automatic region discovery (default; no scene-specific prompts):

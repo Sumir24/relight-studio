@@ -2,6 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import numpy as np
 
+from .runtime import memory_snapshot, release_device_cache, resolve_torch_device
+
 
 @dataclass
 class SceneDiscoveryResult:
@@ -41,21 +43,46 @@ class Florence2SceneDiscovery:
                 "Automatic scene discovery requires torch and transformers with Florence-2 support. "
                 "Install requirements-models.txt; no fixed landscape prompts are substituted."
             ) from exc
-        if self.device_request == "auto":
-            if torch.cuda.is_available():
-                device = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        else:
-            device = self.device_request
+        device = resolve_torch_device(torch, self.device_request)
         dtype = torch.float16 if device == "cuda" else torch.float32
+        # Retain runtime handles before loading so a partial failure can be cleaned up.
+        self._torch, self._device = torch, device
         self._processor = AutoProcessor.from_pretrained(self.model_id, trust_remote_code=True)
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_id, torch_dtype=dtype, trust_remote_code=True
         ).to(device).eval()
-        self._torch, self._device = torch, device
+
+    def runtime_snapshot(self) -> dict:
+        """Return best-effort allocator counters and loaded-model state."""
+        return {
+            "device": self._device,
+            "model_loaded": self._model is not None,
+            "processor_loaded": self._processor is not None,
+            "memory": memory_snapshot(self._torch, self._device) if self._torch is not None else {
+                "device": self._device, "available": False
+            },
+        }
+
+    def close(self) -> dict:
+        """Release Florence-2 model/processor references and accelerator cache.
+
+        Safe to call repeatedly. A subsequent discover() call lazily reloads the model.
+        """
+        if self._torch is None:
+            return {"released": False, "already_closed": True, "device": self._device}
+        before = memory_snapshot(self._torch, self._device)
+        was_loaded = self._model is not None or self._processor is not None
+        self._model = None
+        self._processor = None
+        cleanup = release_device_cache(self._torch, self._device)
+        after = memory_snapshot(self._torch, self._device)
+        return {
+            "released": was_loaded,
+            "device": self._device,
+            "memory_before_release": before,
+            "memory_after_release": after,
+            "cleanup": cleanup,
+        }
 
     def _run_task(self, pil_image, task: str) -> dict:
         torch = self._torch
