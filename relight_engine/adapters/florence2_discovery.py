@@ -54,7 +54,11 @@ class Florence2SceneDiscovery:
             self.model_id, trust_remote_code=True, **revision_kwargs
         )
         self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_id, torch_dtype=dtype, trust_remote_code=True, **revision_kwargs
+            self.model_id,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            attn_implementation="eager",
+            **revision_kwargs,
         ).to(device).eval()
 
     def runtime_snapshot(self) -> dict:
