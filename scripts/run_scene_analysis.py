@@ -157,6 +157,10 @@ def main() -> int:
     scene = build_scene_buffers(rgb, depth, semantics, alpha_mask=image_input.alpha_mask)
     scene.geometry_confidence = geometry_conf.astype(np.float32)
     scene.normals = normals.astype(np.float32)
+    scene.metadata["geometry_confidence_source"] = (
+        "edge-aware log-depth curvature and normal-validity heuristic; not calibrated"
+    )
+    scene.metadata["geometry_confidence_calibrated"] = False
     scene.validate()
 
     print("[5/5] Saving generic scene buffers, masks and provenance...")
@@ -219,6 +223,7 @@ def main() -> int:
         },
         "scene_quality_report": "scene_quality_report.json",
         "structural_quality_status": quality_report["status"],
+        "lighting_readiness": quality_report["lighting_readiness"],
         "metrics": {
             "lightable_fraction": float(np.mean(seg.lightable_mask > 0.05)),
             "protected_fraction": float(np.mean(seg.protected_mask > 0.05)),
