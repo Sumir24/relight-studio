@@ -95,3 +95,62 @@ def test_shared_renderer_is_independent_of_scene_domain_metadata():
     result_a = relight(portrait_scene, camera, source, target, EngineSettings(shadow_steps=4))
     result_b = relight(vehicle_scene, camera, source, target, EngineSettings(shadow_steps=4))
     assert np.allclose(result_a.rgb_srgb, result_b.rgb_srgb, atol=0, rtol=0)
+
+
+
+def test_material_report_records_map_provenance_confidence_and_supported_families():
+    scene = make_scene()
+    scene.roughness = np.full(scene.shape, 0.32, dtype=np.float32)
+    scene.metalness = np.full(scene.shape, 0.85, dtype=np.float32)
+    scene.specular_color = np.broadcast_to(
+        np.array([0.78, 0.24, 0.12], dtype=np.float32),
+        (*scene.shape, 3),
+    ).copy()
+    scene.material_confidence = np.full(scene.shape, 0.72, dtype=np.float32)
+    scene.material_metadata = {
+        "roughness": {"source": "user_authored", "calibrated": False},
+        "metalness": {"source": "user_authored", "calibrated": False},
+        "specular_color": {"source": "user_authored", "calibrated": False},
+        "material_confidence": {"source": "user_reviewed", "calibrated": False},
+    }
+
+    report = evaluate_scene_buffers(scene)
+    materials = report["materials"]
+
+    assert materials["maps"]["roughness"]["source"] == "user_authored"
+    assert materials["maps"]["specular_color"]["available"] is True
+    assert materials["maps"]["specular_color"]["expected_shape"] == "HxWx3_linear_RGB_conductor_F0"
+    assert materials["material_confidence"]["available"] is True
+    assert materials["material_confidence"]["mean"] == pytest.approx(0.72)
+    assert "ggx_conductor_with_RGB_F0" in materials["implemented_response_families"]
+    assert "transmission_and_refraction" in materials["not_implemented_response_families"]
+    assert materials["material_estimation_claimed"] is False
+
+
+def test_material_report_marks_missing_maps_as_conservative_priors():
+    scene = make_scene()
+    report = evaluate_scene_buffers(scene)
+    materials = report["materials"]
+
+    assert materials["maps"]["roughness"]["source"] == "conservative_prior"
+    assert materials["maps"]["roughness"]["fallback_prior"] == pytest.approx(0.75)
+    assert materials["maps"]["metalness"]["fallback_prior"] == pytest.approx(0.0)
+    assert materials["maps"]["specular_level"]["fallback_prior"] == pytest.approx(0.04)
+    assert materials["material_confidence"]["available"] is False
+    assert materials["material_estimation_claimed"] is False
+
+
+def test_material_report_warns_for_unsourced_or_unconfident_estimated_maps():
+    scene = make_scene()
+    scene.roughness = np.full(scene.shape, 0.4, dtype=np.float32)
+    scene.material_metadata = {
+        "roughness": {"source": "model_estimated"}
+    }
+    report = evaluate_scene_buffers(scene)
+
+    assert report["materials"]["maps"]["roughness"]["source"] == "model_estimated"
+    assert any("no per-pixel material-confidence" in w.lower() for w in report["warnings"])
+
+    scene.material_metadata = {}
+    report_without_source = evaluate_scene_buffers(scene)
+    assert any("lack declared provenance" in w.lower() for w in report_without_source["warnings"])
