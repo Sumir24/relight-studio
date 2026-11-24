@@ -349,3 +349,58 @@ def test_grounding_dino_postprocessing_receives_the_original_input_ids():
     assert seen["threshold"] == adapter.box_threshold
     assert seen["text_threshold"] == adapter.text_threshold
     assert selected == [("car", 0.91, [1.0, 2.0, 7.0, 8.0])]
+
+
+
+def test_florence_load_uses_eager_attention_and_pinned_revision(monkeypatch):
+    from types import ModuleType
+    import sys
+
+    revision = "0123456789abcdef0123456789abcdef01234567"
+    seen = {"processor": None, "model": None}
+
+    class FakeProcessor:
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            seen["processor"] = {"model_id": model_id, **kwargs}
+            return object()
+
+    class FakeModel:
+        def to(self, device):
+            self.device = device
+            return self
+
+        def eval(self):
+            return self
+
+    class FakeAutoModel:
+        @classmethod
+        def from_pretrained(cls, model_id, **kwargs):
+            seen["model"] = {"model_id": model_id, **kwargs}
+            return FakeModel()
+
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+        backends=SimpleNamespace(
+            mps=SimpleNamespace(is_available=lambda: False)
+        ),
+        float16="float16",
+        float32="float32",
+    )
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.AutoProcessor = FakeProcessor
+    fake_transformers.AutoModelForCausalLM = FakeAutoModel
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    adapter = Florence2SceneDiscovery(device="cpu", revision=revision)
+    adapter._load()
+
+    assert seen["processor"]["revision"] == revision
+    assert seen["processor"]["trust_remote_code"] is True
+    assert seen["model"]["revision"] == revision
+    assert seen["model"]["trust_remote_code"] is True
+    assert seen["model"]["attn_implementation"] == "eager"
+    assert seen["model"]["torch_dtype"] == "float32"
+    assert adapter.runtime_snapshot()["model_loaded"] is True
