@@ -51,6 +51,118 @@ def _confidence_kind(source: Any) -> str:
     return "declared_source_unclassified"
 
 
+def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
+    """Describe supplied material maps, provenance and the renderer's explicit fallbacks."""
+    metadata = scene.material_metadata if isinstance(scene.material_metadata, dict) else {}
+    map_specs = {
+        "roughness": {
+            "array": scene.roughness,
+            "prior": 0.75,
+            "shape": "HxW",
+        },
+        "metalness": {
+            "array": scene.metalness,
+            "prior": 0.0,
+            "shape": "HxW",
+        },
+        "specular_level": {
+            "array": scene.specular_level,
+            "prior": 0.04,
+            "shape": "HxW",
+        },
+        "specular_color": {
+            "array": scene.specular_color,
+            "prior": [0.65, 0.65, 0.65],
+            "shape": "HxWx3_linear_RGB_conductor_F0",
+        },
+    }
+
+    maps: dict[str, dict[str, Any]] = {}
+    for name, spec in map_specs.items():
+        supplied = spec["array"]
+        entry = metadata.get(name, {})
+        if isinstance(entry, str):
+            source = entry
+            calibrated = False
+            notes = None
+        elif isinstance(entry, dict):
+            source = str(entry.get("source", "unspecified"))
+            calibrated = bool(entry.get("calibrated", False))
+            notes = entry.get("notes")
+        else:
+            source = "unspecified"
+            calibrated = False
+            notes = None
+
+        values = None if supplied is None else np.asarray(supplied, dtype=np.float32)
+        maps[name] = {
+            "available": supplied is not None,
+            "source": source if supplied is not None else "conservative_prior",
+            "calibrated": calibrated,
+            "expected_shape": spec["shape"],
+            "fallback_prior": spec["prior"],
+            "mean": (
+                [float(v) for v in np.mean(values, axis=(0, 1))]
+                if values is not None and values.ndim == 3
+                else (float(np.mean(values)) if values is not None else None)
+            ),
+            "minimum": float(np.min(values)) if values is not None else None,
+            "maximum": float(np.max(values)) if values is not None else None,
+            "notes": notes,
+        }
+
+    confidence = scene.material_confidence
+    confidence_values = (
+        np.asarray(confidence, dtype=np.float32) if confidence is not None else None
+    )
+    confidence_entry = metadata.get("material_confidence", {})
+    if isinstance(confidence_entry, dict):
+        confidence_source = str(confidence_entry.get("source", "unspecified"))
+        confidence_calibrated = bool(confidence_entry.get("calibrated", False))
+    elif isinstance(confidence_entry, str):
+        confidence_source = confidence_entry
+        confidence_calibrated = False
+    else:
+        confidence_source = "unspecified"
+        confidence_calibrated = False
+
+    unimplemented = [
+        "layered_clear_coat",
+        "subsurface_scattering",
+        "transmission_and_refraction",
+        "emissive_radiance_separation",
+        "environment_dependent_reflection",
+    ]
+    return {
+        "maps": maps,
+        "material_confidence": {
+            "available": confidence_values is not None,
+            "source": confidence_source if confidence_values is not None else "unavailable",
+            "calibrated": confidence_calibrated,
+            "mean": float(np.mean(confidence_values)) if confidence_values is not None else None,
+            "minimum": float(np.min(confidence_values)) if confidence_values is not None else None,
+            "maximum": float(np.max(confidence_values)) if confidence_values is not None else None,
+            "semantics": (
+                "Blends supplied material maps toward declared conservative priors."
+                if confidence_values is not None
+                else "No per-pixel confidence blend; supplied maps are used as provided."
+            ),
+        },
+        "implemented_response_families": [
+            "lambertian_diffuse_baseline",
+            "ggx_rough_dielectric",
+            "ggx_conductor_with_RGB_F0",
+        ],
+        "not_implemented_response_families": unimplemented,
+        "material_estimation_claimed": bool(
+            scene.metadata.get("material_maps_estimated", False)
+        ),
+        "interpretation": (
+            "Material maps are inputs, not inferred ground truth. Unavailable maps use the declared priors."
+        ),
+    }
+
+
 def _confidence_provenance(scene: SceneBuffers) -> dict[str, dict[str, Any]]:
     metadata = scene.metadata if isinstance(scene.metadata, dict) else {}
     depth_metadata = metadata.get("depth", {})
@@ -250,6 +362,38 @@ def evaluate_scene_buffers(scene: SceneBuffers) -> dict[str, Any]:
             "Two or more instance masks are near-identical; inspect duplicate detections."
         )
 
+    material_report = describe_material_response(scene)
+    supplied_material_maps = [
+        name for name, detail in material_report["maps"].items()
+        if detail["available"]
+    ]
+    maps_without_source = [
+        name for name in supplied_material_maps
+        if material_report["maps"][name]["source"] == "unspecified"
+    ]
+    if maps_without_source:
+        warnings.append(
+            "Material maps lack declared provenance: " + ", ".join(maps_without_source) + "."
+        )
+    model_estimated_maps = [
+        name for name in supplied_material_maps
+        if material_report["maps"][name]["source"].casefold() in {
+            "model_estimated", "model-estimated", "estimated"
+        }
+    ]
+    if model_estimated_maps and not material_report["material_confidence"]["available"]:
+        warnings.append(
+            "Model-estimated material maps have no per-pixel material-confidence map."
+        )
+    if scene.specular_color is not None and scene.metalness is None:
+        warnings.append(
+            "RGB conductor F0 is supplied without a metalness map; the conservative zero-metalness prior suppresses its conductor contribution."
+        )
+    if scene.material_confidence is not None and not supplied_material_maps:
+        warnings.append(
+            "Material confidence is supplied but no material property maps are available to blend."
+        )
+
     if not np.isfinite(scene.rgb_srgb).all():
         errors.append("RGB contains non-finite values.")
 
@@ -343,14 +487,7 @@ def evaluate_scene_buffers(scene: SceneBuffers) -> dict[str, Any]:
             "instances": instance_stats,
             "near_duplicate_instances": duplicate_instances,
         },
-        "materials": {
-            "roughness_available": scene.roughness is not None,
-            "metalness_available": scene.metalness is not None,
-            "specular_level_available": scene.specular_level is not None,
-            "material_estimation_claimed": bool(
-                scene.metadata.get("material_maps_estimated", False)
-            ),
-        },
+        "materials": material_report,
         "warnings": warnings,
         "errors": errors,
         "metadata": scene.metadata,
