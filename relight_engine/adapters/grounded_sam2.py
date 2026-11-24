@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..scene_policy import SemanticRoutingPolicy, semantic_key, compose_scene_masks
-from .runtime import memory_snapshot, release_device_cache, resolve_torch_device
+from .runtime import memory_snapshot, release_device_cache, resolve_torch_device, revision_descriptor
 
 
 @dataclass
@@ -49,6 +49,8 @@ class HuggingFaceGroundedSAM2:
         text_threshold: float = 0.22,
         max_detections_per_prompt: int = 3,
         min_area_fraction: float = 0.002,
+        detector_revision: str | None = None,
+        segmenter_revision: str | None = None,
     ) -> None:
         if not 0 < box_threshold < 1 or not 0 < text_threshold < 1:
             raise ValueError("Detection thresholds must be in (0,1).")
@@ -63,6 +65,8 @@ class HuggingFaceGroundedSAM2:
         self.text_threshold = text_threshold
         self.max_detections_per_prompt = max_detections_per_prompt
         self.min_area_fraction = min_area_fraction
+        self.detector_revision = detector_revision
+        self.segmenter_revision = segmenter_revision
 
         self._torch = None
         self._device = None
@@ -92,9 +96,14 @@ class HuggingFaceGroundedSAM2:
                 "No heuristic segmentation fallback is silently substituted."
             ) from exc
         if self._det_model is None:
-            self._det_processor = AutoProcessor.from_pretrained(self.detector_id)
+            revision_kwargs = {"revision": self.detector_revision} if self.detector_revision else {}
+            self._det_processor = AutoProcessor.from_pretrained(
+                self.detector_id, **revision_kwargs
+            )
             self._det_model = (
-                AutoModelForZeroShotObjectDetection.from_pretrained(self.detector_id)
+                AutoModelForZeroShotObjectDetection.from_pretrained(
+                    self.detector_id, **revision_kwargs
+                )
                 .to(self._device)
                 .eval()
             )
@@ -108,9 +117,14 @@ class HuggingFaceGroundedSAM2:
                 "Install a Transformers version with SAM2 support to generate masks."
             ) from exc
         if self._sam_model is None:
-            self._sam_processor = Sam2Processor.from_pretrained(self.segmenter_id)
+            revision_kwargs = {"revision": self.segmenter_revision} if self.segmenter_revision else {}
+            self._sam_processor = Sam2Processor.from_pretrained(
+                self.segmenter_id, **revision_kwargs
+            )
             self._sam_model = (
-                Sam2Model.from_pretrained(self.segmenter_id)
+                Sam2Model.from_pretrained(
+                    self.segmenter_id, **revision_kwargs
+                )
                 .to(self._device)
                 .eval()
             )
@@ -386,7 +400,9 @@ class HuggingFaceGroundedSAM2:
             detections=detections,
             metadata={
                 "detector_id": self.detector_id,
+                "detector_model_revision": revision_descriptor(self.detector_revision),
                 "segmenter_id": self.segmenter_id,
+                "segmenter_model_revision": revision_descriptor(self.segmenter_revision),
                 "device": self._device,
                 "prompts": normalized_prompts,
                 "box_threshold": self.box_threshold,
