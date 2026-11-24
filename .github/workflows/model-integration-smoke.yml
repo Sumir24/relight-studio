@@ -10,6 +10,11 @@ on:
       - "requirements-models.txt"
       - ".github/workflows/model-integration-smoke.yml"
 
+# Cancel older smoke jobs for the same PR when a newer commit arrives.
+concurrency:
+  group: model-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
