@@ -104,6 +104,10 @@ class MaterialAssignment:
     metalness: float = 0.0
     specular_level: float = 0.04
     blend: float = 1.0
+    # Optional linear-RGB conductor F0. None uses the renderer's neutral conductor prior.
+    specular_color: tuple[float, float, float] | None = None
+    # Caller-declared confidence in this manual assignment, separate from mask blend.
+    confidence: float = 1.0
 
     def validate(self, shape: tuple[int, int]) -> None:
         if not self.name.strip():
@@ -113,9 +117,14 @@ class MaterialAssignment:
         if not np.isfinite(self.mask).all() or np.any(self.mask < 0) or np.any(self.mask > 1):
             raise ValueError("Material masks must be finite and in [0,1].")
         for key, value in (("roughness", self.roughness), ("metalness", self.metalness),
-                           ("specular_level", self.specular_level), ("blend", self.blend)):
+                           ("specular_level", self.specular_level), ("blend", self.blend),
+                           ("confidence", self.confidence)):
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{key} must be finite and in [0,1].")
+        if self.specular_color is not None:
+            color = np.asarray(self.specular_color, dtype=np.float32)
+            if color.shape != (3,) or not np.isfinite(color).all() or np.any(color < 0) or np.any(color > 1):
+                raise ValueError("specular_color must be a linear-RGB triple in [0,1].")
 
 
 @dataclass
@@ -124,6 +133,8 @@ class MaterialMaps:
     metalness: np.ndarray
     specular_level: np.ndarray
     coverage: np.ndarray
+    confidence: np.ndarray
+    specular_color: np.ndarray | None = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -134,6 +145,7 @@ def build_material_maps(
     base_roughness: float = 0.75,
     base_metalness: float = 0.0,
     base_specular_level: float = 0.04,
+    base_specular_color: tuple[float, float, float] = (0.65, 0.65, 0.65),
 ) -> MaterialMaps:
     """Blend user-authored material overrides over explicit generic dielectric priors.
 
@@ -145,8 +157,11 @@ def build_material_maps(
     if h <= 0 or w <= 0:
         raise ValueError("Material map shape must be positive.")
     bases = (base_roughness, base_metalness, base_specular_level)
+    base_color = np.asarray(base_specular_color, dtype=np.float32)
     if any(not math.isfinite(v) or not 0 <= v <= 1 for v in bases):
         raise ValueError("Base material values must be finite and in [0,1].")
+    if base_color.shape != (3,) or not np.isfinite(base_color).all() or np.any(base_color < 0) or np.any(base_color > 1):
+        raise ValueError("base_specular_color must be a linear-RGB triple in [0,1].")
     for assignment in assignments:
         assignment.validate(shape)
 
@@ -168,21 +183,57 @@ def build_material_maps(
             out += weights[idx] * float(getattr(assignment, attribute))
         return np.clip(out, 0.0, 1.0).astype(np.float32)
 
+    # Confidence is an independent user-declared reliability weight, not mask coverage.
+    confidence_numerator = np.zeros((h, w), dtype=np.float32)
+    for idx, assignment in enumerate(assignments):
+        confidence_numerator += weights[idx] * float(assignment.confidence)
+    material_confidence = np.divide(
+        confidence_numerator,
+        weight_sum,
+        out=np.zeros((h, w), dtype=np.float32),
+        where=weight_sum > 1e-8,
+    )
+
+    specular_color = None
+    if any(assignment.specular_color is not None for assignment in assignments):
+        specular_color = np.broadcast_to(base_color, (h, w, 3)).copy() * base_weight[..., None]
+        for idx, assignment in enumerate(assignments):
+            assignment_color = (
+                base_color if assignment.specular_color is None
+                else np.asarray(assignment.specular_color, dtype=np.float32)
+            )
+            specular_color += weights[idx][..., None] * assignment_color[None, None, :]
+        specular_color = np.clip(specular_color, 0.0, 1.0).astype(np.float32)
+
     return MaterialMaps(
         roughness=compose("roughness", base_roughness),
         metalness=compose("metalness", base_metalness),
         specular_level=compose("specular_level", base_specular_level),
         coverage=np.clip(weight_sum, 0, 1).astype(np.float32),
+        confidence=np.clip(material_confidence, 0, 1).astype(np.float32),
+        specular_color=specular_color,
         metadata={
             "origin": "user_authored_mask_overrides_plus_explicit_generic_base_priors",
             "base_values": {
                 "roughness": float(base_roughness),
                 "metalness": float(base_metalness),
                 "specular_level": float(base_specular_level),
+                "specular_color": [float(value) for value in base_color],
             },
+            "material_confidence_semantics": "caller-declared reliability of manual map assignments; separate from mask coverage/blend",
             "assignments": [
-                {"name": a.name, "roughness": float(a.roughness), "metalness": float(a.metalness),
-                 "specular_level": float(a.specular_level), "blend": float(a.blend)}
+                {
+                    "name": a.name,
+                    "roughness": float(a.roughness),
+                    "metalness": float(a.metalness),
+                    "specular_level": float(a.specular_level),
+                    "specular_color": (
+                        None if a.specular_color is None
+                        else [float(value) for value in a.specular_color]
+                    ),
+                    "blend": float(a.blend),
+                    "confidence": float(a.confidence),
+                }
                 for a in assignments
             ],
             "neural_material_estimation_used": False,
