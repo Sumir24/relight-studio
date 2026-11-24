@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import gc
-import re
 import numpy as np
 
 from ..scene_policy import SemanticRoutingPolicy, semantic_key, compose_scene_masks
