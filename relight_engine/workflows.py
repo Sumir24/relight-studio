@@ -109,6 +109,12 @@ def load_scene_artifacts(scene_dir: str | Path) -> tuple[SceneBuffers, CameraMod
             key[len("mask_instance_"):]: value for key, value in arrays.items()
             if key.startswith("mask_instance_")
         },
+        roughness=arrays.get("roughness"),
+        metalness=arrays.get("metalness"),
+        specular_level=arrays.get("specular_level"),
+        specular_color=arrays.get("specular_color"),
+        material_confidence=arrays.get("material_confidence"),
+        material_metadata=manifest.get("material_metadata", {}),
         metadata={
             "source_manifest": str(manifest_path),
             "depth": manifest.get("depth", {}),
@@ -135,7 +141,10 @@ def apply_user_material_assignments(
     for index, item in enumerate(config):
         if not isinstance(item, dict):
             raise ValueError(f"material_assignments[{index}] must be an object.")
-        allowed = {"name", "mask_key", "roughness", "metalness", "specular_level", "blend"}
+        allowed = {
+            "name", "mask_key", "roughness", "metalness", "specular_level",
+            "specular_color", "blend", "confidence",
+        }
         unknown = set(item) - allowed
         if unknown:
             raise ValueError(f"Unknown material assignment fields at index {index}: {sorted(unknown)}")
@@ -143,16 +152,39 @@ def apply_user_material_assignments(
         key = mask_key if mask_key.startswith("mask_") else f"mask_{mask_key}"
         if key not in arrays:
             raise ValueError(f"Material assignment mask {mask_key!r} is not present in scene buffers.")
+        color = item.get("specular_color")
         assignments.append(MaterialAssignment(
             name=str(item["name"]), mask=arrays[key],
             roughness=float(item["roughness"]), metalness=float(item.get("metalness", 0.0)),
-            specular_level=float(item.get("specular_level", 0.04)), blend=float(item.get("blend", 1.0)),
+            specular_level=float(item.get("specular_level", 0.04)),
+            blend=float(item.get("blend", 1.0)),
+            specular_color=None if color is None else tuple(float(v) for v in color),
+            confidence=float(item.get("confidence", 1.0)),
         ))
     maps = build_material_maps(scene.shape, assignments)
     if assignments:
         scene.roughness = maps.roughness
         scene.metalness = maps.metalness
         scene.specular_level = maps.specular_level
+        scene.material_confidence = maps.confidence
+        if maps.specular_color is not None:
+            scene.specular_color = maps.specular_color
+        scene.material_metadata = {
+            "roughness": {"source": "user_authored", "calibrated": False},
+            "metalness": {"source": "user_authored", "calibrated": False},
+            "specular_level": {"source": "user_authored", "calibrated": False},
+            "material_confidence": {
+                "source": "user_declared_assignment_confidence",
+                "calibrated": False,
+            },
+        }
+        if maps.specular_color is not None:
+            scene.material_metadata["specular_color"] = {
+                "source": "user_authored",
+                "calibrated": False,
+                "notes": "Linear-RGB conductor F0/specular-colour map.",
+            }
+        scene.metadata["material_maps_estimated"] = False
     return maps.metadata
 
 
