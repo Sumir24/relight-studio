@@ -35,22 +35,35 @@ def source_calibration_from_dict(data: dict) -> SourceLightCalibration:
 def target_rig_from_dict(data: dict) -> LightingRig:
     if not isinstance(data, dict):
         raise ValueError("target_rig must be an object.")
-    allowed = {"ambient_strength", "ambient_temperature_kelvin", "ambient_color", "lights"}
+    allowed = {
+        "ambient_strength", "ambient_temperature_kelvin", "ambient_color",
+        "ambient_ground_color", "ambient_ground_temperature_kelvin", "lights",
+    }
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"Unknown target-rig fields: {sorted(unknown)}")
     ambient_strength = float(data.get("ambient_strength", 0.10))
+    if "ambient_temperature_kelvin" in data and "ambient_color" in data:
+        raise ValueError("Specify either ambient_temperature_kelvin or ambient_color, not both.")
     if "ambient_temperature_kelvin" in data:
         ambient_color = kelvin_to_linear_rgb(float(data["ambient_temperature_kelvin"]))
     else:
         ambient_color = tuple(data.get("ambient_color", (1.0, 1.0, 1.0)))
+    if "ambient_ground_temperature_kelvin" in data and "ambient_ground_color" in data:
+        raise ValueError("Specify either ambient_ground_temperature_kelvin or ambient_ground_color, not both.")
+    if "ambient_ground_temperature_kelvin" in data:
+        ambient_ground_color = kelvin_to_linear_rgb(float(data["ambient_ground_temperature_kelvin"]))
+    elif "ambient_ground_color" in data:
+        ambient_ground_color = tuple(data["ambient_ground_color"])
+    else:
+        ambient_ground_color = None
     lights = []
     for index, item in enumerate(data.get("lights", [])):
         if not isinstance(item, dict):
             raise ValueError(f"target_rig.lights[{index}] must be an object.")
         allowed = {
             "name", "kind", "strength", "color", "color_temperature_kelvin", "direction",
-            "position", "area_size", "samples", "casts_shadows",
+            "position", "area_size", "samples", "casts_shadows", "wrap",
         }
         unknown = set(item) - allowed
         if unknown:
@@ -69,8 +82,14 @@ def target_rig_from_dict(data: dict) -> LightingRig:
             area_size=tuple(item.get("area_size", (0.5, 0.5))),
             samples=int(item.get("samples", 4)),
             casts_shadows=bool(item.get("casts_shadows", True)),
+            wrap=float(item.get("wrap", 0.0)),
         ))
-    rig = LightingRig(ambient_color=ambient_color, ambient_strength=ambient_strength, lights=tuple(lights))
+    rig = LightingRig(
+        ambient_color=ambient_color,
+        ambient_strength=ambient_strength,
+        lights=tuple(lights),
+        ambient_ground_color=ambient_ground_color,
+    )
     rig.validate()
     return rig
 

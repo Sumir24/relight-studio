@@ -134,7 +134,13 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
             dist = None
         else:
             dist = np.linalg.norm(pos - points, axis=-1)
-        ndotl = np.clip(np.sum(normals * d, axis=-1), 0, 1)
+        raw_ndotl = np.sum(normals * d, axis=-1)
+        ndotl = np.clip(raw_ndotl, 0, 1)
+        if light.wrap > 0.0:
+            w_fac = float(light.wrap)
+            ndotl_diffuse = np.clip((raw_ndotl + w_fac) / (1.0 + w_fac), 0, 1)
+        else:
+            ndotl_diffuse = ndotl
         if light.kind == 'directional':
             attenuation = np.full((h, w), light.strength, np.float32)
         elif scene.depth_kind == 'metric':
@@ -147,7 +153,7 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
                                                  d if light.kind == 'directional' else None, settings)
         else:
             visibility = np.ones((h, w), np.float32)
-        direct = (ndotl * attenuation * visibility / count).astype(np.float32)
+        direct = (ndotl_diffuse * attenuation * visibility / count).astype(np.float32)
         diffuse += direct[..., None] * color
         spec = _ggx_specular(
             normals, view, d, roughness, metalness, spec_level, specular_color
@@ -160,8 +166,14 @@ def evaluate_rig(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
                  normals: np.ndarray, rig: LightingRig, settings: EngineSettings) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     rig.validate()
     h, w = scene.depth.shape
-    ambient = np.asarray(rig.ambient_color, np.float32)[None, None, :] * rig.ambient_strength
-    diffuse = np.broadcast_to(ambient, (h, w, 3)).copy()
+    sky_color = np.asarray(rig.ambient_color, np.float32)[None, None, :]
+    if rig.ambient_ground_color is not None:
+        ground_color = np.asarray(rig.ambient_ground_color, np.float32)[None, None, :]
+        sky_t = np.clip(0.5 * (normals[..., 1] + 1.0), 0.0, 1.0)[..., None]
+        ambient = (ground_color * (1.0 - sky_t) + sky_color * sky_t) * rig.ambient_strength
+    else:
+        ambient = sky_color * rig.ambient_strength
+    diffuse = np.broadcast_to(ambient, (h, w, 3)).astype(np.float32, copy=True)
     specular = np.zeros((h, w, 3), np.float32)
     visibility = np.ones((h, w), np.float32)
     for light in rig.lights:

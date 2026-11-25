@@ -104,10 +104,29 @@ def test_scene_buffers_validates_intrinsic_maps_and_rejects_bad_shapes_or_negati
 def test_engine_settings_validates_renderer_mode_and_detail_lock_strength():
     defaults = EngineSettings()
     assert defaults.color_ratio_min <= 0.25 and defaults.color_ratio_max >= 3.0
-    EngineSettings(renderer_mode="intrinsic", detail_lock_strength=0.9, preserve_source_lighting=True).validate()
+    assert 0.85 <= defaults.detail_power <= 1.0
+    assert defaults.lighting_smooth_sigma >= 0.0
+    EngineSettings(
+        renderer_mode="intrinsic",
+        detail_lock_strength=0.9,
+        preserve_source_lighting=True,
+        lighting_smooth_sigma=1.5,
+    ).validate()
     with pytest.raises(ValueError, match="renderer_mode"):
         EngineSettings(renderer_mode="unknown").validate()
     with pytest.raises(ValueError, match="detail_lock_strength"):
         EngineSettings(detail_lock_strength=1.5).validate()
     with pytest.raises(ValueError, match="preserve_source_lighting"):
         EngineSettings(preserve_source_lighting="yes").validate()
+    with pytest.raises(ValueError, match="lighting_smooth_sigma"):
+        EngineSettings(lighting_smooth_sigma=-0.5).validate()
+    with pytest.raises(ValueError, match="shadow_max_thickness"):
+        EngineSettings(shadow_max_thickness=0.0).validate()
+    with pytest.raises(ValueError, match="source_shading_blend"):
+        EngineSettings(source_shading_blend=1.2).validate()
+    with pytest.raises(ValueError, match="atmosphere_density"):
+        EngineSettings(atmosphere_density=-0.1).validate()
+    with pytest.raises(ValueError, match="wrap"):
+        Light("w", "directional", direction=(0, 0, -1), wrap=1.5).validate()
+    with pytest.raises(ValueError, match="ground"):
+        LightingRig(ambient_ground_color=(-0.1, 0.2, 0.2)).validate()

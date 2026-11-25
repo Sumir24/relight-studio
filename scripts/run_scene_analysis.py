@@ -124,10 +124,14 @@ def main() -> int:
                         help="Optional SAM2 revision; use a full 40-character commit SHA for immutable pinning.")
     parser.add_argument("--normal-backend", default="depth_derived",
                         help="Surface normal backend: 'depth_derived' or a registered normal backend (e.g. 'marigold_normals').")
+    parser.add_argument("--normal-ensemble", type=int, default=3,
+                        help="Ensemble size for diffusion-based normal backends (default: 3).")
     parser.add_argument("--normal-revision", default=None,
                         help="Optional Hugging Face revision for external normal backend.")
     parser.add_argument("--intrinsic-backend", default="none",
                         help="Optional intrinsic backend: 'none' or a registered backend (e.g. 'marigold_intrinsics_lighting').")
+    parser.add_argument("--intrinsic-ensemble", type=int, default=3,
+                        help="Ensemble size for diffusion-based intrinsic backends (default: 3).")
     parser.add_argument("--intrinsic-revision", default=None,
                         help="Optional Hugging Face revision for intrinsic backend.")
     parser.add_argument("--strict-model-revisions", action="store_true",
@@ -290,7 +294,7 @@ def main() -> int:
     if args.normal_backend != "depth_derived":
         from relight_engine.adapters.registry import create_normal_backend
         print(f"[4b/5] Estimating surface normals with {args.normal_backend}...")
-        norm_kwargs = {"device": args.device}
+        norm_kwargs = {"device": args.device, "ensemble_size": max(1, int(args.normal_ensemble))}
         if args.normal_revision:
             norm_kwargs["revision"] = args.normal_revision
         normal_backend = create_normal_backend(args.normal_backend, **norm_kwargs)
@@ -323,7 +327,7 @@ def main() -> int:
     if args.intrinsic_backend != "none":
         from relight_engine.adapters.registry import create_intrinsic_backend
         print(f"[4c/5] Estimating intrinsic buffers with {args.intrinsic_backend}...")
-        intr_kwargs = {"device": args.device}
+        intr_kwargs = {"device": args.device, "ensemble_size": max(1, int(args.intrinsic_ensemble))}
         if args.intrinsic_revision:
             intr_kwargs["revision"] = args.intrinsic_revision
         intrinsic_backend = create_intrinsic_backend(args.intrinsic_backend, **intr_kwargs)

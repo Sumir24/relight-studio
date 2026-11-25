@@ -13,9 +13,39 @@ from .contracts import (
 )
 from .geometry import prepare_geometry
 from .lighting import evaluate_rig
-from .composite import compose_hybrid_neural, compose_intrinsic, compose_source_preserving
+from .composite import compose_hybrid_neural, compose_intrinsic, compose_source_preserving, _depth_guided_smooth
 from .quality import evaluate_scene_buffers, describe_material_response
 from .color import luminance
+
+
+def _effective_source_diffuse(
+    scene: SceneBuffers,
+    source_d: np.ndarray,
+    settings: EngineSettings,
+) -> np.ndarray:
+    """Blend depth-smoothed neural source shading with analytic source_rig diffuse."""
+    blend = float(settings.source_shading_blend)
+    if blend <= 0.0 or scene.source_shading is None:
+        return source_d
+    sh = np.asarray(scene.source_shading, dtype=np.float32)
+    if sh.ndim == 2:
+        sh = np.repeat(sh[..., None], 3, axis=-1)
+    smooth_sigma = max(float(settings.lighting_smooth_sigma) * 2.0, 2.0)
+    sh_smooth = np.maximum(_depth_guided_smooth(sh, scene.depth, smooth_sigma), 1e-4)
+    active = (scene.depth > 0) & (scene.lightable_mask > 0.05)
+    if scene.protected_mask is not None:
+        active = active & (scene.protected_mask < 0.95)
+    if not np.any(active):
+        active = scene.depth > 0
+    sh_y = np.maximum(luminance(sh_smooth), 1e-4)
+    sd_y = np.maximum(luminance(source_d), 1e-4)
+    med_sh = max(float(np.median(sh_y[active])), 1e-4)
+    med_sd = max(float(np.median(sd_y[active])), 1e-4)
+    rel_y = np.clip(sh_y / med_sh, 0.42, 2.4)
+    chroma = np.clip(sh_smooth / sh_y[..., None], 0.45, 2.0)
+    chroma = np.power(chroma, 0.70)
+    sh_matched = (rel_y[..., None] * chroma) * med_sd
+    return ((1.0 - blend) * source_d + blend * sh_matched).astype(np.float32)
 
 
 def relight(
@@ -42,6 +72,11 @@ def relight(
     camera.validate()
 
     points, normals, geometry_conf = prepare_geometry(scene, camera)
+    if float(settings.normal_smooth_sigma) > 0.0:
+        smoothed = _depth_guided_smooth(normals, scene.depth, float(settings.normal_smooth_sigma))
+        lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
+        valid_n = lens[..., 0] > 1e-6
+        normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
 
     gate_report = None
     if require_geometry_ready:
@@ -76,6 +111,7 @@ def relight(
         source_d, source_s, _ = evaluate_rig(
             scene, camera, points, normals, source_rig, settings
         )
+        source_d = _effective_source_diffuse(scene, source_d, settings)
     if settings.preserve_source_lighting:
         assert source_d is not None and source_s is not None
         target_d = source_d + target_d
@@ -122,6 +158,7 @@ def relight(
             target_s,
             geometry_conf,
             settings,
+            target_rig=target_rig,
         )
         mode_label = "2.5D source-to-target relighting"
 

@@ -66,12 +66,17 @@ def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         inside = (u >= 1) & (u < w - 1) & (v >= 1) & (v < h - 1) & (qz > 0)
         penetration = (qz - bias) - sampled
-        soft_hit = np.where(
+        raw_hit = np.where(
             inside & (sampled > 0) & (penetration > 0),
             np.clip(penetration / soft_width, 0.0, 1.0),
             0.0,
         )
-        visibility = np.minimum(visibility, 1.0 - soft_hit)
+        if settings.shadow_max_thickness is not None:
+            max_t = float(settings.shadow_max_thickness)
+            fade_w = max(max_t * 0.35, 1e-4)
+            thickness_weight = np.clip((max_t - penetration) / fade_w, 0.0, 1.0)
+            raw_hit *= thickness_weight
+        visibility = np.minimum(visibility, 1.0 - raw_hit)
         if not np.any(visibility > 0.02):
             break
     return _smooth_visibility_edge_aware(visibility, depth_f32)

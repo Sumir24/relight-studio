@@ -2,7 +2,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from .color import srgb_to_linear, linear_to_srgb, luminance
-from .contracts import SceneBuffers, EngineSettings
+from .contracts import SceneBuffers, EngineSettings, LightingRig
 
 def _edge_aware_log_base(log_y: np.ndarray, sigma: float, eps_guide: float = 0.08) -> np.ndarray:
     """Self-guided filter in log-luminance space to suppress boundary halos."""
@@ -22,6 +22,31 @@ def _compute_log_base(log_y: np.ndarray, settings: EngineSettings) -> np.ndarray
     return gaussian_filter(log_y, settings.base_blur_sigma, mode='reflect')
 
 
+def _depth_guided_smooth(
+    field: np.ndarray, depth: np.ndarray, sigma: float, eps_guide: float = 0.008
+) -> np.ndarray:
+    """Smooth a scalar or HxWxC lighting field while preserving sharp depth discontinuities."""
+    if sigma <= 0.0:
+        return field
+    guide = np.log(np.maximum(depth, 1e-3)).astype(np.float32)
+    mean_i = gaussian_filter(guide, sigma, mode='reflect')
+    mean_ii = gaussian_filter(guide * guide, sigma, mode='reflect')
+    var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+
+    def _filter_2d(p: np.ndarray) -> np.ndarray:
+        mean_p = gaussian_filter(p, sigma, mode='reflect')
+        mean_ip = gaussian_filter(guide * p, sigma, mode='reflect')
+        cov_ip = mean_ip - mean_i * mean_p
+        a = cov_ip / (var_i + eps_guide)
+        b = mean_p - a * mean_i
+        return gaussian_filter(a, sigma, mode='reflect') * guide + gaussian_filter(b, sigma, mode='reflect')
+
+    if field.ndim == 2:
+        return _filter_2d(field.astype(np.float32)).astype(np.float32)
+    channels = [_filter_2d(field[..., c].astype(np.float32)) for c in range(field.shape[-1])]
+    return np.stack(channels, axis=-1).astype(np.float32)
+
+
 def _active_blend_mask(
     scene: SceneBuffers, geometry_confidence: np.ndarray, settings: EngineSettings
 ) -> np.ndarray:
@@ -30,8 +55,14 @@ def _active_blend_mask(
         mask *= 1.0 - np.clip(scene.protected_mask, 0, 1)
     if scene.alpha_mask is not None:
         mask *= np.clip(scene.alpha_mask, 0, 1)
-    mask *= np.clip(geometry_confidence, 0, 1)
-    mask *= (geometry_confidence >= settings.min_geometry_confidence).astype(np.float32)
+    conf = np.clip(geometry_confidence, 0, 1).astype(np.float32)
+    min_c = float(settings.min_geometry_confidence)
+    ramp_hi = max(min_c + 0.15, 0.30)
+    if ramp_hi > min_c + 1e-6:
+        conf_weight = np.clip((conf - min_c) / (ramp_hi - min_c), 0.0, 1.0)
+    else:
+        conf_weight = (conf >= min_c).astype(np.float32)
+    mask *= conf_weight * (conf >= min_c).astype(np.float32)
     return np.clip(mask, 0, 1).astype(np.float32)
 
 
@@ -45,10 +76,55 @@ def _apply_highlight_shoulder(relit: np.ndarray, src: np.ndarray, eps: float = 1
     return relit * scale[..., None]
 
 
+def _infer_atmosphere_color(target_rig: LightingRig | None, settings: EngineSettings) -> np.ndarray:
+    if settings.atmosphere_color is not None:
+        return np.asarray(settings.atmosphere_color, dtype=np.float32)
+    if target_rig is not None:
+        weighted = np.zeros(3, dtype=np.float32)
+        total_w = 0.0
+        for light in target_rig.lights:
+            w = max(float(light.strength), 0.0)
+            weighted += np.asarray(light.color, dtype=np.float32) * w
+            total_w += w
+        if target_rig.ambient_strength > 0.0:
+            w_amb = float(target_rig.ambient_strength) * 0.5
+            weighted += np.asarray(target_rig.ambient_color, dtype=np.float32) * w_amb
+            total_w += w_amb
+        if total_w > 1e-6:
+            col = weighted / total_w
+            return col / max(float(luminance(col)), 1e-4)
+    return np.array([1.0, 1.0, 1.0], dtype=np.float32)
+
+
+def _apply_aerial_perspective(
+    relit: np.ndarray,
+    scene: SceneBuffers,
+    target_rig: LightingRig | None,
+    settings: EngineSettings,
+) -> np.ndarray:
+    density = float(settings.atmosphere_density)
+    if density <= 0.0:
+        return relit
+    valid = scene.depth > 0
+    if not np.any(valid):
+        return relit
+    z_near, z_far = np.quantile(scene.depth[valid], [0.02, 0.98])
+    z_span = max(float(z_far - z_near), 1e-4)
+    d_norm = np.clip((scene.depth - float(z_near)) / z_span, 0.0, 1.25)
+    trans = np.where(valid, np.exp(-density * d_norm), 1.0).astype(np.float32)
+
+    relit_y = np.maximum(luminance(relit), 1e-4)
+    ref_y = float(np.quantile(relit_y[valid], 0.65))
+    scatter_tint = _infer_atmosphere_color(target_rig, settings)[None, None, :]
+    haze_rad = scatter_tint * (0.55 * relit_y[..., None] + 0.45 * ref_y)
+    return (relit * trans[..., None] + haze_rad * (1.0 - trans[..., None])).astype(np.float32)
+
+
 def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
                               target_diffuse: np.ndarray, source_specular: np.ndarray,
                               target_specular: np.ndarray, geometry_confidence: np.ndarray,
-                              settings: EngineSettings) -> tuple[np.ndarray, np.ndarray]:
+                              settings: EngineSettings,
+                              target_rig: LightingRig | None = None) -> tuple[np.ndarray, np.ndarray]:
     src = srgb_to_linear(scene.rgb_srgb)
     eps = 1e-4
     # Use a luminance ratio for stable detail preservation; carry a restrained RGB chroma shift separately.
@@ -61,19 +137,32 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
     color_ratio = np.clip(tgt_chroma / np.maximum(src_chroma, eps),
                           settings.color_ratio_min, settings.color_ratio_max)
     color_ratio = np.power(color_ratio, 0.85)
+    if settings.lighting_smooth_sigma > 0.0:
+        ratio = np.clip(
+            _depth_guided_smooth(ratio, scene.depth, settings.lighting_smooth_sigma),
+            settings.ratio_min, settings.ratio_max,
+        )
+        color_ratio = np.clip(
+            _depth_guided_smooth(color_ratio, scene.depth, settings.lighting_smooth_sigma),
+            settings.color_ratio_min, settings.color_ratio_max,
+        )
 
     y = np.maximum(luminance(src), eps)
-    log_y = np.log(y)
-    base = np.exp(_compute_log_base(log_y, settings))
-    detail = y - base
-    y_relit = base * ratio + detail * np.power(ratio, settings.detail_power)
-    y_relit = np.maximum(y_relit, eps)
+    if abs(float(settings.detail_power) - 1.0) < 1e-6:
+        y_relit = np.maximum(y * ratio, eps)
+    else:
+        log_y = np.log(y)
+        base = np.exp(_compute_log_base(log_y, settings))
+        detail = y - base
+        y_relit = base * ratio + detail * np.power(ratio, settings.detail_power)
+        y_relit = np.maximum(y_relit, eps)
     relit = src * (y_relit / y)[..., None] * color_ratio
     relit *= settings.output_exposure
 
     # Add only the incremental GGX highlight predicted by the target rig.
     spec_delta = np.maximum(target_specular - source_specular, 0.0)
     relit += spec_delta * settings.specular_scale
+    relit = _apply_aerial_perspective(relit, scene, target_rig, settings)
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]

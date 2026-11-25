@@ -159,6 +159,7 @@ class Light:
     area_size: Tuple[float, float] = (0.5, 0.5)             # area width/height, scene units
     samples: int = 4
     casts_shadows: bool = True
+    wrap: float = 0.0                                       # wrapped Lambertian scatter [0, 1]
 
     def validate(self) -> None:
         if not self.name.strip():
@@ -168,6 +169,9 @@ class Light:
         _finite_scalar('Light strength', self.strength)
         if self.strength < 0:
             raise ValueError('Light strength cannot be negative.')
+        _finite_scalar('Light wrap', self.wrap)
+        if not 0.0 <= self.wrap <= 1.0:
+            raise ValueError('Light wrap must be in [0,1].')
         color = np.asarray(self.color, dtype=np.float64)
         if color.shape != (3,) or not np.isfinite(color).all() or np.any(color < 0):
             raise ValueError('Light color must be a finite non-negative linear RGB triple.')
@@ -195,6 +199,7 @@ class LightingRig:
     ambient_color: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     ambient_strength: float = 0.15
     lights: Tuple[Light, ...] = ()
+    ambient_ground_color: Optional[Tuple[float, float, float]] = None
 
     def validate(self) -> None:
         _finite_scalar('Ambient strength', self.ambient_strength)
@@ -203,6 +208,10 @@ class LightingRig:
         color = np.asarray(self.ambient_color, dtype=np.float64)
         if color.shape != (3,) or not np.isfinite(color).all() or np.any(color < 0):
             raise ValueError('Ambient color must be a finite non-negative RGB triple.')
+        if self.ambient_ground_color is not None:
+            gcolor = np.asarray(self.ambient_ground_color, dtype=np.float64)
+            if gcolor.shape != (3,) or not np.isfinite(gcolor).all() or np.any(gcolor < 0):
+                raise ValueError('Ambient ground color must be a finite non-negative RGB triple.')
         for light in self.lights:
             light.validate()
 
@@ -210,7 +219,7 @@ class LightingRig:
 @dataclass(frozen=True)
 class EngineSettings:
     base_blur_sigma: float = 18.0
-    detail_power: float = 0.78
+    detail_power: float = 0.90
     ratio_min: float = 0.25
     ratio_max: float = 4.0
     color_ratio_min: float = 0.15
@@ -219,12 +228,18 @@ class EngineSettings:
     shadow_steps: int = 24
     shadow_bias_metric: float = 0.015
     shadow_bias_relative: float = 0.003
+    shadow_max_thickness: Optional[float] = None
     min_geometry_confidence: float = 0.15
     output_exposure: float = 1.0
     edge_aware_base: bool = True
     renderer_mode: RendererMode = 'auto'
-    detail_lock_strength: float = 0.85
+    detail_lock_strength: float = 0.95
     preserve_source_lighting: bool = False
+    lighting_smooth_sigma: float = 1.2
+    normal_smooth_sigma: float = 0.0
+    source_shading_blend: float = 0.0
+    atmosphere_density: float = 0.0
+    atmosphere_color: Optional[Tuple[float, float, float]] = None
 
     def validate(self) -> None:
         numeric = {
@@ -240,6 +255,10 @@ class EngineSettings:
             'min_geometry_confidence': self.min_geometry_confidence,
             'output_exposure': self.output_exposure,
             'detail_lock_strength': self.detail_lock_strength,
+            'lighting_smooth_sigma': self.lighting_smooth_sigma,
+            'normal_smooth_sigma': self.normal_smooth_sigma,
+            'source_shading_blend': self.source_shading_blend,
+            'atmosphere_density': self.atmosphere_density,
         }
         for name, value in numeric.items():
             _finite_scalar(name, value)
@@ -251,6 +270,10 @@ class EngineSettings:
             raise ValueError('Detail, specular and exposure controls must be non-negative.')
         if self.shadow_bias_metric < 0 or self.shadow_bias_relative < 0:
             raise ValueError('Shadow bias values must be non-negative.')
+        if self.shadow_max_thickness is not None:
+            _finite_scalar('shadow_max_thickness', self.shadow_max_thickness)
+            if self.shadow_max_thickness <= 0:
+                raise ValueError('shadow_max_thickness must be positive when set.')
         if not isinstance(self.shadow_steps, int) or self.shadow_steps < 2:
             raise ValueError('shadow_steps must be an integer >= 2.')
         if not 0 <= self.min_geometry_confidence <= 1:
@@ -263,6 +286,18 @@ class EngineSettings:
             raise ValueError('detail_lock_strength must be in [0,1].')
         if not isinstance(self.preserve_source_lighting, bool):
             raise ValueError('preserve_source_lighting must be a boolean.')
+        if self.lighting_smooth_sigma < 0:
+            raise ValueError('lighting_smooth_sigma must be non-negative.')
+        if self.normal_smooth_sigma < 0:
+            raise ValueError('normal_smooth_sigma must be non-negative.')
+        if not 0.0 <= self.source_shading_blend <= 1.0:
+            raise ValueError('source_shading_blend must be in [0,1].')
+        if self.atmosphere_density < 0.0:
+            raise ValueError('atmosphere_density must be non-negative.')
+        if self.atmosphere_color is not None:
+            acolor = np.asarray(self.atmosphere_color, dtype=np.float64)
+            if acolor.shape != (3,) or not np.isfinite(acolor).all() or np.any(acolor < 0):
+                raise ValueError('atmosphere_color must be a finite non-negative RGB triple.')
 
 
 @dataclass

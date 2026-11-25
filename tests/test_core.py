@@ -697,3 +697,206 @@ def test_preserve_source_lighting_adds_colored_point_light_leaving_shadow_unchan
     # Lit area receives vivid red glow while occluded area preserves original 0.50 gray photo
     assert float(lit_pixel[0] - lit_pixel[2]) > 0.20
     assert np.allclose(shadowed_pixel, 0.50, atol=0.04)
+
+
+def test_active_mask_applies_full_relight_for_valid_confidence_prior():
+    h, w = 24, 32
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    scene_075 = SceneBuffers(
+        rgb_srgb=np.full((h, w, 3), 0.45, dtype=np.float32),
+        depth=np.full((h, w), 2.0, dtype=np.float32),
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.full((h, w), 0.75, dtype=np.float32),
+    )
+    scene_100 = SceneBuffers(
+        rgb_srgb=scene_075.rgb_srgb,
+        depth=scene_075.depth,
+        depth_confidence=scene_075.depth_confidence,
+        lightable_mask=scene_075.lightable_mask,
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src = LightingRig(ambient_strength=0.25, lights=(
+        Light("s", "directional", direction=(0.0, 0.0, -1.0), strength=0.8, casts_shadows=False),
+    ))
+    tgt = LightingRig(ambient_strength=0.10, lights=(
+        Light("t", "directional", direction=(0.0, 0.0, -1.0), strength=1.5, color=(1.0, 0.2, 0.2), casts_shadows=False),
+    ))
+    r75 = relight(scene_075, camera, src, tgt, EngineSettings(renderer_mode="ratio"))
+    r100 = relight(scene_100, camera, src, tgt, EngineSettings(renderer_mode="ratio"))
+    assert np.allclose(r75.rgb_srgb, r100.rgb_srgb, atol=1e-4)
+
+
+def test_lighting_smooth_suppresses_normal_noise_without_blurring_source_texture():
+    rng = np.random.default_rng(7)
+    h, w = 32, 48
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    # Crisp 2px periodic source texture must stay sharp
+    tex = np.where(((xx.astype(int) + yy.astype(int)) % 2) == 0, 0.60, 0.35).astype(np.float32)
+    rgb = np.repeat(tex[..., None], 3, axis=-1)
+    # Noisy surface normals on left plane; sharp depth step at w//2 must not bleed light across
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    depth[:, w // 2 :] = 6.0
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 0] = rng.normal(0.0, 0.35, size=(h, w)).astype(np.float32)
+    normals[..., 2] = -1.0
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+    scene = SceneBuffers(
+        rgb_srgb=rgb, depth=depth, depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32), depth_kind="relative",
+        normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src = LightingRig(ambient_strength=0.3, lights=(
+        Light("s", "directional", direction=(0.0, 0.0, -1.0), strength=0.7, casts_shadows=False),
+    ))
+    tgt = LightingRig(ambient_strength=0.1, lights=(
+        Light("t", "directional", direction=(0.8, 0.0, -0.6), strength=1.4, color=(1.0, 0.2, 0.2), casts_shadows=False),
+    ))
+    raw_res = relight(scene, camera, src, tgt, EngineSettings(renderer_mode="ratio", lighting_smooth_sigma=0.0))
+    smooth_res = relight(scene, camera, src, tgt, EngineSettings(renderer_mode="ratio", lighting_smooth_sigma=1.5))
+    # Depth-guided lighting smoothing cuts noisy normal variation while preserving checkerboard contrast
+    assert np.std(smooth_res.diffuse_ratio[:, 4 : w // 2 - 4]) < np.std(raw_res.diffuse_ratio[:, 4 : w // 2 - 4]) * 0.5
+    checker_even = smooth_res.rgb_srgb[4:20:2, 4:18:2, 0].mean()
+    checker_odd = smooth_res.rgb_srgb[4:20:2, 5:18:2, 0].mean()
+    assert abs(checker_even - checker_odd) > 0.12
+
+
+def test_shadow_max_thickness_prevents_far_background_streak_while_keeping_contact_shadow():
+    h, w = 48, 64
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    depth = np.full((h, w), 4.8, dtype=np.float32)
+    # Near small occluder far in front of the distant background
+    depth[18:30, 20:24] = 1.4
+    # Nearby surface right next to a second occluder step
+    depth[:, 44:] = 1.8
+    depth[18:30, 40:44] = 1.4
+    points = backproject_depth(depth, camera)
+    normals = np.zeros_like(points)
+    normals[..., 2] = -1.0
+    to_light = np.zeros_like(points)
+    to_light[:] = np.array([-1.0, 0.0, -0.45], dtype=np.float32)
+
+    vis_unbounded = ray_visibility(
+        points, normals, depth, camera, to_light, np.full((h, w), 6.0, np.float32),
+        "relative", EngineSettings(shadow_steps=20, shadow_max_thickness=None),
+    )
+    vis_bounded = ray_visibility(
+        points, normals, depth, camera, to_light, np.full((h, w), 6.0, np.float32),
+        "relative", EngineSettings(shadow_steps=20, shadow_max_thickness=0.7),
+    )
+    # Unbounded hits the far background across a 3.4-unit chasm; bounded does not streak the distant plane
+    assert float(vis_unbounded[24, 28]) < 0.5
+    assert float(vis_bounded[24, 28]) > 0.95
+    # Contact shadow onto nearby 0.4-unit step remains intact
+    assert float(vis_bounded[24, 46]) < 0.5
+
+
+def test_wrapped_diffuse_and_hemispheric_ambient_smooth_terminator():
+    h, w = 16, 16
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[:, :8] = np.array([0.55, 0.2, -0.81], dtype=np.float32)  # just past 90-degree terminator (N.L ~ -0.15)
+    normals[:, 8:] = np.array([-0.1, -0.95, -0.29], dtype=np.float32)  # faces down toward ground
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+    scene = SceneBuffers(
+        rgb_srgb=np.full((h, w, 3), 0.45, dtype=np.float32),
+        depth=np.full((h, w), 2.0, dtype=np.float32),
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    pts = backproject_depth(scene.depth, camera)
+    hard_rig = LightingRig(
+        ambient_color=(0.2, 0.2, 0.8),
+        ambient_ground_color=(0.9, 0.4, 0.2),
+        ambient_strength=0.3,
+        lights=(Light("sun", "directional", direction=(-0.9, 0.1, -0.4), color=(1.0, 0.7, 0.3), wrap=0.0, casts_shadows=False),),
+    )
+    wrap_rig = LightingRig(
+        ambient_color=(0.2, 0.2, 0.8),
+        ambient_ground_color=(0.9, 0.4, 0.2),
+        ambient_strength=0.3,
+        lights=(Light("sun", "directional", direction=(-0.9, 0.1, -0.4), color=(1.0, 0.7, 0.3), wrap=0.45, casts_shadows=False),),
+    )
+    d_hard, _, _ = evaluate_rig(scene, camera, pts, normals, hard_rig, EngineSettings())
+    d_wrap, _, _ = evaluate_rig(scene, camera, pts, normals, wrap_rig, EngineSettings())
+    # Wrap smoothly illuminates grazing faces past the hard 90-degree terminator
+    assert float(d_wrap[8, 2, 0]) > float(d_hard[8, 2, 0]) + 0.10
+    # Downward-facing normals pick up warm ground bounce more strongly than blue sky ambient
+    assert float(d_hard[8, 12, 0]) > float(d_hard[8, 12, 2])
+
+
+def test_source_shading_blend_and_aerial_perspective_stay_exact_in_foreground():
+    from relight_engine.color import linear_to_srgb
+
+    h, w = 32, 48
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    depth = np.where(xx < w // 2, 1.0, 5.0).astype(np.float32)
+    # Fine 2px texture across both foreground and background
+    tex = np.where(((xx.astype(int) + yy.astype(int)) % 2) == 0, 0.55, 0.30).astype(np.float32)
+    # Cool blue tint baked into background right half via source_shading
+    albedo = np.repeat(tex[..., None], 3, axis=-1)
+    src_sh = np.ones((h, w, 3), dtype=np.float32)
+    src_sh[:, w // 2 :] = np.array([0.55, 0.75, 1.10], dtype=np.float32)
+    rgb_srgb = linear_to_srgb(np.clip(albedo * src_sh, 0.0, 1.0))
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    scene = SceneBuffers(
+        rgb_srgb=rgb_srgb, depth=depth, depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32), depth_kind="relative",
+        normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+        source_shading=src_sh,
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src_rig = LightingRig(ambient_strength=0.4, lights=(
+        Light("src", "directional", direction=(0, 0, -1), strength=0.6, casts_shadows=False),
+    ))
+    tgt_rig = LightingRig(ambient_strength=0.35, ambient_color=(1.0, 0.78, 0.50), lights=(
+        Light("warm", "directional", direction=(-0.3, 0.3, -0.9), color=(1.0, 0.72, 0.40), strength=0.9, casts_shadows=False),
+    ))
+    res = relight(
+        scene, camera, src_rig, tgt_rig,
+        EngineSettings(detail_power=1.0, source_shading_blend=0.8, atmosphere_density=0.25),
+    )
+    # Foreground remains sharp with checkerboard intact and warm relit
+    fg_even = float(res.rgb_srgb[4:24:2, 4:18:2, 0].mean())
+    fg_odd = float(res.rgb_srgb[4:24:2, 5:18:2, 0].mean())
+    assert abs(fg_even - fg_odd) > 0.12
+    # Cool blue background haze neutralizes and warms up instead of staying colder than red
+    bg_mean = res.rgb_srgb[:, w // 2 + 4 : -4].mean(axis=(0, 1))
+    assert float(bg_mean[0]) > float(bg_mean[2])
+
+
+def test_normal_smooth_sigma_suppresses_texture_crease_across_flat_depth():
+    h, w = 24, 32
+    depth = np.full((h, w), 3.0, dtype=np.float32)
+    depth[:, w // 2 :] = 1.5  # crisp depth boundary between two planes
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    # Fake 2px-wide normal glitch on flat left depth plane; distinct tilted right plane
+    normals[10:14, 6:8] = np.array([0.85, 0.0, -0.52], dtype=np.float32)
+    normals[:, w // 2 :] = np.array([-0.6, 0.0, -0.8], dtype=np.float32)
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+    scene = SceneBuffers(
+        rgb_srgb=np.full((h, w, 3), 0.5, dtype=np.float32),
+        depth=depth, depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32), depth_kind="relative",
+        normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    rig = LightingRig(ambient_strength=0.1, lights=(
+        Light("key", "directional", direction=(-0.7, 0.2, -0.7), strength=1.0, casts_shadows=False),
+    ))
+    res = relight(scene, camera, rig, rig, EngineSettings(normal_smooth_sigma=2.5))
+    # Glitch smoothed away on flat left plane while tilted right plane normal remains distinct
+    assert abs(float(res.normal_map[12, 7, 0])) < 0.25
+    assert float(res.normal_map[12, w // 2 + 4, 0]) < -0.50
