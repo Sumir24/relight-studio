@@ -12,6 +12,7 @@ from .calibration import (
     kelvin_to_linear_rgb,
 )
 from .engine import relight
+from .image_io import save_image
 from .scene_policy import semantic_key
 
 
@@ -306,15 +307,7 @@ def run_scene_relight(
         if relighter is not None:
             relighter.close()
 
-    from PIL import Image
-    out = Path(output_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    rgb_u8 = np.round(np.clip(result.rgb_srgb, 0, 1) * 255).astype(np.uint8)
-    if scene.alpha_mask is not None:
-        rgba_u8 = np.dstack([rgb_u8, np.round(np.clip(scene.alpha_mask, 0, 1) * 255).astype(np.uint8)])
-        Image.fromarray(rgba_u8, mode="RGBA").save(out)
-    else:
-        Image.fromarray(rgb_u8, mode="RGB").save(out)
+    out = save_image(output_path, result.rgb_srgb, alpha_mask=scene.alpha_mask)
     relative_depth_point_area = (
         scene.depth_kind == "relative"
         and any(light.kind in ("point", "area") for light in target_rig.lights)

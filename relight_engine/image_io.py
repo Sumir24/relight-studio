@@ -73,3 +73,21 @@ def load_image(path: str | Path) -> ImageInput:
     )
     result.validate()
     return result
+
+
+def save_image(
+    path: str | Path,
+    rgb_srgb: np.ndarray,
+    *,
+    alpha_mask: np.ndarray | None = None,
+) -> Path:
+    """Save sRGB [0,1] image to disk, preserving separate alpha transparency if supplied."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rgb_u8 = np.round(np.clip(rgb_srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if alpha_mask is not None:
+        alpha_u8 = np.round(np.clip(alpha_mask, 0.0, 1.0) * 255.0).astype(np.uint8)
+        Image.fromarray(np.dstack([rgb_u8, alpha_u8]), mode="RGBA").save(out)
+    else:
+        Image.fromarray(rgb_u8, mode="RGB").save(out)
+    return out
