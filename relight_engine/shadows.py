@@ -30,21 +30,51 @@ def _smooth_visibility_edge_aware(visibility: np.ndarray, depth: np.ndarray,
     return np.clip(acc / np.maximum(wsum, 1e-6), 0.0, 1.0).astype(np.float32)
 
 
+def _pcss_penumbra_smooth(visibility: np.ndarray, depth: np.ndarray,
+                          penumbra_px: np.ndarray) -> np.ndarray:
+    """Blend depth-aware multi-scale visibility for PCSS-style contact-sharp to far-soft shadows."""
+    from scipy.ndimage import gaussian_filter
+
+    valid = depth > 0
+    log_d = np.log(np.maximum(depth, 1e-3)).astype(np.float32)
+
+    def _guided_vis(sig: float) -> np.ndarray:
+        mean_i = gaussian_filter(log_d, sig, mode='reflect')
+        mean_ii = gaussian_filter(log_d * log_d, sig, mode='reflect')
+        var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+        mean_p = gaussian_filter(visibility, sig, mode='reflect')
+        mean_ip = gaussian_filter(log_d * visibility, sig, mode='reflect')
+        cov_ip = mean_ip - mean_i * mean_p
+        a = cov_ip / (var_i + 0.005)
+        b = mean_p - a * mean_i
+        out = gaussian_filter(a, sig, mode='reflect') * log_d + gaussian_filter(b, sig, mode='reflect')
+        return np.clip(np.where(valid, out, visibility), 0.0, 1.0).astype(np.float32)
+
+    v_med = _guided_vis(2.0)
+    v_wide = _guided_vis(5.0)
+    t1 = np.clip(penumbra_px / 2.5, 0.0, 1.0)
+    t2 = np.clip((penumbra_px - 2.5) / 4.5, 0.0, 1.0)
+    blended = visibility * (1.0 - t1) + v_med * t1
+    return np.clip(blended * (1.0 - t2) + v_wide * t2, 0.0, 1.0).astype(np.float32)
+
+
 def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
                    camera: CameraModel, to_light: np.ndarray,
                    max_distance: np.ndarray, depth_kind: str,
-                   settings: EngineSettings) -> np.ndarray:
+                   settings: EngineSettings,
+                   light_radius: float = 0.0) -> np.ndarray:
     """Approximate 2.5D visibility by marching camera-projected rays through the depth map.
 
     A nearer observed depth than the ray point marks an occluder. Uses deterministic
-    2x2 Bayer sub-step phase offsets, soft depth-margin attenuation, and edge-aware
-    spatial smoothing to avoid discrete step-band silhouettes.
+    2x2 Bayer sub-step phase offsets, soft depth-margin attenuation, optional finite
+    occluder thickness bounds, and PCSS-style blocker-distance penumbra softening.
     """
     h, w = depth.shape
     direction = to_light / np.maximum(np.linalg.norm(to_light, axis=-1, keepdims=True), 1e-8)
     bias = settings.shadow_bias_metric if depth_kind == 'metric' else settings.shadow_bias_relative
     origin = points + normals * bias * 2.0
     visibility = np.ones((h, w), np.float32)
+    blocker_step = np.full((h, w), 1.0, np.float32)
     yy, xx = np.mgrid[0:h, 0:w]
     bayer = (((yy & 1) * 2 + (xx & 1)) * 0.25).astype(np.float32)
     n_steps = max(2, settings.shadow_steps)
@@ -76,20 +106,32 @@ def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
             fade_w = max(max_t * 0.35, 1e-4)
             thickness_weight = np.clip((max_t - penetration) / fade_w, 0.0, 1.0)
             raw_hit *= thickness_weight
+        hit_mask = raw_hit > 0.15
+        blocker_step = np.where(hit_mask, np.minimum(blocker_step, step), blocker_step)
         visibility = np.minimum(visibility, 1.0 - raw_hit)
         if not np.any(visibility > 0.02):
             break
-    return _smooth_visibility_edge_aware(visibility, depth_f32)
+    vis_out = _smooth_visibility_edge_aware(visibility, depth_f32)
+    if float(light_radius) > 0.0 and np.any(vis_out < 0.99):
+        # Blocker-to-receiver distance ratio controls penumbra width in screen pixels.
+        gap_ratio = blocker_step / np.maximum(1.0 - blocker_step, 0.15)
+        penumbra_px = np.clip(float(light_radius) * gap_ratio * 12.0, 0.0, 7.0)
+        vis_out = _pcss_penumbra_smooth(vis_out, depth_f32, penumbra_px)
+    return vis_out
 
 def scene_shadow_visibility(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
                             normals: np.ndarray, light_positions: np.ndarray | None,
                             directional_vectors: np.ndarray | None,
-                            settings: EngineSettings) -> np.ndarray:
+                            settings: EngineSettings,
+                            light_radius: float = 0.0) -> np.ndarray:
     h, w = scene.depth.shape
     if light_positions is not None:
         vec = light_positions - points
         dist = np.linalg.norm(vec, axis=-1)
-        return ray_visibility(points, normals, scene.depth, camera, vec, dist, scene.depth_kind, settings)
+        return ray_visibility(
+            points, normals, scene.depth, camera, vec, dist,
+            scene.depth_kind, settings, light_radius=light_radius,
+        )
     assert directional_vectors is not None
     bias = settings.shadow_bias_metric if scene.depth_kind == 'metric' else settings.shadow_bias_relative
     valid = scene.depth > 0
@@ -113,5 +155,7 @@ def scene_shadow_visibility(scene: SceneBuffers, camera: CameraModel, points: np
         t_exit_far = np.maximum((z_max - points[..., 2]) / np.maximum(dz, 1e-4), 0.0) + 4.0 * bias
         max_dist = np.where(away_cam, np.minimum(max_dist, t_exit_far), max_dist)
     max_dist = np.maximum(max_dist, 4.0 * bias)
-    return ray_visibility(points, normals, scene.depth, camera, directional_vectors, max_dist,
-                          scene.depth_kind, settings)
+    return ray_visibility(
+        points, normals, scene.depth, camera, directional_vectors, max_dist,
+        scene.depth_kind, settings, light_radius=light_radius,
+    )

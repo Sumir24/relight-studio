@@ -209,6 +209,38 @@ def estimate_normals(
     return normals.astype(np.float32), np.clip(confidence, 0.0, 1.0).astype(np.float32)
 
 
+def refine_depth_to_rgb_edges(
+    depth: np.ndarray,
+    rgb_srgb: np.ndarray,
+    *,
+    sigma: float = 3.5,
+    eps_guide: float = 0.004,
+) -> np.ndarray:
+    """Snap soft relative depth transitions onto sharp RGB luminance edges via guided filtering."""
+    from scipy.ndimage import gaussian_filter
+
+    d = np.asarray(depth, dtype=np.float32)
+    valid = d > 0
+    if not np.any(valid):
+        return d
+    guide = (
+        0.299 * rgb_srgb[..., 0] + 0.587 * rgb_srgb[..., 1] + 0.114 * rgb_srgb[..., 2]
+    ).astype(np.float32)
+    mean_i = gaussian_filter(guide, sigma, mode='reflect')
+    mean_ii = gaussian_filter(guide * guide, sigma, mode='reflect')
+    var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+    mean_p = gaussian_filter(d, sigma, mode='reflect')
+    mean_ip = gaussian_filter(guide * d, sigma, mode='reflect')
+    cov_ip = mean_ip - mean_i * mean_p
+    a = cov_ip / (var_i + eps_guide)
+    b = mean_p - a * mean_i
+    refined = gaussian_filter(a, sigma, mode='reflect') * guide + gaussian_filter(b, sigma, mode='reflect')
+    d_min = float(np.min(d[valid]))
+    d_max = float(np.max(d[valid]))
+    refined = np.clip(refined, d_min, d_max)
+    return np.where(valid, refined, 0.0).astype(np.float32)
+
+
 def prepare_geometry(
     scene: SceneBuffers,
     camera: CameraModel,

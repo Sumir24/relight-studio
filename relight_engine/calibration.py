@@ -106,6 +106,10 @@ class MaterialAssignment:
     blend: float = 1.0
     # Optional linear-RGB conductor F0. None uses the renderer's neutral conductor prior.
     specular_color: tuple[float, float, float] | None = None
+    # Optional layered clear-coat and subsurface scattering parameters in [0,1].
+    clearcoat: float = 0.0
+    clearcoat_roughness: float = 0.15
+    subsurface: float = 0.0
     # Caller-declared confidence in this manual assignment, separate from mask blend.
     confidence: float = 1.0
 
@@ -118,7 +122,8 @@ class MaterialAssignment:
             raise ValueError("Material masks must be finite and in [0,1].")
         for key, value in (("roughness", self.roughness), ("metalness", self.metalness),
                            ("specular_level", self.specular_level), ("blend", self.blend),
-                           ("confidence", self.confidence)):
+                           ("clearcoat", self.clearcoat), ("clearcoat_roughness", self.clearcoat_roughness),
+                           ("subsurface", self.subsurface), ("confidence", self.confidence)):
             if not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{key} must be finite and in [0,1].")
         if self.specular_color is not None:
@@ -135,6 +140,9 @@ class MaterialMaps:
     coverage: np.ndarray
     confidence: np.ndarray
     specular_color: np.ndarray | None = None
+    clearcoat: np.ndarray | None = None
+    clearcoat_roughness: np.ndarray | None = None
+    subsurface: np.ndarray | None = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -146,6 +154,9 @@ def build_material_maps(
     base_metalness: float = 0.0,
     base_specular_level: float = 0.04,
     base_specular_color: tuple[float, float, float] = (0.65, 0.65, 0.65),
+    base_clearcoat: float = 0.0,
+    base_clearcoat_roughness: float = 0.15,
+    base_subsurface: float = 0.0,
 ) -> MaterialMaps:
     """Blend user-authored material overrides over explicit generic dielectric priors.
 
@@ -212,6 +223,9 @@ def build_material_maps(
         coverage=np.clip(weight_sum, 0, 1).astype(np.float32),
         confidence=np.clip(material_confidence, 0, 1).astype(np.float32),
         specular_color=specular_color,
+        clearcoat=compose("clearcoat", base_clearcoat) if any(a.clearcoat > 0.0 for a in assignments) else None,
+        clearcoat_roughness=compose("clearcoat_roughness", base_clearcoat_roughness) if any(a.clearcoat > 0.0 for a in assignments) else None,
+        subsurface=compose("subsurface", base_subsurface) if any(a.subsurface > 0.0 for a in assignments) else None,
         metadata={
             "origin": "user_authored_mask_overrides_plus_explicit_generic_base_priors",
             "base_values": {

@@ -11,22 +11,85 @@ from .contracts import (
     EngineSettings,
     RelightResult,
 )
-from .geometry import prepare_geometry
-from .lighting import evaluate_rig
+from .geometry import prepare_geometry, refine_depth_to_rgb_edges
+from .lighting import evaluate_rig, compute_indirect_bounce
 from .composite import compose_hybrid_neural, compose_intrinsic, compose_source_preserving, _depth_guided_smooth
 from .quality import evaluate_scene_buffers, describe_material_response
 from .color import luminance
 
 
+def _fit_sh_source_irradiance(
+    scene: SceneBuffers,
+    normals: np.ndarray,
+    source_d: np.ndarray,
+) -> np.ndarray:
+    """Fit an order-2 RGB Spherical Harmonics source light model from (normals, source_shading)."""
+    assert scene.source_shading is not None
+    sh = np.asarray(scene.source_shading, dtype=np.float32)
+    if sh.ndim == 2:
+        sh = np.repeat(sh[..., None], 3, axis=-1)
+    active = (scene.depth > 0) & (scene.lightable_mask > 0.05)
+    if scene.protected_mask is not None:
+        active = active & (scene.protected_mask < 0.95)
+    if not np.any(active):
+        active = scene.depth > 0
+
+    nx, ny, nz = normals[..., 0], normals[..., 1], normals[..., 2]
+    basis = np.stack([
+        np.ones_like(nx),
+        ny,
+        nz,
+        nx,
+        nx * ny,
+        ny * nz,
+        3.0 * nz * nz - 1.0,
+        nx * nz,
+        nx * nx - ny * ny,
+    ], axis=-1).astype(np.float64)
+
+    sh_y = luminance(sh)
+    # Exclude dark-albedo/low-shading pixels so dark clothing or hair doesn't pull SH toward zero.
+    med_all = max(float(np.median(sh_y[active])), 1e-4)
+    mask_fit = active & (sh_y > max(0.18, 0.35 * med_all))
+    if np.sum(mask_fit) < 16:
+        mask_fit = active
+    b_fit = basis[mask_fit]
+    y_fit = sh[mask_fit].astype(np.float64)
+    if b_fit.shape[0] > 20000:
+        step = max(1, b_fit.shape[0] // 20000)
+        b_fit = b_fit[::step]
+        y_fit = y_fit[::step]
+
+    # Stronger L2 regularization on order-1/2 harmonics prevents extrapolation dark-holes on minority normals.
+    reg_diag = np.array([0.02, 0.25, 0.25, 0.25, 0.8, 0.8, 0.8, 0.8, 0.8], dtype=np.float64)
+    gram = b_fit.T @ b_fit + np.diag(reg_diag * max(b_fit.shape[0] * 1e-3, 1.0))
+    rhs = b_fit.T @ y_fit
+    coeffs = np.linalg.solve(gram, rhs)
+    sh_pred = np.maximum(basis @ coeffs, 1e-4).astype(np.float32)
+
+    pred_y = np.maximum(luminance(sh_pred), 1e-4)
+    sd_y = np.maximum(luminance(source_d), 1e-4)
+    med_pred = max(float(np.median(pred_y[active])), 1e-4)
+    med_sd = max(float(np.median(sd_y[active])), 1e-4)
+    # Physical ambient floor (0.45x median) prevents blowing out eye sockets, brows, or under-chins.
+    scaled = sh_pred * (med_sd / med_pred)
+    return np.clip(scaled, 0.45 * med_sd, 3.0 * med_sd).astype(np.float32)
+
+
 def _effective_source_diffuse(
     scene: SceneBuffers,
+    normals: np.ndarray,
     source_d: np.ndarray,
     settings: EngineSettings,
 ) -> np.ndarray:
-    """Blend depth-smoothed neural source shading with analytic source_rig diffuse."""
+    """Combine analytic source_rig with optional order-2 SH fit and depth-smoothed source shading."""
+    base_src = source_d
+    if settings.auto_sh_source and scene.source_shading is not None:
+        base_src = _fit_sh_source_irradiance(scene, normals, source_d)
+
     blend = float(settings.source_shading_blend)
     if blend <= 0.0 or scene.source_shading is None:
-        return source_d
+        return base_src
     sh = np.asarray(scene.source_shading, dtype=np.float32)
     if sh.ndim == 2:
         sh = np.repeat(sh[..., None], 3, axis=-1)
@@ -38,14 +101,14 @@ def _effective_source_diffuse(
     if not np.any(active):
         active = scene.depth > 0
     sh_y = np.maximum(luminance(sh_smooth), 1e-4)
-    sd_y = np.maximum(luminance(source_d), 1e-4)
+    sd_y = np.maximum(luminance(base_src), 1e-4)
     med_sh = max(float(np.median(sh_y[active])), 1e-4)
     med_sd = max(float(np.median(sd_y[active])), 1e-4)
     rel_y = np.clip(sh_y / med_sh, 0.42, 2.4)
     chroma = np.clip(sh_smooth / sh_y[..., None], 0.45, 2.0)
     chroma = np.power(chroma, 0.70)
     sh_matched = (rel_y[..., None] * chroma) * med_sd
-    return ((1.0 - blend) * source_d + blend * sh_matched).astype(np.float32)
+    return ((1.0 - blend) * base_src + blend * sh_matched).astype(np.float32)
 
 
 def relight(
@@ -71,9 +134,14 @@ def relight(
     scene.validate()
     camera.validate()
 
-    points, normals, geometry_conf = prepare_geometry(scene, camera)
+    work_scene = scene
+    if settings.refine_depth_edges:
+        work_scene = copy(scene)
+        work_scene.depth = refine_depth_to_rgb_edges(scene.depth, scene.rgb_srgb)
+
+    points, normals, geometry_conf = prepare_geometry(work_scene, camera)
     if float(settings.normal_smooth_sigma) > 0.0:
-        smoothed = _depth_guided_smooth(normals, scene.depth, float(settings.normal_smooth_sigma))
+        smoothed = _depth_guided_smooth(normals, work_scene.depth, float(settings.normal_smooth_sigma))
         lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
         valid_n = lens[..., 0] > 1e-6
         normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
@@ -103,15 +171,19 @@ def relight(
         raise ValueError("renderer_mode='hybrid_neural' requires a NeuralRelighter instance.")
 
     target_d, target_s, visibility = evaluate_rig(
-        scene, camera, points, normals, target_rig, settings
+        work_scene, camera, points, normals, target_rig, settings
     )
+    if float(settings.indirect_bounce_strength) > 0.0:
+        target_d = target_d + compute_indirect_bounce(
+            work_scene, points, normals, target_d, settings
+        )
     source_d: np.ndarray | None = None
     source_s: np.ndarray | None = None
     if settings.preserve_source_lighting or effective_mode == "ratio":
         source_d, source_s, _ = evaluate_rig(
-            scene, camera, points, normals, source_rig, settings
+            work_scene, camera, points, normals, source_rig, settings
         )
-        source_d = _effective_source_diffuse(scene, source_d, settings)
+        source_d = _effective_source_diffuse(work_scene, normals, source_d, settings)
     if settings.preserve_source_lighting:
         assert source_d is not None and source_s is not None
         target_d = source_d + target_d
@@ -120,29 +192,29 @@ def relight(
     neural_metadata = None
     if effective_mode == "intrinsic":
         out, ratio = compose_intrinsic(
-            scene, target_d, target_s, geometry_conf, settings
+            work_scene, target_d, target_s, geometry_conf, settings
         )
         mode_label = "2.5D intrinsic de-lighting and re-rendering"
     elif effective_mode == "hybrid_neural":
         neural_pred = neural_relighter.render(
-            scene, target_d, target_s, target_rig, settings
+            work_scene, target_d, target_s, target_rig, settings
         )
         neural_rgb = np.asarray(neural_pred.rgb_srgb, dtype=np.float32)
-        if neural_rgb.shape != scene.rgb_srgb.shape:
+        if neural_rgb.shape != work_scene.rgb_srgb.shape:
             raise ValueError(
-                f"NeuralRelighter returned shape {neural_rgb.shape}; expected {scene.rgb_srgb.shape}."
+                f"NeuralRelighter returned shape {neural_rgb.shape}; expected {work_scene.rgb_srgb.shape}."
             )
         if not np.isfinite(neural_rgb).all() or np.any(neural_rgb < 0.0) or np.any(neural_rgb > 1.0):
             raise ValueError("NeuralRelighter returned non-finite or out-of-[0,1] pixel values.")
-        out = compose_hybrid_neural(scene, neural_rgb, geometry_conf, settings)
+        out = compose_hybrid_neural(work_scene, neural_rgb, geometry_conf, settings)
         t_y = np.maximum(luminance(target_d), 1e-4)
-        if scene.source_shading is not None and not settings.preserve_source_lighting:
-            sh = scene.source_shading[..., None] if scene.source_shading.ndim == 2 else scene.source_shading
-            s_y = np.maximum(luminance(np.broadcast_to(sh, (*scene.shape, 3))), 1e-4)
+        if work_scene.source_shading is not None and not settings.preserve_source_lighting:
+            sh = work_scene.source_shading[..., None] if work_scene.source_shading.ndim == 2 else work_scene.source_shading
+            s_y = np.maximum(luminance(np.broadcast_to(sh, (*work_scene.shape, 3))), 1e-4)
         else:
             if source_d is None:
                 source_d, _, _ = evaluate_rig(
-                    scene, camera, points, normals, source_rig, settings
+                    work_scene, camera, points, normals, source_rig, settings
                 )
             s_y = np.maximum(luminance(source_d), 1e-4)
         ratio = np.clip(t_y / s_y, settings.ratio_min, settings.ratio_max).astype(np.float32)
@@ -151,7 +223,7 @@ def relight(
     else:
         assert source_d is not None and source_s is not None
         out, ratio = compose_source_preserving(
-            scene,
+            work_scene,
             source_d,
             target_d,
             source_s,

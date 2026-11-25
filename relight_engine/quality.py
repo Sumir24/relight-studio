@@ -75,6 +75,21 @@ def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
             "prior": [0.65, 0.65, 0.65],
             "shape": "HxWx3_linear_RGB_conductor_F0",
         },
+        "clearcoat": {
+            "array": scene.clearcoat,
+            "prior": 0.0,
+            "shape": "HxW",
+        },
+        "clearcoat_roughness": {
+            "array": scene.clearcoat_roughness,
+            "prior": 0.15,
+            "shape": "HxW",
+        },
+        "subsurface": {
+            "array": scene.subsurface,
+            "prior": 0.0,
+            "shape": "HxW",
+        },
     }
 
     maps: dict[str, dict[str, Any]] = {}
@@ -127,8 +142,6 @@ def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
         confidence_calibrated = False
 
     unimplemented = [
-        "layered_clear_coat",
-        "subsurface_scattering",
         "transmission_and_refraction",
         "emissive_radiance_separation",
         "environment_dependent_reflection",
@@ -152,6 +165,8 @@ def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
             "lambertian_diffuse_baseline",
             "ggx_rough_dielectric",
             "ggx_conductor_with_RGB_F0",
+            "layered_clear_coat",
+            "subsurface_scattering",
         ],
         "not_implemented_response_families": unimplemented,
         "material_estimation_claimed": bool(

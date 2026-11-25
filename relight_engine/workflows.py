@@ -63,7 +63,7 @@ def target_rig_from_dict(data: dict) -> LightingRig:
             raise ValueError(f"target_rig.lights[{index}] must be an object.")
         allowed = {
             "name", "kind", "strength", "color", "color_temperature_kelvin", "direction",
-            "position", "area_size", "samples", "casts_shadows", "wrap",
+            "position", "area_size", "samples", "casts_shadows", "wrap", "radius",
         }
         unknown = set(item) - allowed
         if unknown:
@@ -83,6 +83,7 @@ def target_rig_from_dict(data: dict) -> LightingRig:
             samples=int(item.get("samples", 4)),
             casts_shadows=bool(item.get("casts_shadows", True)),
             wrap=float(item.get("wrap", 0.0)),
+            radius=float(item.get("radius", 0.0)),
         ))
     rig = LightingRig(
         ambient_color=ambient_color,
@@ -198,7 +199,8 @@ def apply_user_material_assignments(
             raise ValueError(f"material_assignments[{index}] must be an object.")
         allowed = {
             "name", "mask_key", "roughness", "metalness", "specular_level",
-            "specular_color", "blend", "confidence",
+            "specular_color", "clearcoat", "clearcoat_roughness", "subsurface",
+            "blend", "confidence",
         }
         unknown = set(item) - allowed
         if unknown:
@@ -212,6 +214,9 @@ def apply_user_material_assignments(
             specular_level=float(item.get("specular_level", 0.04)),
             blend=float(item.get("blend", 1.0)),
             specular_color=None if color is None else tuple(float(v) for v in color),
+            clearcoat=float(item.get("clearcoat", 0.0)),
+            clearcoat_roughness=float(item.get("clearcoat_roughness", 0.15)),
+            subsurface=float(item.get("subsurface", 0.0)),
             confidence=float(item.get("confidence", 1.0)),
         ))
     maps = build_material_maps(scene.shape, assignments)
@@ -222,6 +227,12 @@ def apply_user_material_assignments(
         scene.material_confidence = maps.confidence
         if maps.specular_color is not None:
             scene.specular_color = maps.specular_color
+        if maps.clearcoat is not None:
+            scene.clearcoat = maps.clearcoat
+        if maps.clearcoat_roughness is not None:
+            scene.clearcoat_roughness = maps.clearcoat_roughness
+        if maps.subsurface is not None:
+            scene.subsurface = maps.subsurface
         scalar_map_metadata = {
             "source": "user_assignment_plus_renderer_prior",
             "calibrated": False,

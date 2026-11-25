@@ -18,10 +18,14 @@ def test_target_rig_builder_supports_temperature_and_directional_light():
         "ambient_strength": 0.1,
         "ambient_temperature_kelvin": 6500,
         "ambient_ground_temperature_kelvin": 3200,
-        "lights": [{"kind": "directional", "direction": [1, 1, -1], "color_temperature_kelvin": 5000, "wrap": 0.35}],
+        "lights": [{
+            "kind": "directional", "direction": [1, 1, -1],
+            "color_temperature_kelvin": 5000, "wrap": 0.35, "radius": 0.12,
+        }],
     })
     assert len(rig.lights) == 1
     assert rig.lights[0].wrap == pytest.approx(0.35)
+    assert rig.lights[0].radius == pytest.approx(0.12)
     assert rig.ambient_ground_color is not None
     rig.validate()
 

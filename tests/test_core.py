@@ -900,3 +900,128 @@ def test_normal_smooth_sigma_suppresses_texture_crease_across_flat_depth():
     # Glitch smoothed away on flat left plane while tilted right plane normal remains distinct
     assert abs(float(res.normal_map[12, 7, 0])) < 0.25
     assert float(res.normal_map[12, w // 2 + 4, 0]) < -0.50
+
+
+def test_indirect_bounce_bleeds_color_onto_facing_neighbor():
+    h, w = 32, 48
+    rgb = np.full((h, w, 3), 0.45, dtype=np.float32)
+    # Left half is vivid red emitter surface, right half is neutral grey wall tilted toward left
+    rgb[:, : w // 2] = np.array([0.88, 0.08, 0.08], dtype=np.float32)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[:, : w // 2] = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    normals[:, w // 2 :] = np.array([-0.75, 0.0, -0.66], dtype=np.float32)
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+    scene = SceneBuffers(
+        rgb_srgb=rgb, depth=depth, depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32), depth_kind="relative",
+        normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src = LightingRig(ambient_strength=0.4, lights=())
+    tgt = LightingRig(ambient_strength=0.1, lights=(
+        Light("key", "directional", direction=(0.6, 0.0, -0.8), strength=1.5, casts_shadows=False),
+    ))
+    no_gi = relight(scene, camera, src, tgt, EngineSettings(indirect_bounce_strength=0.0))
+    with_gi = relight(scene, camera, src, tgt, EngineSettings(indirect_bounce_strength=0.65, indirect_bounce_radius=12.0))
+    # Right side near the boundary catches red indirect color bleed from the red left half
+    diff_near = with_gi.rgb_srgb[16, w // 2 + 4] - no_gi.rgb_srgb[16, w // 2 + 4]
+    assert float(diff_near[0]) > float(diff_near[2]) + 0.02
+
+
+def test_clearcoat_and_subsurface_respond_to_multi_light():
+    h, w = 16, 16
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[:, :8] = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    normals[:, 8:] = np.array([0.92, 0.0, -0.39], dtype=np.float32)  # grazing ~90-deg terminator to left light
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+    scene_base = SceneBuffers(
+        rgb_srgb=np.full((h, w, 3), 0.45, np.float32), depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.ones((h, w), np.float32), lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative", normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+        roughness=np.full((h, w), 0.85, np.float32),
+    )
+    scene_layered = SceneBuffers(
+        rgb_srgb=scene_base.rgb_srgb, depth=scene_base.depth,
+        depth_confidence=scene_base.depth_confidence, lightable_mask=scene_base.lightable_mask,
+        depth_kind="relative", normals=normals, geometry_confidence=scene_base.geometry_confidence,
+        roughness=scene_base.roughness,
+        clearcoat=np.full((h, w), 0.9, np.float32),
+        clearcoat_roughness=np.full((h, w), 0.08, np.float32),
+        subsurface=np.full((h, w), 0.8, np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    pts = backproject_depth(scene_base.depth, camera)
+    rig = LightingRig(ambient_strength=0.05, lights=(
+        Light("front_spec", "directional", direction=(0.0, 0.0, -1.0), strength=1.2, casts_shadows=False),
+        Light("front_left", "directional", direction=(-0.4, 0.0, -0.9), strength=1.2, casts_shadows=False),
+    ))
+    d_base, s_base, _ = evaluate_rig(scene_base, camera, pts, normals, rig, EngineSettings())
+    d_lay, s_lay, _ = evaluate_rig(scene_layered, camera, pts, normals, rig, EngineSettings())
+    # Clear coat adds crisp highlight specular over rough base
+    assert float(np.max(s_lay[:, :8])) > float(np.max(s_base[:, :8])) + 0.50
+    # Subsurface adds warm red scatter along grazing terminator without washing out front-lit skin
+    assert float(d_lay[8, 12, 0] - d_base[8, 12, 0]) > float(d_lay[8, 12, 2] - d_base[8, 12, 2]) + 0.02
+    assert np.allclose(d_lay[8, 2], d_base[8, 2], atol=0.02)
+
+
+def test_auto_sh_source_and_filmic_rolloff_and_edge_depth_refine():
+    from relight_engine.color import linear_to_srgb
+
+    h, w = 24, 32
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    # Two-light baked source shading (warm left + cool top) baked across curved cylinder normals
+    angle = (xx / (w - 1) - 0.5) * 2.2
+    normals = np.stack([np.sin(angle), np.zeros_like(angle), -np.cos(angle)], axis=-1).astype(np.float32)
+    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+    # Approximate true multi-light shading on the cylinder
+    l1 = np.clip(np.sum(normals * np.array([-0.8, 0.0, -0.6]), axis=-1), 0, 1)[..., None] * np.array([1.2, 0.8, 0.4])
+    l2 = np.clip(np.sum(normals * np.array([0.8, 0.2, -0.57]), axis=-1), 0, 1)[..., None] * np.array([0.4, 0.7, 1.3])
+    true_sh = (0.25 + l1 + l2).astype(np.float32)
+
+    # Sharp foreground edge with blurry relative depth transition
+    rgb_lin = np.clip(0.35 * true_sh, 0.0, 1.0)
+    rgb_lin[:, : w // 2] *= 1.4
+    depth = np.clip(2.0 + 2.0 * (1.0 / (1.0 + np.exp(-(xx - w // 2) * 0.5))), 1.0, 5.0).astype(np.float32)
+    scene = SceneBuffers(
+        rgb_srgb=linear_to_srgb(rgb_lin), depth=depth, depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32), depth_kind="relative",
+        normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+        source_shading=true_sh,
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src = LightingRig(ambient_strength=0.3, lights=(Light("guess", "directional", direction=(0, 0, -1), casts_shadows=False),))
+    # Bright overlapping dual-light rig to exercise filmic highlight rolloff
+    tgt = LightingRig(ambient_strength=0.2, lights=(
+        Light("warm", "directional", direction=(-0.6, 0.3, -0.7), color=(1.0, 0.7, 0.3), strength=1.8, radius=0.15, casts_shadows=False),
+        Light("blue", "directional", direction=(0.6, 0.3, -0.7), color=(0.3, 0.6, 1.0), strength=1.8, radius=0.15, casts_shadows=False),
+    ))
+    res = relight(
+        scene, camera, src, tgt,
+        EngineSettings(
+            detail_power=1.0,
+            auto_sh_source=True,
+            filmic_highlight_rolloff=True,
+            refine_depth_edges=True,
+        ),
+    )
+    assert np.isfinite(res.rgb_srgb).all()
+    assert float(np.max(res.rgb_srgb)) <= 1.0
+    assert float(np.mean(np.abs(res.rgb_srgb - scene.rgb_srgb))) > 0.02
+
+
+def test_pcss_light_radius_softens_far_shadow_more_than_contact_shadow():
+    h, w = 48, 64
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    depth = np.full((h, w), 4.5, dtype=np.float32)
+    depth[18:30, 18:22] = 1.5
+    points = backproject_depth(depth, camera)
+    normals = np.zeros_like(points)
+    normals[..., 2] = -1.0
+    to_light = np.zeros_like(points)
+    to_light[:] = np.array([-1.0, 0.0, -0.45], dtype=np.float32)
+    max_dist = np.full((h, w), 6.0, np.float32)
+    vis_hard = ray_visibility(points, normals, depth, camera, to_light, max_dist, "relative", EngineSettings(shadow_steps=20), light_radius=0.0)
+    vis_soft = ray_visibility(points, normals, depth, camera, to_light, max_dist, "relative", EngineSettings(shadow_steps=20), light_radius=0.35)
+    # Soft radius light introduces smooth gradient differences across penumbra boundary
+    assert float(np.max(np.abs(vis_soft - vis_hard))) > 0.05

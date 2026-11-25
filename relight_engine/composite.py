@@ -66,9 +66,26 @@ def _active_blend_mask(
     return np.clip(mask, 0, 1).astype(np.float32)
 
 
-def _apply_highlight_shoulder(relit: np.ndarray, src: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+def _apply_highlight_shoulder(
+    relit: np.ndarray,
+    src: np.ndarray,
+    eps: float = 1e-4,
+    *,
+    filmic: bool = False,
+) -> np.ndarray:
     peak = np.max(relit, axis=-1)
     source_peak = np.max(src, axis=-1)
+    if filmic:
+        threshold, width = 0.85, 0.15
+        over = np.maximum(peak - threshold, 0.0)
+        compressed = threshold + width * np.tanh(over / width)
+        newly_hot = (peak > threshold) & (peak > source_peak + 1e-6)
+        scale = np.where(newly_hot, compressed / np.maximum(peak, eps), 1.0)
+        scaled = relit * scale[..., None]
+        # Perceptual highlight desaturation toward neutral luminance when overlapping lights saturate.
+        luma = np.maximum(luminance(scaled), eps)[..., None]
+        desat = np.where(newly_hot, np.clip(over * 0.55, 0.0, 0.65), 0.0)[..., None]
+        return (scaled * (1.0 - desat) + luma * desat).astype(np.float32)
     threshold, width = 0.94, 0.08
     compressed = threshold + width * (1 - np.exp(-np.maximum(peak - threshold, 0) / width))
     newly_hot = (peak > threshold) & (peak > source_peak + 1e-6)
@@ -166,7 +183,7 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]
-    relit = _apply_highlight_shoulder(relit, src, eps)
+    relit = _apply_highlight_shoulder(relit, src, eps, filmic=bool(settings.filmic_highlight_rolloff))
     out = linear_to_srgb(relit)
     return out.astype(np.float32), ratio.astype(np.float32)
 
@@ -213,7 +230,7 @@ def compose_intrinsic(
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]
-    relit = _apply_highlight_shoulder(relit, src, eps)
+    relit = _apply_highlight_shoulder(relit, src, eps, filmic=bool(settings.filmic_highlight_rolloff))
 
     t_y = np.maximum(luminance(target_diffuse), eps)
     if scene.source_shading is not None:
@@ -252,5 +269,5 @@ def compose_hybrid_neural(
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]
-    relit = _apply_highlight_shoulder(relit, src, eps)
+    relit = _apply_highlight_shoulder(relit, src, eps, filmic=bool(settings.filmic_highlight_rolloff))
     return linear_to_srgb(relit).astype(np.float32)

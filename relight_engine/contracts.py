@@ -45,6 +45,9 @@ class SceneBuffers:
     roughness: Optional[np.ndarray] = None
     metalness: Optional[np.ndarray] = None
     specular_level: Optional[np.ndarray] = None
+    clearcoat: Optional[np.ndarray] = None
+    clearcoat_roughness: Optional[np.ndarray] = None
+    subsurface: Optional[np.ndarray] = None
     normals: Optional[np.ndarray] = None
     geometry_confidence: Optional[np.ndarray] = None
     alpha_mask: Optional[np.ndarray] = None  # optional original transparency, preserved at output
@@ -90,7 +93,9 @@ class SceneBuffers:
             raise ValueError('Depth must be non-negative; zero denotes invalid depth.')
         for name, arr in [('depth_confidence', self.depth_confidence), ('lightable_mask', self.lightable_mask),
                           ('roughness', self.roughness), ('metalness', self.metalness),
-                          ('specular_level', self.specular_level), ('geometry_confidence', self.geometry_confidence),
+                          ('specular_level', self.specular_level), ('clearcoat', self.clearcoat),
+                          ('clearcoat_roughness', self.clearcoat_roughness), ('subsurface', self.subsurface),
+                          ('geometry_confidence', self.geometry_confidence),
                           ('alpha_mask', self.alpha_mask), ('protected_mask', self.protected_mask),
                           ('material_confidence', self.material_confidence)]:
             if arr is not None:
@@ -160,6 +165,7 @@ class Light:
     samples: int = 4
     casts_shadows: bool = True
     wrap: float = 0.0                                       # wrapped Lambertian scatter [0, 1]
+    radius: float = 0.0                                     # finite source radius for soft penumbras >= 0
 
     def validate(self) -> None:
         if not self.name.strip():
@@ -172,6 +178,9 @@ class Light:
         _finite_scalar('Light wrap', self.wrap)
         if not 0.0 <= self.wrap <= 1.0:
             raise ValueError('Light wrap must be in [0,1].')
+        _finite_scalar('Light radius', self.radius)
+        if self.radius < 0.0:
+            raise ValueError('Light radius must be non-negative.')
         color = np.asarray(self.color, dtype=np.float64)
         if color.shape != (3,) or not np.isfinite(color).all() or np.any(color < 0):
             raise ValueError('Light color must be a finite non-negative linear RGB triple.')
@@ -238,6 +247,11 @@ class EngineSettings:
     lighting_smooth_sigma: float = 1.2
     normal_smooth_sigma: float = 0.0
     source_shading_blend: float = 0.0
+    auto_sh_source: bool = False
+    indirect_bounce_strength: float = 0.0
+    indirect_bounce_radius: float = 24.0
+    filmic_highlight_rolloff: bool = False
+    refine_depth_edges: bool = False
     atmosphere_density: float = 0.0
     atmosphere_color: Optional[Tuple[float, float, float]] = None
 
@@ -258,6 +272,8 @@ class EngineSettings:
             'lighting_smooth_sigma': self.lighting_smooth_sigma,
             'normal_smooth_sigma': self.normal_smooth_sigma,
             'source_shading_blend': self.source_shading_blend,
+            'indirect_bounce_strength': self.indirect_bounce_strength,
+            'indirect_bounce_radius': self.indirect_bounce_radius,
             'atmosphere_density': self.atmosphere_density,
         }
         for name, value in numeric.items():
@@ -292,6 +308,16 @@ class EngineSettings:
             raise ValueError('normal_smooth_sigma must be non-negative.')
         if not 0.0 <= self.source_shading_blend <= 1.0:
             raise ValueError('source_shading_blend must be in [0,1].')
+        if not isinstance(self.auto_sh_source, bool):
+            raise ValueError('auto_sh_source must be a boolean.')
+        if self.indirect_bounce_strength < 0.0:
+            raise ValueError('indirect_bounce_strength must be non-negative.')
+        if self.indirect_bounce_radius <= 0.0:
+            raise ValueError('indirect_bounce_radius must be positive.')
+        if not isinstance(self.filmic_highlight_rolloff, bool):
+            raise ValueError('filmic_highlight_rolloff must be a boolean.')
+        if not isinstance(self.refine_depth_edges, bool):
+            raise ValueError('refine_depth_edges must be a boolean.')
         if self.atmosphere_density < 0.0:
             raise ValueError('atmosphere_density must be non-negative.')
         if self.atmosphere_color is not None:

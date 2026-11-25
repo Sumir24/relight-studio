@@ -128,5 +128,18 @@ def test_engine_settings_validates_renderer_mode_and_detail_lock_strength():
         EngineSettings(atmosphere_density=-0.1).validate()
     with pytest.raises(ValueError, match="wrap"):
         Light("w", "directional", direction=(0, 0, -1), wrap=1.5).validate()
+    with pytest.raises(ValueError, match="radius"):
+        Light("r", "point", position=(0, 0, 1), radius=-0.2).validate()
     with pytest.raises(ValueError, match="ground"):
         LightingRig(ambient_ground_color=(-0.1, 0.2, 0.2)).validate()
+    with pytest.raises(ValueError, match="indirect_bounce_strength"):
+        EngineSettings(indirect_bounce_strength=-0.1).validate()
+    with pytest.raises(ValueError, match="indirect_bounce_radius"):
+        EngineSettings(indirect_bounce_radius=0.0).validate()
+    EngineSettings(
+        auto_sh_source=True,
+        indirect_bounce_strength=0.35,
+        indirect_bounce_radius=18.0,
+        filmic_highlight_rolloff=True,
+        refine_depth_edges=True,
+    ).validate()
