@@ -7,6 +7,7 @@ from .camera import CameraCalibration, camera_from_horizontal_fov
 from .diffusers_normals import DiffusersNormalAdapter
 from .diffusers_intrinsics import DiffusersIntrinsicAdapter
 from .ic_light_relighter import ICLightRelighter
+from .flux_iclight_relighter import FluxICLightRelighter
 from .protocols import (
     DepthEstimator,
     IntrinsicEstimator,
@@ -34,7 +35,7 @@ __all__ = [
     'SemanticRoutingPolicy', 'compose_scene_masks', 'semantic_key',
     'Florence2SceneDiscovery', 'SceneDiscoveryResult',
     'CameraCalibration', 'camera_from_horizontal_fov',
-    'DiffusersNormalAdapter', 'DiffusersIntrinsicAdapter', 'ICLightRelighter',
+    'DiffusersNormalAdapter', 'DiffusersIntrinsicAdapter', 'ICLightRelighter', 'FluxICLightRelighter',
     'DepthEstimator', 'NormalEstimator', 'NormalPrediction',
     'IntrinsicEstimator', 'IntrinsicPrediction',
     'NeuralRelighter', 'NeuralRelightPrediction',

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from copy import copy
+from dataclasses import replace
+import hashlib
+import threading
 
 import numpy as np
 
@@ -13,9 +17,124 @@ from .contracts import (
 )
 from .geometry import prepare_geometry, refine_depth_to_rgb_edges
 from .lighting import evaluate_rig, compute_indirect_bounce
-from .composite import compose_hybrid_neural, compose_intrinsic, compose_source_preserving, _depth_guided_smooth
+from .composite import (
+    compose_hybrid_neural,
+    compose_intrinsic,
+    compose_source_preserving,
+    _compose_intrinsic_output,
+    _depth_guided_smooth,
+    _get_or_compute_intrinsic_priors,
+    _get_or_compute_intrinsic_residual,
+)
+from .preview import downsample_scene_buffers_for_preview, depth_guided_upsample_batch
 from .quality import evaluate_scene_buffers, describe_material_response
 from .color import luminance
+
+
+def _pipeline_observability(
+    scene: SceneBuffers,
+    requested_mode: str,
+    effective_mode: str,
+    target_rig: LightingRig,
+) -> dict:
+    """Explicit observability of effective mode, fallback reason, and active shading paths."""
+    if requested_mode == "auto" and effective_mode == "ratio":
+        fallback_reason = "intrinsic_albedo_unavailable_using_ratio_fallback"
+    elif requested_mode not in ("auto", effective_mode):
+        fallback_reason = f"switched_from_{requested_mode}_to_{effective_mode}"
+    else:
+        fallback_reason = None
+
+    has_authored_mat = any(
+        getattr(scene, k) is not None
+        for k in ("roughness", "metalness", "specular_level", "specular_color", "clearcoat", "subsurface", "anisotropy")
+    )
+    has_model_mat = bool(scene.metadata.get("material_maps_estimated", False))
+    env = target_rig.environment
+    env_active = bool(
+        env is not None
+        and (
+            float(env.strength) > 0.0
+            or float(env.key_strength) > 0.0
+            or (env.env_map is not None and float(env.env_map_strength) > 0.0)
+        )
+    )
+    if has_model_mat and has_authored_mat:
+        spec_path = "model_material_ggx"
+    elif has_authored_mat:
+        spec_path = "authored_material_ggx"
+    else:
+        spec_path = "conservative_prior_dielectric_ggx"
+    if env_active:
+        spec_path = f"{spec_path}+environment_ibl"
+
+    return {
+        "requested_renderer_mode": requested_mode,
+        "fallback_reason": fallback_reason,
+        "scene_buffers_available": {
+            "albedo": scene.albedo is not None,
+            "source_shading": scene.source_shading is not None,
+            "non_diffuse_residual": scene.non_diffuse_residual is not None,
+            "normals_supplied": scene.normals is not None,
+            "material_maps_supplied": has_authored_mat,
+        },
+        "active_specular_path": spec_path,
+        "residual_decomposition_active": bool(
+            effective_mode == "intrinsic" and scene.non_diffuse_residual is not None
+        ),
+        "environment_lighting_active": env_active,
+    }
+
+_PREVIEW_SCENE_CACHE: OrderedDict[tuple, tuple[SceneBuffers, CameraModel]] = OrderedDict()
+_PREVIEW_CACHE_LOCK = threading.Lock()
+_PREVIEW_CACHE_MAX = 4
+
+
+def _buf_digest(arr: np.ndarray | None) -> tuple | None:
+    if arr is None:
+        return None
+    buf = np.ascontiguousarray(arr)
+    return (buf.shape, str(buf.dtype), hashlib.blake2b(memoryview(buf), digest_size=16).digest())
+
+
+def _get_or_create_preview_scene(
+    scene: SceneBuffers,
+    camera: CameraModel,
+    max_side: int,
+) -> tuple[SceneBuffers, CameraModel]:
+    key = (
+        _buf_digest(scene.rgb_srgb),
+        _buf_digest(scene.depth),
+        _buf_digest(scene.normals),
+        _buf_digest(scene.albedo),
+        _buf_digest(scene.source_shading),
+        _buf_digest(scene.lightable_mask),
+        _buf_digest(scene.protected_mask),
+        _buf_digest(scene.alpha_mask),
+        _buf_digest(scene.roughness),
+        _buf_digest(scene.metalness),
+        _buf_digest(scene.specular_level),
+        _buf_digest(scene.specular_color),
+        _buf_digest(scene.anisotropy),
+        _buf_digest(scene.material_confidence),
+        int(max_side),
+        float(camera.fx),
+        float(camera.fy),
+        float(camera.cx),
+        float(camera.cy),
+    )
+    with _PREVIEW_CACHE_LOCK:
+        cached = _PREVIEW_SCENE_CACHE.get(key)
+        if cached is not None:
+            _PREVIEW_SCENE_CACHE.move_to_end(key)
+            return cached
+    prev_scene, prev_cam = downsample_scene_buffers_for_preview(scene, camera, int(max_side))
+    with _PREVIEW_CACHE_LOCK:
+        _PREVIEW_SCENE_CACHE[key] = (prev_scene, prev_cam)
+        _PREVIEW_SCENE_CACHE.move_to_end(key)
+        while len(_PREVIEW_SCENE_CACHE) > _PREVIEW_CACHE_MAX:
+            _PREVIEW_SCENE_CACHE.popitem(last=False)
+    return prev_scene, prev_cam
 
 
 def _fit_sh_source_irradiance(
@@ -134,20 +253,47 @@ def relight(
     scene.validate()
     camera.validate()
 
+    if settings.quality_mode == "preview":
+        eff_settings = replace(
+            settings,
+            shadow_steps=min(settings.shadow_steps, 12),
+            shadow_adaptive_sampling=False,
+            shadow_smooth_passes=1,
+        )
+        preview_side = settings.preview_max_side if settings.preview_max_side is not None else 384
+    elif settings.quality_mode == "final":
+        eff_settings = replace(
+            settings,
+            shadow_steps=max(settings.shadow_steps, 48),
+            shadow_adaptive_sampling=True,
+            shadow_smooth_passes=max(settings.shadow_smooth_passes, 2),
+        )
+        preview_side = settings.preview_max_side
+    else:
+        eff_settings = settings
+        preview_side = settings.preview_max_side
+
     work_scene = scene
-    if settings.refine_depth_edges:
+    if eff_settings.refine_depth_edges:
         work_scene = copy(scene)
         work_scene.depth = refine_depth_to_rgb_edges(scene.depth, scene.rgb_srgb)
 
-    points, normals, geometry_conf = prepare_geometry(work_scene, camera)
-    if float(settings.normal_smooth_sigma) > 0.0:
-        smoothed = _depth_guided_smooth(normals, work_scene.depth, float(settings.normal_smooth_sigma))
-        lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
-        valid_n = lens[..., 0] > 1e-6
-        normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
+    use_preview_downscale = preview_side is not None and max(work_scene.shape) > int(preview_side)
+
+    if use_preview_downscale and not require_geometry_ready:
+        # Defer full-resolution geometry prep when rendering a downscaled non-upsampled preview directly.
+        points, normals, geometry_conf = (None, None, None)
+    else:
+        points, normals, geometry_conf = prepare_geometry(work_scene, camera)
+        if float(eff_settings.normal_smooth_sigma) > 0.0:
+            smoothed = _depth_guided_smooth(normals, work_scene.depth, float(eff_settings.normal_smooth_sigma))
+            lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
+            valid_n = lens[..., 0] > 1e-6
+            normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
 
     gate_report = None
     if require_geometry_ready:
+        assert normals is not None and geometry_conf is not None
         # QA the exact geometry prepared for this render, including normals estimated
         # on demand when they were not persisted in SceneBuffers.
         quality_scene = copy(scene)
@@ -162,97 +308,194 @@ def relight(
                 + reasons
             )
 
-    requested_mode = settings.renderer_mode
-    effective_mode = "ratio" if requested_mode == "auto" else requested_mode
+    requested_mode = eff_settings.renderer_mode
+    if requested_mode == "auto":
+        effective_mode = "intrinsic" if scene.albedo is not None else "ratio"
+    else:
+        effective_mode = requested_mode
 
     if effective_mode == "intrinsic" and scene.albedo is None:
         raise ValueError("renderer_mode='intrinsic' requires scene.albedo to be populated.")
     if effective_mode == "hybrid_neural" and neural_relighter is None:
         raise ValueError("renderer_mode='hybrid_neural' requires a NeuralRelighter instance.")
 
+    if use_preview_downscale:
+        assert preview_side is not None
+        eval_scene, eval_cam = _get_or_create_preview_scene(work_scene, camera, int(preview_side))
+        eval_points, eval_normals, eval_geom_conf = prepare_geometry(eval_scene, eval_cam)
+        if float(eff_settings.normal_smooth_sigma) > 0.0:
+            smoothed_ev = _depth_guided_smooth(eval_normals, eval_scene.depth, float(eff_settings.normal_smooth_sigma))
+            lens_ev = np.linalg.norm(smoothed_ev, axis=-1, keepdims=True)
+            valid_ev = lens_ev[..., 0] > 1e-6
+            eval_normals = np.where(valid_ev[..., None], smoothed_ev / np.maximum(lens_ev, 1e-6), eval_normals).astype(np.float32)
+    else:
+        eval_scene, eval_cam = work_scene, camera
+        if points is None or normals is None or geometry_conf is None:
+            points, normals, geometry_conf = prepare_geometry(work_scene, camera)
+        eval_points, eval_normals, eval_geom_conf = points, normals, geometry_conf
+
     target_d, target_s, visibility = evaluate_rig(
-        work_scene, camera, points, normals, target_rig, settings
+        eval_scene, eval_cam, eval_points, eval_normals, target_rig, eff_settings
     )
-    if float(settings.indirect_bounce_strength) > 0.0:
+    if float(eff_settings.indirect_bounce_strength) > 0.0:
         target_d = target_d + compute_indirect_bounce(
-            work_scene, points, normals, target_d, settings
+            eval_scene, eval_points, eval_normals, target_d, eff_settings
         )
     source_d: np.ndarray | None = None
     source_s: np.ndarray | None = None
-    if settings.preserve_source_lighting or effective_mode == "ratio":
+    need_source_eval = (
+        eff_settings.preserve_source_lighting
+        or effective_mode == "ratio"
+        or float(eff_settings.background_light_influence) < 1.0 - 1e-6
+        or float(eff_settings.real_image_preservation) > 0.0
+        or float(eff_settings.highlight_relocation_strength) > 0.0
+    )
+    if need_source_eval:
         source_d, source_s, _ = evaluate_rig(
-            work_scene, camera, points, normals, source_rig, settings
+            eval_scene, eval_cam, eval_points, eval_normals, source_rig, eff_settings
         )
-        source_d = _effective_source_diffuse(work_scene, normals, source_d, settings)
-    if settings.preserve_source_lighting:
+        source_d = _effective_source_diffuse(eval_scene, eval_normals, source_d, eff_settings)
+    if eff_settings.preserve_source_lighting:
         assert source_d is not None and source_s is not None
         target_d = source_d + target_d
         target_s = source_s + target_s
 
+    if use_preview_downscale and eff_settings.preview_upsample:
+        if points is None or normals is None or geometry_conf is None:
+            points, normals, geometry_conf = prepare_geometry(work_scene, camera)
+            if float(eff_settings.normal_smooth_sigma) > 0.0:
+                smoothed = _depth_guided_smooth(normals, work_scene.depth, float(eff_settings.normal_smooth_sigma))
+                lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
+                valid_n = lens[..., 0] > 1e-6
+                normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
+        to_up = [target_d, target_s, visibility]
+        if source_d is not None:
+            to_up.append(source_d)
+        if source_s is not None:
+            to_up.append(source_s)
+        up = depth_guided_upsample_batch(to_up, work_scene.depth, eval_scene.depth)
+        target_d, target_s, visibility = up[0], up[1], up[2]
+        idx = 3
+        if source_d is not None:
+            source_d = up[idx]
+            idx += 1
+        if source_s is not None:
+            source_s = up[idx]
+        comp_scene = work_scene
+        comp_normals = normals
+        comp_geom_conf = geometry_conf
+        metric_scene = scene
+    elif use_preview_downscale:
+        comp_scene = eval_scene
+        comp_normals = eval_normals
+        comp_geom_conf = eval_geom_conf
+        metric_scene = eval_scene
+    else:
+        comp_scene = work_scene
+        assert normals is not None and geometry_conf is not None
+        comp_normals = normals
+        comp_geom_conf = geometry_conf
+        metric_scene = scene
+
     neural_metadata = None
     if effective_mode == "intrinsic":
         out, ratio = compose_intrinsic(
-            work_scene, target_d, target_s, geometry_conf, settings
+            comp_scene,
+            target_d,
+            target_s,
+            comp_geom_conf,
+            eff_settings,
+            source_diffuse=source_d,
+            source_specular=source_s,
+            target_rig=target_rig,
         )
         mode_label = "2.5D intrinsic de-lighting and re-rendering"
     elif effective_mode == "hybrid_neural":
         neural_pred = neural_relighter.render(
-            work_scene, target_d, target_s, target_rig, settings
+            comp_scene, target_d, target_s, target_rig, eff_settings
         )
         neural_rgb = np.asarray(neural_pred.rgb_srgb, dtype=np.float32)
-        if neural_rgb.shape != work_scene.rgb_srgb.shape:
+        if neural_rgb.shape != comp_scene.rgb_srgb.shape:
             raise ValueError(
-                f"NeuralRelighter returned shape {neural_rgb.shape}; expected {work_scene.rgb_srgb.shape}."
+                f"NeuralRelighter returned shape {neural_rgb.shape}; expected {comp_scene.rgb_srgb.shape}."
             )
         if not np.isfinite(neural_rgb).all() or np.any(neural_rgb < 0.0) or np.any(neural_rgb > 1.0):
             raise ValueError("NeuralRelighter returned non-finite or out-of-[0,1] pixel values.")
-        out = compose_hybrid_neural(work_scene, neural_rgb, geometry_conf, settings)
+        out = compose_hybrid_neural(comp_scene, neural_rgb, comp_geom_conf, eff_settings)
         t_y = np.maximum(luminance(target_d), 1e-4)
-        if work_scene.source_shading is not None and not settings.preserve_source_lighting:
-            sh = work_scene.source_shading[..., None] if work_scene.source_shading.ndim == 2 else work_scene.source_shading
-            s_y = np.maximum(luminance(np.broadcast_to(sh, (*work_scene.shape, 3))), 1e-4)
+        if comp_scene.source_shading is not None and not eff_settings.preserve_source_lighting:
+            sh = comp_scene.source_shading[..., None] if comp_scene.source_shading.ndim == 2 else comp_scene.source_shading
+            s_y = np.maximum(luminance(np.broadcast_to(sh, (*comp_scene.shape, 3))), 1e-4)
         else:
             if source_d is None:
                 source_d, _, _ = evaluate_rig(
-                    work_scene, camera, points, normals, source_rig, settings
+                    comp_scene, camera if not (use_preview_downscale and not eff_settings.preview_upsample) else eval_cam,
+                    points if comp_scene is work_scene else eval_points, comp_normals, source_rig, eff_settings
                 )
             s_y = np.maximum(luminance(source_d), 1e-4)
-        ratio = np.clip(t_y / s_y, settings.ratio_min, settings.ratio_max).astype(np.float32)
+        ratio = np.clip(t_y / s_y, eff_settings.ratio_min, eff_settings.ratio_max).astype(np.float32)
         neural_metadata = dict(getattr(neural_pred, "metadata", {}) or {})
         mode_label = "Hybrid physics-steered neural relighting with detail lock"
     else:
         assert source_d is not None and source_s is not None
         out, ratio = compose_source_preserving(
-            work_scene,
+            comp_scene,
             source_d,
             target_d,
             source_s,
             target_s,
-            geometry_conf,
-            settings,
+            comp_geom_conf,
+            eff_settings,
             target_rig=target_rig,
         )
         mode_label = "2.5D source-to-target relighting"
 
     active = (
-        (scene.lightable_mask > 0.05)
-        & (geometry_conf > settings.min_geometry_confidence)
+        (metric_scene.lightable_mask > 0.05)
+        & (comp_geom_conf > eff_settings.min_geometry_confidence)
     )
-    if scene.protected_mask is not None:
-        active = active & (scene.protected_mask < 0.95)
-    if scene.alpha_mask is not None:
-        active = active & (scene.alpha_mask > 0.05)
-    delta = np.abs(out - scene.rgb_srgb)
+    if metric_scene.protected_mask is not None:
+        active = active & (metric_scene.protected_mask < 0.95)
+    if metric_scene.alpha_mask is not None:
+        active = active & (metric_scene.alpha_mask > 0.05)
+    delta = np.abs(out - metric_scene.rgb_srgb)
+    valid_d = metric_scene.depth > 0
+    depth_span = (
+        [float(np.min(metric_scene.depth[valid_d])), float(np.max(metric_scene.depth[valid_d]))]
+        if np.any(valid_d)
+        else [0.0, 0.0]
+    )
     metrics = {
         "mode": mode_label,
         "renderer_mode": effective_mode,
+        **_pipeline_observability(scene, requested_mode, effective_mode, target_rig),
+        "quality_mode": eff_settings.quality_mode,
+        "shadow_steps_effective": int(eff_settings.shadow_steps),
+        "preview_downscaled": bool(use_preview_downscale),
+        "preview_upsampled": bool(use_preview_downscale and eff_settings.preview_upsample),
         "depth_kind": scene.depth_kind,
+        "lighting_scale": {
+            "depth_kind": scene.depth_kind,
+            "calibrated_metric_scale": scene.depth_kind == "metric",
+            "attenuation_law": (
+                "inverse_square_metres (strength / max(d^2, 0.04))"
+                if scene.depth_kind == "metric"
+                else "bounded_relative_dimensionless (strength / (1 + 0.15 * d^2))"
+            ),
+            "depth_units": "metres" if scene.depth_kind == "metric" else "relative_scene_units",
+            "depth_span": depth_span,
+            "base_shadow_bias": (
+                eff_settings.shadow_bias_metric
+                if scene.depth_kind == "metric"
+                else eff_settings.shadow_bias_relative
+            ),
+        },
         "material_response": describe_material_response(scene),
         "neural_relighter": neural_metadata,
         "geometry_valid_fraction": float(
             np.mean(
-                (scene.depth > 0)
-                & (geometry_conf > settings.min_geometry_confidence)
+                (metric_scene.depth > 0)
+                & (comp_geom_conf > eff_settings.min_geometry_confidence)
             )
         ),
         "lightable_fraction": float(np.mean(active)),
@@ -284,8 +527,236 @@ def relight(
             "Single-image intrinsic decomposition remains ambiguous; source_rig must approximate the original illumination.",
             "The structural geometry gate is not a substitute for real-photo visual validation.",
             "Relative depth does not support metre-based point/area-light distance falloff.",
+            "Direct lighting and parameterized studio environment probes do not model mirror raytraced inter-reflections, glass/water refraction, or transmission.",
         ],
     }
     return RelightResult(
-        out, normals, ratio, visibility, geometry_conf, metrics
+        out, comp_normals, ratio, visibility, comp_geom_conf, metrics
+    )
+
+
+class RelightSession:
+    """Reusable scene session avoiding redundant buffer validation, hashing, and geometry prep.
+
+    Designed for interactive light manipulation: construct once when a scene loads,
+    then call `render(target_rig, ...)` repeatedly as lights move or change colour.
+    """
+
+    def __init__(
+        self,
+        scene: SceneBuffers,
+        camera: CameraModel,
+        source_rig: LightingRig,
+        settings: EngineSettings | None = None,
+        *,
+        preview_max_side: int = 384,
+        require_geometry_ready: bool = False,
+    ) -> None:
+        base_settings = settings or EngineSettings()
+        base_settings.validate()
+        scene.validate()
+        camera.validate()
+        source_rig.validate()
+
+        self.scene = scene
+        self.camera = camera
+        self.source_rig = source_rig
+        self.base_settings = base_settings
+        self.preview_max_side = max(32, int(preview_max_side))
+
+        work_scene = scene
+        if base_settings.refine_depth_edges:
+            work_scene = copy(scene)
+            work_scene.depth = refine_depth_to_rgb_edges(scene.depth, scene.rgb_srgb)
+        self.work_scene = work_scene
+
+        points, normals, geom_conf = prepare_geometry(work_scene, camera)
+        if float(base_settings.normal_smooth_sigma) > 0.0:
+            smoothed = _depth_guided_smooth(normals, work_scene.depth, float(base_settings.normal_smooth_sigma))
+            lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
+            valid_n = lens[..., 0] > 1e-6
+            normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
+        self.points = points
+        self.normals = normals
+        self.geom_conf = geom_conf
+
+        if require_geometry_ready:
+            quality_scene = copy(scene)
+            quality_scene.normals = normals
+            quality_scene.geometry_confidence = geom_conf
+            gate_report = evaluate_scene_buffers(quality_scene)
+            gate = gate_report["lighting_readiness"]["normal_dependent_shading"]
+            if not gate["structural_gate_passed"]:
+                raise ValueError(
+                    "Scene failed the structural gate for normal-dependent lighting: "
+                    + "; ".join(gate["blocking_reasons"])
+                )
+
+        # Precompute full-res compositing invariants (F3 priors, multiscale residual layers)
+        self.material_meta = describe_material_response(scene)
+        self.albedo_corr_hi: np.ndarray | None = None
+        self.detail_factor_hi: np.ndarray | None = None
+        self.residual_layers_hi: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        if work_scene.albedo is not None:
+            self.albedo_corr_hi, self.detail_factor_hi = _get_or_compute_intrinsic_priors(work_scene, base_settings)
+            self.residual_layers_hi = _get_or_compute_intrinsic_residual(work_scene, base_settings)
+
+        # Precompute preview buffers & geometry for fast scrubbing
+        self.prev_scene, self.prev_cam = downsample_scene_buffers_for_preview(work_scene, camera, self.preview_max_side)
+        self.prev_points, prev_norms, self.prev_geom_conf = prepare_geometry(self.prev_scene, self.prev_cam)
+        if float(base_settings.normal_smooth_sigma) > 0.0:
+            smoothed_p = _depth_guided_smooth(prev_norms, self.prev_scene.depth, float(base_settings.normal_smooth_sigma))
+            lens_p = np.linalg.norm(smoothed_p, axis=-1, keepdims=True)
+            valid_p = lens_p[..., 0] > 1e-6
+            prev_norms = np.where(valid_p[..., None], smoothed_p / np.maximum(lens_p, 1e-6), prev_norms).astype(np.float32)
+        self.prev_normals = prev_norms
+        self.albedo_corr_lo: np.ndarray | None = None
+        self.detail_factor_lo: np.ndarray | None = None
+        self.residual_layers_lo: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        if self.prev_scene.albedo is not None:
+            self.albedo_corr_lo, self.detail_factor_lo = _get_or_compute_intrinsic_priors(self.prev_scene, base_settings)
+            self.residual_layers_lo = _get_or_compute_intrinsic_residual(self.prev_scene, base_settings)
+
+    def render(
+        self,
+        target_rig: LightingRig,
+        settings: EngineSettings | None = None,
+    ) -> RelightResult:
+        """Render using cached geometry and intrinsic priors for responsive interaction."""
+        cfg = settings or self.base_settings
+        cfg.validate()
+        target_rig.validate()
+
+        requested_mode = cfg.renderer_mode
+        effective_mode = ("intrinsic" if self.scene.albedo is not None else "ratio") if requested_mode == "auto" else requested_mode
+        if effective_mode == "intrinsic" and self.scene.albedo is None:
+            raise ValueError("renderer_mode='intrinsic' requires scene.albedo to be populated.")
+
+        if cfg.quality_mode == "preview":
+            eff = replace(cfg, shadow_steps=min(cfg.shadow_steps, 12), shadow_adaptive_sampling=False, shadow_smooth_passes=1)
+            use_prev = max(self.work_scene.shape) > (cfg.preview_max_side or self.preview_max_side)
+        elif cfg.quality_mode == "final":
+            eff = replace(cfg, shadow_steps=max(cfg.shadow_steps, 48), shadow_adaptive_sampling=True, shadow_smooth_passes=max(cfg.shadow_smooth_passes, 2))
+            use_prev = False
+        else:
+            eff = cfg
+            use_prev = cfg.preview_max_side is not None and max(self.work_scene.shape) > int(cfg.preview_max_side)
+
+        if use_prev:
+            ev_sc, ev_cam, ev_pts, ev_nrm = self.prev_scene, self.prev_cam, self.prev_points, self.prev_normals
+        else:
+            ev_sc, ev_cam, ev_pts, ev_nrm = self.work_scene, self.camera, self.points, self.normals
+
+        target_d, target_s, visibility = evaluate_rig(ev_sc, ev_cam, ev_pts, ev_nrm, target_rig, eff)
+        if float(eff.indirect_bounce_strength) > 0.0:
+            target_d = target_d + compute_indirect_bounce(ev_sc, ev_pts, ev_nrm, target_d, eff)
+
+        source_d: np.ndarray | None = None
+        source_s: np.ndarray | None = None
+        need_source_eval = (
+            eff.preserve_source_lighting
+            or effective_mode == "ratio"
+            or float(eff.background_light_influence) < 1.0 - 1e-6
+            or float(eff.real_image_preservation) > 0.0
+            or float(eff.highlight_relocation_strength) > 0.0
+        )
+        if need_source_eval:
+            source_d, source_s, _ = evaluate_rig(ev_sc, ev_cam, ev_pts, ev_nrm, self.source_rig, eff)
+            source_d = _effective_source_diffuse(ev_sc, ev_nrm, source_d, eff)
+        if eff.preserve_source_lighting:
+            assert source_d is not None and source_s is not None
+            target_d = source_d + target_d
+            target_s = source_s + target_s
+
+        if use_prev and eff.preview_upsample:
+            to_up = [target_d, target_s, visibility]
+            if source_d is not None:
+                to_up.append(source_d)
+            if source_s is not None:
+                to_up.append(source_s)
+            up = depth_guided_upsample_batch(to_up, self.work_scene.depth, self.prev_scene.depth)
+            target_d, target_s, visibility = up[0], up[1], up[2]
+            idx = 3
+            if source_d is not None:
+                source_d = up[idx]
+                idx += 1
+            if source_s is not None:
+                source_s = up[idx]
+            hi_res = True
+        elif use_prev:
+            hi_res = False
+        else:
+            hi_res = True
+
+        comp_sc = self.work_scene if hi_res else self.prev_scene
+        comp_nrm = self.normals if hi_res else self.prev_normals
+        comp_conf = self.geom_conf if hi_res else self.prev_geom_conf
+        eps = 1e-4
+
+        if effective_mode == "intrinsic":
+            if hi_res and self.albedo_corr_hi is not None and self.detail_factor_hi is not None and cfg.detail_preservation_mode == self.base_settings.detail_preservation_mode and cfg.detail_lock_strength == self.base_settings.detail_lock_strength:
+                alb_corr, det_fac, res_layers = (
+                    self.albedo_corr_hi, self.detail_factor_hi, self.residual_layers_hi
+                )
+            elif (not hi_res) and self.albedo_corr_lo is not None and self.detail_factor_lo is not None and cfg.detail_preservation_mode == self.base_settings.detail_preservation_mode and cfg.detail_lock_strength == self.base_settings.detail_lock_strength:
+                alb_corr, det_fac, res_layers = (
+                    self.albedo_corr_lo, self.detail_factor_lo, self.residual_layers_lo
+                )
+            else:
+                alb_corr, det_fac = _get_or_compute_intrinsic_priors(comp_sc, eff, eps=eps)
+                res_layers = _get_or_compute_intrinsic_residual(comp_sc, eff, eps=eps)
+
+            out, ratio = _compose_intrinsic_output(
+                comp_sc,
+                alb_corr,
+                det_fac,
+                res_layers,
+                target_d,
+                target_s,
+                comp_conf,
+                eff,
+                eps=eps,
+                source_diffuse=source_d,
+                source_specular=source_s,
+                target_rig=target_rig,
+            )
+        else:
+            assert source_d is not None and source_s is not None
+            out, ratio = compose_source_preserving(
+                comp_sc, source_d, target_d, source_s, target_s, comp_conf, eff, target_rig=target_rig
+            )
+
+        metrics = {
+            "mode": "2.5D intrinsic de-lighting and re-rendering" if effective_mode == "intrinsic" else "2.5D source-to-target relighting",
+            "renderer_mode": effective_mode,
+            **_pipeline_observability(self.scene, requested_mode, effective_mode, target_rig),
+            "quality_mode": eff.quality_mode,
+            "shadow_steps_effective": int(eff.shadow_steps),
+            "preview_downscaled": bool(use_prev),
+            "preview_upsampled": bool(use_prev and eff.preview_upsample),
+            "depth_kind": self.scene.depth_kind,
+            "material_response": self.material_meta,
+            "shadow_visibility_mean": float(np.mean(visibility)),
+            "session_cached": True,
+        }
+        return RelightResult(out, comp_nrm, ratio, visibility, comp_conf, metrics)
+
+
+def prepare_relight_session(
+    scene: SceneBuffers,
+    camera: CameraModel,
+    source_rig: LightingRig,
+    settings: EngineSettings | None = None,
+    *,
+    preview_max_side: int = 384,
+    require_geometry_ready: bool = False,
+) -> RelightSession:
+    """Create a reusable RelightSession with cached geometry and intrinsic priors."""
+    return RelightSession(
+        scene,
+        camera,
+        source_rig,
+        settings,
+        preview_max_side=preview_max_side,
+        require_geometry_ready=require_geometry_ready,
     )

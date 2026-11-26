@@ -48,6 +48,8 @@ def default_scene_analyzer(
         "--normal-ensemble", str(options.get("normal_ensemble", 3)),
         "--intrinsic-backend", str(options.get("intrinsic_backend", "marigold_intrinsics_lighting")),
         "--intrinsic-ensemble", str(options.get("intrinsic_ensemble", 3)),
+        "--material-backend", str(options.get("material_backend", "marigold_intrinsics_appearance")),
+        "--material-ensemble", str(options.get("material_ensemble", 3)),
     ]
     if options.get("prompts"):
         cmd.extend(["--prompts", *[str(p) for p in options["prompts"]]])
@@ -80,7 +82,9 @@ def default_scene_analyzer(
         elif "[4/5]" in text or "[4b/5]" in text:
             on_progress("estimating_normals", 0.7)
         elif "[4c/5]" in text:
-            on_progress("estimating_intrinsics", 0.85)
+            on_progress("estimating_intrinsics", 0.80)
+        elif "[4d/5]" in text:
+            on_progress("estimating_materials", 0.90)
         elif "[5/5]" in text:
             on_progress("writing_scene_buffers", 0.95)
     rc = proc.wait()

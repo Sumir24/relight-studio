@@ -181,6 +181,12 @@ By default all visible image pixels are candidates. To restrict lighting to sele
 
 Artifacts include registered depth, normals, confidence, arbitrary `mask_<label>.png` class masks, `instance_mask_<label>__NNN.png` object masks, lightable/protected maps, an overlay, `scene_buffers.npz` and a provenance manifest.
 
+### CLI vs. Server Analysis Defaults
+
+- **`scripts/run_scene_analysis.py` (CLI)** defaults to `--normal-backend depth_derived` and `--intrinsic-backend none` so standalone/reproducible runs avoid downloading and running multi-GB Marigold diffusion pipelines unless requested. Without intrinsic buffers, `renderer_mode="auto"` falls back to the `ratio` renderer.
+- **FastAPI Server (`POST /v1/scenes/analyze`)** defaults to `normal_backend=marigold_normals` and `intrinsic_backend=marigold_intrinsics_lighting`, producing `albedo`, `source_shading`, and `non_diffuse_residual` so `renderer_mode="auto"` uses the `intrinsic` renderer out of the box.
+- To run the CLI with the full server stack, pass `--normal-backend marigold_normals --intrinsic-backend marigold_intrinsics_lighting`.
+
 ## Current model candidates and license screening
 
 - Florence-2 Base: MIT model card; detailed captions and dense-region captions provide per-image concept proposals. Audit/pin custom code.

@@ -127,6 +127,8 @@ class DiffusersIntrinsicAdapter:
             "match_input_resolution": True,
             "output_type": "np",
         }
+        if self.ensemble_size > 2 and self.variant_kind == "appearance":
+            call_kwargs["output_uncertainty"] = True
         if self.processing_resolution is not None:
             call_kwargs["processing_resolution"] = int(self.processing_resolution)
         with self._torch.inference_mode():
@@ -143,8 +145,11 @@ class DiffusersIntrinsicAdapter:
         raw_albedo = np.clip(self._align(pred[albedo_idx], h, w), 0.0, 1.0)
 
         pred_spaces = props.get("prediction_space") or props.get("target_spaces") or {}
+        albedo_meta = props.get("albedo") if isinstance(props.get("albedo"), dict) else {}
         albedo_is_linear = self.output_is_linear
-        if isinstance(pred_spaces, dict) and "albedo" in pred_spaces:
+        if isinstance(albedo_meta, dict) and "prediction_space" in albedo_meta:
+            albedo_is_linear = str(albedo_meta["prediction_space"]).lower() != "srgb"
+        elif isinstance(pred_spaces, dict) and "albedo" in pred_spaces:
             albedo_is_linear = str(pred_spaces["albedo"]).lower() != "srgb"
         albedo = linear_to_srgb(raw_albedo).astype(np.float32) if albedo_is_linear else raw_albedo
         albedo_lin = raw_albedo if albedo_is_linear else srgb_to_linear(raw_albedo)
@@ -152,6 +157,19 @@ class DiffusersIntrinsicAdapter:
         residual = None
         roughness = None
         metalness = None
+        specular_level = None
+        specular_color = None
+        material_confidence = None
+        roughness_unc = None
+        metalness_unc = None
+        extra_metadata: dict[str, Any] = {
+            "model_id": self.model_id,
+            "variant_kind": self.variant_kind,
+            "device": self._device,
+            **revision_descriptor(self.revision),
+            "source": "model_estimated",
+            "calibrated": False,
+        }
         if self.variant_kind == "lighting":
             sh_idx = target_names.index("shading") if "shading" in target_names else 1
             source_shading = np.maximum(self._align(pred[sh_idx], h, w), 0.0)
@@ -165,12 +183,70 @@ class DiffusersIntrinsicAdapter:
                 else (1 if albedo_idx == 0 else 0)
             )
             mat = self._align(pred[mat_idx], h, w)
-            roughness = np.clip(mat[..., 0], 0.0, 1.0)
-            metalness = np.clip(mat[..., 1], 0.0, 1.0)
+            raw_roughness = np.clip(mat[..., 0], 0.0, 1.0).astype(np.float32)
+            raw_metalness = np.clip(mat[..., 1], 0.0, 1.0).astype(np.float32)
+            ch2_unused = mat[..., 2].astype(np.float32) if mat.shape[-1] >= 3 else np.zeros((h, w), np.float32)
+
+            unc = getattr(output, "uncertainty", None)
+            if unc is not None:
+                unc_arr = np.asarray(unc, dtype=np.float32)
+                if unc_arr.ndim == 4 and unc_arr.shape[0] > mat_idx:
+                    mat_unc = self._align(unc_arr[mat_idx], h, w)
+                    roughness_unc = np.clip(mat_unc[..., 0], 0.0, 1.0).astype(np.float32)
+                    metalness_unc = np.clip(mat_unc[..., 1], 0.0, 1.0).astype(np.float32)
+                    uncertainty_source = "ensemble_dispersion"
+                else:
+                    roughness_unc = None
+                    metalness_unc = None
+                    uncertainty_source = "single_sample_conservative_prior"
+            else:
+                roughness_unc = None
+                metalness_unc = None
+                uncertainty_source = "single_sample_conservative_prior"
+
+            # Confidence-aware material assignment:
+            # 1. Trust ensemble-agreed predictions (cap 0.86 vs 0.60 uncalibrated single-sample).
+            base_cap = 0.86 if roughness_unc is not None else 0.60
+            if roughness_unc is not None and metalness_unc is not None:
+                unc_combined = 0.65 * roughness_unc + 0.35 * metalness_unc
+                unc_factor = np.exp(-unc_combined / 0.065)
+            else:
+                unc_factor = np.ones((h, w), dtype=np.float32)
+
+            # 2. Gentle shadow-floor SNR damping only near crushed black (<0.02 linear),
+            # keeping dark matte textiles from being falsely treated as low-confidence.
             rgb_lin = srgb_to_linear(rgb_srgb)
+            lum_lin = (0.2126 * rgb_lin[..., 0] + 0.7152 * rgb_lin[..., 1] + 0.0722 * rgb_lin[..., 2]).astype(np.float32)
+            snr_factor = np.clip((lum_lin - 0.002) / 0.018, 0.55, 1.0).astype(np.float32)
+
+            # 3. Sanity gate against unexpected spikes in unused channel 2.
+            sanity_factor = np.clip(1.0 - np.maximum(np.abs(ch2_unused) - 0.15, 0.0) * 2.0, 0.3, 1.0).astype(np.float32)
+            material_confidence = np.clip(
+                base_cap * unc_factor * snr_factor * sanity_factor,
+                0.0,
+                1.0,
+            ).astype(np.float32)
+
+            # Keep raw model predictions faithful at the adapter boundary; downstream material-prior
+            # assignment separates glossy dielectrics/clearcoat from conductors via uncertainty.
+            metalness = raw_metalness
+            roughness = raw_roughness
+            specular_level = np.full((h, w), 0.04, dtype=np.float32)
+            specular_color = np.clip(albedo_lin, 0.04, 0.98).astype(np.float32)
             source_shading = np.maximum(
                 rgb_lin / np.maximum(albedo_lin, 1e-3), 0.0
             ).astype(np.float32)
+            extra_metadata["material_target_semantics"] = {
+                "sub_target_names": ["roughness", "metallicity", None],
+                "uncertainty_source": uncertainty_source,
+                "license": "openrail++",
+                "raw_roughness_mean": float(np.mean(raw_roughness)),
+                "raw_metalness_mean": float(np.mean(raw_metalness)),
+                "material_confidence_mean": float(np.mean(material_confidence)),
+            }
+            if roughness_unc is not None and metalness_unc is not None:
+                extra_metadata["material_target_semantics"]["raw_roughness_unc_mean"] = float(np.mean(roughness_unc))
+                extra_metadata["material_target_semantics"]["raw_metalness_unc_mean"] = float(np.mean(metalness_unc))
         else:
             source_shading = np.maximum(self._align(pred[1], h, w), 0.0)
 
@@ -180,12 +256,10 @@ class DiffusersIntrinsicAdapter:
             non_diffuse_residual=residual,
             roughness=roughness,
             metalness=metalness,
-            metadata={
-                "model_id": self.model_id,
-                "variant_kind": self.variant_kind,
-                "device": self._device,
-                **revision_descriptor(self.revision),
-                "source": "model_estimated",
-                "calibrated": False,
-            },
+            specular_level=specular_level,
+            specular_color=specular_color,
+            material_confidence=material_confidence,
+            roughness_uncertainty=roughness_unc,
+            metalness_uncertainty=metalness_unc,
+            metadata=extra_metadata,
         )

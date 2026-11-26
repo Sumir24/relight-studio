@@ -1,8 +1,30 @@
 from __future__ import annotations
+from collections import OrderedDict
+import hashlib
+import threading
 import numpy as np
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, sobel
 from .color import srgb_to_linear, linear_to_srgb, luminance
 from .contracts import SceneBuffers, EngineSettings, LightingRig
+from .wavelet import compose_wavelet_identity_lock
+
+_INTRINSIC_DETAIL_CACHE: OrderedDict[tuple, tuple[np.ndarray, np.ndarray]] = OrderedDict()
+_INTRINSIC_RESIDUAL_CACHE: OrderedDict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray]] = OrderedDict()
+_INTRINSIC_DETAIL_LOCK = threading.Lock()
+_INTRINSIC_CACHE_MAX = 4
+
+
+def _array_digest(arr: np.ndarray | None) -> tuple | None:
+    if arr is None:
+        return None
+    buf = np.ascontiguousarray(arr)
+    return (buf.shape, str(buf.dtype), hashlib.blake2b(memoryview(buf), digest_size=16).digest())
+
+
+def _filter_log_field(field: np.ndarray, sigma: float, settings: EngineSettings, *, eps_guide: float) -> np.ndarray:
+    if settings.edge_aware_base:
+        return _edge_aware_log_base(field, sigma, eps_guide=eps_guide)
+    return gaussian_filter(field, sigma, mode='reflect')
 
 def _edge_aware_log_base(log_y: np.ndarray, sigma: float, eps_guide: float = 0.08) -> np.ndarray:
     """Self-guided filter in log-luminance space to suppress boundary halos."""
@@ -20,6 +42,60 @@ def _compute_log_base(log_y: np.ndarray, settings: EngineSettings) -> np.ndarray
     if settings.edge_aware_base:
         return _edge_aware_log_base(log_y, settings.base_blur_sigma)
     return gaussian_filter(log_y, settings.base_blur_sigma, mode='reflect')
+
+
+def _joint_guided_filter(field: np.ndarray, guide: np.ndarray, sigma: float, eps_guide: float = 0.005) -> np.ndarray:
+    """Edge-preserving guided filter using a structural guide (e.g. log-luminance) to prevent chroma halos."""
+    mean_i = gaussian_filter(guide, sigma, mode='reflect')
+    mean_ii = gaussian_filter(guide * guide, sigma, mode='reflect')
+    var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+    mean_p = gaussian_filter(field, sigma, mode='reflect')
+    mean_ip = gaussian_filter(guide * field, sigma, mode='reflect')
+    cov_ip = mean_ip - mean_i * mean_p
+    a = cov_ip / (var_i + eps_guide)
+    b = mean_p - a * mean_i
+    return gaussian_filter(a, sigma, mode='reflect') * guide + gaussian_filter(b, sigma, mode='reflect')
+
+
+def _preserve_source_chroma(
+    src_lin: np.ndarray,
+    albedo_lin: np.ndarray,
+    settings: EngineSettings,
+    eps: float = 1e-4,
+) -> np.ndarray:
+    """Restore high-frequency local chromaticity missing from smooth albedo without copying broad source casts."""
+    strength = 0.75 * float(settings.detail_lock_strength)
+    if strength <= 0.0:
+        return albedo_lin
+
+    y_src = np.maximum(luminance(src_lin), eps)
+    y_alb = np.maximum(luminance(albedo_lin), eps)
+    log_y_src = np.log(y_src)
+    log_c_src = np.log(np.maximum(src_lin, eps)) - log_y_src[..., None]
+    log_c_alb = np.log(np.maximum(albedo_lin, eps)) - np.log(y_alb)[..., None]
+    c_diff = log_c_src - log_c_alb
+
+    # Separate broad source color casts (low-frequency) from local fine chromatic detail (high-frequency).
+    # Joint filtering guided by log_y_src preserves structural edges (no halos) while capturing isoluminant chroma detail.
+    sigma = float(settings.base_blur_sigma)
+    if settings.edge_aware_base:
+        base_c = np.stack([
+            _joint_guided_filter(c_diff[..., c], log_y_src, sigma, eps_guide=0.005)
+            for c in range(3)
+        ], axis=-1)
+    else:
+        base_c = np.stack([
+            gaussian_filter(c_diff[..., c], sigma, mode='reflect')
+            for c in range(3)
+        ], axis=-1)
+    delta_c_hf = np.clip(c_diff - base_c, -0.65, 0.65)
+
+    # Attenuate chroma restoration in near-black pixels where RGB ratios are noise-dominated.
+    chroma_conf = np.clip((np.minimum(y_src, y_alb) - 0.01) / 0.06, 0.0, 1.0)
+    corrected = albedo_lin * np.exp(delta_c_hf * (strength * chroma_conf)[..., None])
+    # Re-normalize to keep predicted albedo luminance unchanged so target lighting drives shading.
+    corrected *= (y_alb / np.maximum(luminance(corrected), eps))[..., None]
+    return np.clip(corrected, 0.0, 1.0).astype(np.float32)
 
 
 def _depth_guided_smooth(
@@ -137,49 +213,224 @@ def _apply_aerial_perspective(
     return (relit * trans[..., None] + haze_rad * (1.0 - trans[..., None])).astype(np.float32)
 
 
+def _estimate_background_weight(scene: SceneBuffers) -> np.ndarray:
+    """Domain-agnostic soft background weight in [0, 1] from explicit masks or relative depth."""
+    h, w = scene.shape
+    if "background" in scene.semantic_masks:
+        bg = np.clip(scene.semantic_masks["background"], 0.0, 1.0).astype(np.float32)
+        return np.clip(_depth_guided_smooth(bg, scene.depth, 3.0), 0.0, 1.0)
+
+    depth = scene.depth.astype(np.float32)
+    valid = depth > 0
+    if not np.any(valid):
+        return np.zeros((h, w), dtype=np.float32)
+
+    z_vals = depth[valid]
+    q10, q90 = np.quantile(z_vals, [0.10, 0.90])
+    if float(q90 - q10) < 1e-3:
+        if scene.semantic_masks:
+            fg = np.zeros((h, w), dtype=np.float32)
+            for m in scene.semantic_masks.values():
+                fg = np.maximum(fg, np.clip(m, 0.0, 1.0))
+            return np.clip(1.0 - fg, 0.0, 1.0)
+        return np.zeros((h, w), dtype=np.float32)
+
+    if scene.semantic_masks:
+        fg = np.zeros((h, w), dtype=np.float32)
+        for m in scene.semantic_masks.values():
+            fg = np.maximum(fg, np.clip(m, 0.0, 1.0))
+        bg_mask = np.clip(1.0 - fg, 0.0, 1.0)
+        fg_pixels = valid & (fg > 0.5)
+        if np.any(fg_pixels):
+            z_fg = float(np.median(depth[fg_pixels]))
+            z_hi = max(float(q90), z_fg + 0.15 * float(q90 - q10))
+            depth_gate = np.clip((depth - z_fg) / max(z_hi - z_fg, 1e-3), 0.0, 1.0)
+            bg = bg_mask * (0.35 + 0.65 * depth_gate)
+        else:
+            bg = bg_mask
+    else:
+        z_lo = float(np.quantile(z_vals, 0.55))
+        z_hi = max(float(q90), z_lo + 1e-3)
+        bg = np.clip((depth - z_lo) / (z_hi - z_lo), 0.0, 1.0)
+
+    return np.clip(_depth_guided_smooth(bg.astype(np.float32), depth, 3.0), 0.0, 1.0)
+
+
+def _attenuate_background_lighting(
+    scene: SceneBuffers,
+    target_diffuse: np.ndarray,
+    target_specular: np.ndarray,
+    settings: EngineSettings,
+    *,
+    source_diffuse: np.ndarray | None = None,
+    albedo_lin: np.ndarray | None = None,
+    src_lin: np.ndarray | None = None,
+    eps: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Attenuate excessive target-light flooding on background regions toward real room tone."""
+    bg_inf = float(settings.background_light_influence)
+    if bg_inf >= 1.0 - 1e-6:
+        return target_diffuse, target_specular
+
+    bg_w = _estimate_background_weight(scene)
+    atten = np.clip(bg_w * (1.0 - bg_inf), 0.0, 1.0)[..., None]
+    if not np.any(atten > 1e-5):
+        return target_diffuse, target_specular
+
+    if source_diffuse is not None:
+        base_d = np.maximum(source_diffuse, 0.0)
+        # Keep neutral ambient scale aligned with original luminance when albedo is present.
+        if albedo_lin is not None and src_lin is not None:
+            implied = np.clip(src_lin / np.maximum(albedo_lin, 0.05), 0.05, 2.5)
+            implied_smooth = np.maximum(_depth_guided_smooth(implied, scene.depth, 4.0), eps)
+            base_d = 0.5 * base_d + 0.5 * implied_smooth
+    elif albedo_lin is not None and src_lin is not None:
+        implied = np.clip(src_lin / np.maximum(albedo_lin, 0.05), 0.05, 2.5)
+        base_d = np.maximum(_depth_guided_smooth(implied, scene.depth, 4.0), eps)
+    else:
+        base_d = np.maximum(target_diffuse, 0.0)
+
+    t_d_eff = np.maximum(target_diffuse, 0.0) * (1.0 - atten) + base_d * atten
+    t_s_eff = np.maximum(target_specular, 0.0) * (1.0 - atten)
+    return t_d_eff.astype(np.float32), t_s_eff.astype(np.float32)
+
+
 def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
                               target_diffuse: np.ndarray, source_specular: np.ndarray,
                               target_specular: np.ndarray, geometry_confidence: np.ndarray,
                               settings: EngineSettings,
                               target_rig: LightingRig | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Transfer lighting in source-preserving fallback mode with multiscale highlight/shadow separation."""
     src = srgb_to_linear(scene.rgb_srgb)
     eps = 1e-4
-    # Use a luminance ratio for stable detail preservation; carry a restrained RGB chroma shift separately.
-    s_y = np.maximum(luminance(source_diffuse), eps)
-    t_y = np.maximum(luminance(target_diffuse), eps)
-    raw_ratio = t_y / s_y
-    ratio = np.clip(raw_ratio, settings.ratio_min, settings.ratio_max)
-    src_chroma = source_diffuse / s_y[..., None]
-    tgt_chroma = target_diffuse / t_y[..., None]
-    color_ratio = np.clip(tgt_chroma / np.maximum(src_chroma, eps),
-                          settings.color_ratio_min, settings.color_ratio_max)
-    color_ratio = np.power(color_ratio, 0.85)
+    t_d_in, t_s_in = _attenuate_background_lighting(
+        scene,
+        target_diffuse,
+        target_specular,
+        settings,
+        source_diffuse=source_diffuse,
+        src_lin=src,
+        eps=eps,
+    )
+    s_d = np.maximum(source_diffuse, eps)
+    t_d = np.maximum(t_d_in, 0.0)
+    s_y = np.maximum(luminance(s_d), eps)
+    t_y = np.maximum(luminance(t_d), eps)
+    ratio = np.clip(t_y / s_y, settings.ratio_min, settings.ratio_max)
+
+    min_gain = settings.ratio_min * settings.color_ratio_min
+    max_gain = settings.ratio_max * settings.color_ratio_max
+    # Maintain ratio_min as the shadow floor for low-saturation lights (e.g. outdoor daylight),
+    # while allowing saturated colored lights in deep shadow to attenuate toward min_gain without red/color wash.
+    t_chan_max = np.maximum(np.max(t_d, axis=-1, keepdims=True), eps)
+    t_hue = t_d / t_chan_max
+    t_sat = 1.0 - np.min(t_hue, axis=-1, keepdims=True)
+    sat_w = np.clip((t_sat - 0.25) / 0.55, 0.0, 1.0)
+    dyn_min_gain = float(settings.ratio_min) * (1.0 - sat_w) + min_gain * sat_w
+    rgb_gain = np.clip(t_d / s_d, dyn_min_gain, max_gain)
     if settings.lighting_smooth_sigma > 0.0:
         ratio = np.clip(
             _depth_guided_smooth(ratio, scene.depth, settings.lighting_smooth_sigma),
             settings.ratio_min, settings.ratio_max,
         )
-        color_ratio = np.clip(
-            _depth_guided_smooth(color_ratio, scene.depth, settings.lighting_smooth_sigma),
-            settings.color_ratio_min, settings.color_ratio_max,
+        rgb_gain = np.clip(
+            _depth_guided_smooth(rgb_gain, scene.depth, settings.lighting_smooth_sigma),
+            min_gain, max_gain,
         )
 
     y = np.maximum(luminance(src), eps)
-    if abs(float(settings.detail_power) - 1.0) < 1e-6:
-        y_relit = np.maximum(y * ratio, eps)
+    log_y = np.log(y)
+    base = np.exp(_compute_log_base(log_y, settings))
+    detail = y - base
+
+    change_w = np.clip(
+        np.maximum(np.abs(ratio - 1.0), np.linalg.norm(rgb_gain - 1.0, axis=-1) * 0.45),
+        0.0, 1.0,
+    )
+    min_c = float(settings.min_geometry_confidence)
+    conf_norm = np.clip((geometry_confidence - min_c) / 0.35, 0.0, 1.0).astype(np.float32)
+
+    reloc_s = float(settings.highlight_relocation_strength)
+    if settings.preserve_source_lighting or not np.any(change_w > 1e-6):
+        base_eff = base
+        rgb_gain_eff = rgb_gain
     else:
-        log_y = np.log(y)
-        base = np.exp(_compute_log_base(log_y, settings))
-        detail = y - base
-        y_relit = base * ratio + detail * np.power(ratio, settings.detail_power)
-        y_relit = np.maximum(y_relit, eps)
-    relit = src * (y_relit / y)[..., None] * color_ratio
+        # Only compress isolated specular overshoot (> 1.35x macro albedo above 0.45 linear) or
+        # extreme near-clipped plateaus (> 0.80 linear), leaving snow, sky, and white fabric untouched.
+        sigma_macro = float(settings.base_blur_sigma) * 2.5
+        base_macro = np.exp(_filter_log_field(log_y, sigma_macro, settings, eps_guide=0.12))
+        spec_thresh = np.minimum(np.maximum(base_macro * 1.35, 0.45), 0.80)
+        excess = np.maximum(base - spec_thresh, 0.0)
+        base_sep = base - excess * (0.55 * change_w * conf_norm)
+
+        if reloc_s > 0.0:
+            # Tier 1D: Strongly attenuate baked specular lobes facing away from the new light.
+            reloc_thresh = np.minimum(np.maximum(base_macro * 1.15, 0.32), 0.70)
+            reloc_excess = np.maximum(base - reloc_thresh, 0.0)
+            away_from_new = np.clip((1.05 - ratio) / 0.75, 0.0, 1.0)
+            extra_suppress = reloc_excess * (0.75 * reloc_s * away_from_new * change_w * conf_norm)
+            base_sep = np.maximum(base_sep - extra_suppress, eps)
+
+        base_eff = base_sep
+
+        # Prevent near-white baked source highlights from picking up >1.0 saturated channel amplification.
+        white_hi = np.clip((y - 0.58) / 0.35, 0.0, 1.0) * change_w * conf_norm
+        gain_over = np.maximum(rgb_gain - 1.0, 0.0)
+        rgb_gain_eff = rgb_gain - gain_over * (0.55 * white_hi[..., None])
+
+    # Tier 1A: Separate luminance transfer from chromatic tinting when color_transfer_strength < 1.0.
+    c_strength = float(settings.color_transfer_strength)
+    if c_strength < 1.0 - 1e-6:
+        gain_y = np.maximum(luminance(rgb_gain_eff), eps)[..., None]
+        chroma_shift = rgb_gain_eff / gain_y
+        # Desaturate intense colored tint slightly in bright highlights and suppress tint in unlit shadow.
+        hi_desat = np.clip((y - 0.50) / 0.45, 0.0, 1.0)[..., None] * 0.45
+        lit_gate = np.clip(t_y / np.maximum(s_y * 0.85, 0.25), 0.15, 1.0)[..., None]
+        eff_c = c_strength * (1.0 - hi_desat) * lit_gate
+        chroma_eff = 1.0 + eff_c * (chroma_shift - 1.0)
+        rgb_gain_eff = ratio[..., None] * chroma_eff
+
+    y_sep = np.maximum(base_eff + detail, eps)
+
+    tinted = src * (y_sep / y)[..., None] * rgb_gain_eff
+    eff_y = np.maximum(luminance(tinted), eps)
+    base_ratio = eff_y / np.maximum(y_sep, eps)
+    if abs(float(settings.detail_power) - 1.0) < 1e-6:
+        y_relit = np.maximum(y_sep * base_ratio, eps)
+    else:
+        y_relit = np.maximum(
+            base_eff * base_ratio + detail * np.power(np.clip(base_ratio, settings.ratio_min, settings.ratio_max), settings.detail_power),
+            eps,
+        )
+    relit = tinted * (y_relit / eff_y)[..., None]
     relit *= settings.output_exposure
 
-    # Add only the incremental GGX highlight predicted by the target rig.
-    spec_delta = np.maximum(target_specular - source_specular, 0.0)
+    # Tier 1C: Preserve shadow-side photographic fill from real image when real_image_preservation > 0.
+    real_pres = float(settings.real_image_preservation)
+    if real_pres > 0.0 and np.any(change_w > 1e-6):
+        shadow_zone = np.clip((1.0 - ratio) / 0.75, 0.0, 1.0) * conf_norm
+        fill_floor = src * np.clip(0.50 + 0.50 * ratio, 0.42, 1.15)[..., None]
+        relit = relit + (fill_floor - relit) * (0.45 * real_pres * shadow_zone[..., None])
+
+    # Add incremental virtual-light GGX highlight, gated by geometry confidence and void-dust guard on priors.
+    spec_delta = np.maximum(t_s_in - source_specular, 0.0) * conf_norm[..., None]
+    if scene.metalness is None and scene.specular_level is None and scene.clearcoat is None:
+        void_guard = np.clip((y - 0.003) / 0.020, 0.0, 1.0)[..., None]
+        spec_delta = spec_delta * void_guard
+    if reloc_s > 0.0:
+        spec_delta = spec_delta * (1.0 + 0.75 * reloc_s)
     relit += spec_delta * settings.specular_scale
     relit = _apply_aerial_perspective(relit, scene, target_rig, settings)
+
+    if settings.detail_preservation_mode == "wavelet":
+        relit = compose_wavelet_identity_lock(
+            src,
+            relit,
+            levels=settings.wavelet_levels,
+            detail_lock_strength=settings.detail_lock_strength,
+            mid_blend=settings.wavelet_mid_blend,
+            eps=eps,
+        )
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]
@@ -188,19 +439,66 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
     return out.astype(np.float32), ratio.astype(np.float32)
 
 
-def compose_intrinsic(
+def _compute_f3_log_detail(
+    raw_residual: np.ndarray,
     scene: SceneBuffers,
-    target_diffuse: np.ndarray,
-    target_specular: np.ndarray,
-    geometry_confidence: np.ndarray,
+    y_src: np.ndarray,
+    y_pred: np.ndarray,
     settings: EngineSettings,
+    eps: float = 1e-4,
+) -> np.ndarray:
+    """Extract shading-gated, locally centered multi-scale log-luminance detail for optional F3 mode."""
+    sf = float(np.clip(max(scene.shape) / 1024.0, 0.5, 1.35))
+    b_lo = _filter_log_field(raw_residual, 6.0 * sf, settings, eps_guide=0.25)
+    b_hi = _filter_log_field(raw_residual, 22.0 * sf, settings, eps_guide=0.25)
+    hf_clean = raw_residual - b_lo
+    mid_raw = b_lo - b_hi
+    local_dc = _filter_log_field(mid_raw, 18.0 * sf, settings, eps_guide=0.08)
+    mid_centered = mid_raw - local_dc
+
+    if scene.source_shading is not None:
+        sh_gray = scene.source_shading if scene.source_shading.ndim == 2 else luminance(scene.source_shading)
+        log_sh_blur = gaussian_filter(np.log(np.maximum(sh_gray, eps)).astype(np.float32), 2.5 * sf, mode='reflect')
+        gx = sobel(log_sh_blur, axis=1, mode='reflect') / (8.0 * max(sf, 1.0))
+        gy = sobel(log_sh_blur, axis=0, mode='reflect') / (8.0 * max(sf, 1.0))
+        g_macro = gaussian_filter(np.hypot(gx, gy), 3.0 * sf, mode='reflect')
+        w_shade = (1.0 / (1.0 + (g_macro / 0.055) ** 2)).astype(np.float32)
+    else:
+        w_shade = np.float32(1.0)
+
+    w_conf = (1.0 / (1.0 + (np.abs(mid_raw) / 0.35) ** 2)).astype(np.float32)
+    w_dark = np.clip((np.minimum(y_src, y_pred) - 0.008) / 0.04, 0.25, 1.0).astype(np.float32)
+    hf_term = (0.85 * w_dark) * np.tanh(hf_clean / 0.85)
+    mid_term = (0.75 * w_shade * w_conf) * np.tanh(mid_centered / 0.75)
+    return (hf_term + mid_term).astype(np.float32)
+
+
+def _get_or_compute_intrinsic_priors(
+    scene: SceneBuffers,
+    settings: EngineSettings,
+    eps: float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Re-render from estimated albedo + target shading while locking source high-frequency detail."""
-    if scene.albedo is None:
-        raise ValueError("compose_intrinsic requires scene.albedo.")
+    """Compute (or fetch from content-keyed cache) light-independent intrinsic albedo_corr and detail_factor."""
+    key = (
+        _array_digest(scene.rgb_srgb),
+        _array_digest(scene.albedo),
+        _array_digest(scene.source_shading),
+        _array_digest(scene.non_diffuse_residual),
+        float(settings.base_blur_sigma),
+        bool(settings.edge_aware_base),
+        float(settings.detail_lock_strength),
+        str(settings.detail_preservation_mode),
+        scene.shape,
+    )
+    with _INTRINSIC_DETAIL_LOCK:
+        cached = _INTRINSIC_DETAIL_CACHE.get(key)
+        if cached is not None:
+            _INTRINSIC_DETAIL_CACHE.move_to_end(key)
+            return cached
+
     src = srgb_to_linear(scene.rgb_srgb)
     albedo_lin = srgb_to_linear(scene.albedo)
-    eps = 1e-4
+    albedo_corr = _preserve_source_chroma(src, albedo_lin, settings, eps=eps)
 
     y_src = np.maximum(luminance(src), eps)
     log_y_src = np.log(y_src)
@@ -215,24 +513,232 @@ def compose_intrinsic(
         pred_src = albedo_lin * sh_3ch
         if res_pos is not None:
             pred_src = pred_src + res_pos
+        y_pred = np.maximum(luminance(pred_src), eps)
         # Log high-pass detail extraction is shift-invariant to arbitrary global scale on source_shading.
-        raw_residual = log_y_src - np.log(np.maximum(luminance(pred_src), eps))
-        log_detail = raw_residual - _compute_log_base(raw_residual, settings)
+        raw_residual = log_y_src - np.log(y_pred)
+        if settings.detail_preservation_mode == 'f3':
+            log_detail = _compute_f3_log_detail(raw_residual, scene, y_src, y_pred, settings, eps=eps)
+        else:
+            log_detail = raw_residual - _compute_log_base(raw_residual, settings)
     else:
-        log_detail = log_y_src - _compute_log_base(log_y_src, settings)
-    detail_factor = np.exp(np.clip(log_detail, -1.5, 1.5) * settings.detail_lock_strength)[..., None]
+        if settings.detail_preservation_mode == 'f3':
+            log_detail = _compute_f3_log_detail(log_y_src, scene, y_src, y_src, settings, eps=eps)
+        else:
+            log_detail = log_y_src - _compute_log_base(log_y_src, settings)
+    detail_factor = np.exp(np.clip(log_detail, -1.5, 1.5) * settings.detail_lock_strength)[..., None].astype(np.float32)
 
-    base_relit = albedo_lin * np.maximum(target_diffuse, 0.0)
-    if res_pos is not None:
-        base_relit = base_relit + res_pos * 0.25
+    albedo_corr.setflags(write=False)
+    detail_factor.setflags(write=False)
+    with _INTRINSIC_DETAIL_LOCK:
+        _INTRINSIC_DETAIL_CACHE[key] = (albedo_corr, detail_factor)
+        _INTRINSIC_DETAIL_CACHE.move_to_end(key)
+        while len(_INTRINSIC_DETAIL_CACHE) > _INTRINSIC_CACHE_MAX:
+            _INTRINSIC_DETAIL_CACHE.popitem(last=False)
+    return albedo_corr, detail_factor
+
+
+def _get_or_compute_intrinsic_residual(
+    scene: SceneBuffers,
+    settings: EngineSettings,
+    eps: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Multiscale classification of non_diffuse_residual into fine detail, mid sheen, and broad source glare."""
+    if scene.non_diffuse_residual is None:
+        return None
+    key = (
+        _array_digest(scene.rgb_srgb),
+        _array_digest(scene.non_diffuse_residual),
+        float(settings.base_blur_sigma),
+        bool(settings.edge_aware_base),
+        scene.shape,
+    )
+    with _INTRINSIC_DETAIL_LOCK:
+        cached = _INTRINSIC_RESIDUAL_CACHE.get(key)
+        if cached is not None:
+            _INTRINSIC_RESIDUAL_CACHE.move_to_end(key)
+            return cached
+
+    res_pos = np.maximum(scene.non_diffuse_residual, 0.0).astype(np.float32)
+    sigma_fine = 3.0
+    sigma_broad = min(float(settings.base_blur_sigma), 14.0)
+    if settings.edge_aware_base:
+        src = srgb_to_linear(scene.rgb_srgb)
+        log_y_src = np.log(np.maximum(luminance(src), eps)).astype(np.float32)
+        b_fine = np.stack([
+            _joint_guided_filter(res_pos[..., c], log_y_src, sigma_fine, eps_guide=0.008)
+            for c in range(3)
+        ], axis=-1)
+        b_broad = np.stack([
+            _joint_guided_filter(res_pos[..., c], log_y_src, sigma_broad, eps_guide=0.012)
+            for c in range(3)
+        ], axis=-1)
+    else:
+        b_fine = np.stack([gaussian_filter(res_pos[..., c], sigma_fine, mode='reflect') for c in range(3)], axis=-1)
+        b_broad = np.stack([gaussian_filter(res_pos[..., c], sigma_broad, mode='reflect') for c in range(3)], axis=-1)
+
+    res_lobe = np.clip(b_broad, 0.0, res_pos).astype(np.float32)
+    res_fine = np.maximum(res_pos - np.clip(b_fine, 0.0, res_pos), 0.0).astype(np.float32)
+    res_mid = np.maximum(res_pos - res_fine - res_lobe, 0.0).astype(np.float32)
+    for arr in (res_fine, res_mid, res_lobe):
+        arr.setflags(write=False)
+    with _INTRINSIC_DETAIL_LOCK:
+        _INTRINSIC_RESIDUAL_CACHE[key] = (res_fine, res_mid, res_lobe)
+        _INTRINSIC_RESIDUAL_CACHE.move_to_end(key)
+        while len(_INTRINSIC_RESIDUAL_CACHE) > _INTRINSIC_CACHE_MAX:
+            _INTRINSIC_RESIDUAL_CACHE.popitem(last=False)
+    return res_fine, res_mid, res_lobe
+
+
+def _modulate_intrinsic_residual(
+    scene: SceneBuffers,
+    src_lin: np.ndarray,
+    target_diffuse: np.ndarray,
+    geometry_confidence: np.ndarray,
+    settings: EngineSettings,
+    residual_layers: tuple[np.ndarray, np.ndarray, np.ndarray],
+    eps: float = 1e-4,
+) -> np.ndarray:
+    """Modulate multiscale residual layers using shading ratio and decomposition certainty.
+
+    - Fine non-diffuse texture (`res_fine`) responds to the new target illumination.
+    - Broad original source glare (`res_lobe`) stays untinted so old reflections are never
+      painted with the new light's color, and fades cleanly where confident relighting applies.
+    - Uncertain regions (low geometry confidence or clipped highlights) avoid aggressive removal.
+    """
+    res_fine, res_mid, res_lobe = residual_layers
+    t_pos = np.maximum(target_diffuse, 0.0)
+    t_y = luminance(t_pos)
+
+    min_c = float(settings.min_geometry_confidence)
+    conf_geom = np.clip((geometry_confidence - min_c) / 0.35, 0.0, 1.0).astype(np.float32)
+    sat_ambig = np.clip((np.max(src_lin, axis=-1) - 0.88) / 0.12, 0.0, 1.0).astype(np.float32)
+    decomp_conf = conf_geom * (1.0 - 0.50 * sat_ambig)
+
+    if scene.source_shading is not None:
+        sh = scene.source_shading if scene.source_shading.ndim == 2 else luminance(scene.source_shading)
+        active = (scene.depth > 0) & (scene.lightable_mask > 0.05)
+        sh_med = max(float(np.median(sh[active])) if np.any(active) else float(np.median(sh)), eps)
+        s_rel = np.maximum(sh / sh_med, eps)
+        lobe_gate = np.clip(t_y / np.maximum(0.65 * s_rel, 0.35), 0.0, 1.15) * np.clip(t_y / 0.45, 0.0, 1.0)
+    else:
+        lobe_gate = np.clip(t_y / 0.65, 0.0, 1.25)
+
+    # Confident zones suppress broad source glare aggressively in shadows; uncertain zones soften removal.
+    lobe_weight = (0.12 * lobe_gate) * decomp_conf + (0.20 * np.clip(t_y / 0.50, 0.25, 1.0)) * (1.0 - decomp_conf)
+    mid_weight = 0.20 * np.clip(0.35 + 0.65 * t_y, 0.25, 1.30)
+
+    # Fine surface appearance (metal clasps, hair catchlights, wave/fabric micro-texture) preserves
+    # crisp structure under ambient fill while brightening naturally with target illumination.
+    fine_weight = 0.20 + 0.32 * np.clip(t_y, 0.0, 1.30)
+    t_peak = np.maximum(np.max(t_pos, axis=-1, keepdims=True), eps)
+    fine_tint = 0.45 + 0.55 * (t_pos / t_peak)
+    fine_contrib = res_fine * (fine_weight[..., None] * fine_tint)
+    mid_contrib = res_mid * mid_weight[..., None]
+    lobe_contrib = res_lobe * lobe_weight[..., None]
+    return (fine_contrib + mid_contrib + lobe_contrib).astype(np.float32)
+
+
+def _compose_intrinsic_output(
+    scene: SceneBuffers,
+    albedo_corr: np.ndarray,
+    detail_factor: np.ndarray,
+    residual_layers: tuple[np.ndarray, np.ndarray, np.ndarray] | None,
+    target_diffuse: np.ndarray,
+    target_specular: np.ndarray,
+    geometry_confidence: np.ndarray,
+    settings: EngineSettings,
+    eps: float = 1e-4,
+    source_diffuse: np.ndarray | None = None,
+    source_specular: np.ndarray | None = None,
+    target_rig: LightingRig | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shared intrinsic compositing core used by both compose_intrinsic() and RelightSession."""
+    src = srgb_to_linear(scene.rgb_srgb)
+    t_pos, t_spec_eff = _attenuate_background_lighting(
+        scene,
+        target_diffuse,
+        target_specular,
+        settings,
+        source_diffuse=source_diffuse,
+        albedo_lin=albedo_corr,
+        src_lin=src,
+        eps=eps,
+    )
+    t_pos = np.maximum(t_pos, 0.0)
+
+    # Tier 1A: Soften extreme single-channel hue flooding when color_transfer_strength < 1.0.
+    c_strength = float(settings.color_transfer_strength)
+    if c_strength < 1.0 - 1e-6:
+        t_lum = np.maximum(luminance(t_pos), eps)[..., None]
+        t_chroma = t_pos / t_lum
+        t_pos = t_lum * (1.0 + c_strength * (t_chroma - 1.0))
+
+    diffuse_albedo = albedo_corr
+    # Direct/ambient diffuse in evaluate_rig() already attenuates energy by (1 - 0.88 * metalness)
+    # weighted by material_confidence; suppress broad source highlights on metallic zones here instead.
+    base_relit = diffuse_albedo * t_pos
+    if residual_layers is not None:
+        base_relit = base_relit + _modulate_intrinsic_residual(
+            scene, src, t_pos, geometry_confidence, settings, residual_layers, eps=eps
+        )
     relit = base_relit * detail_factor * settings.output_exposure
-    relit = relit + np.maximum(target_specular, 0.0) * settings.specular_scale
+    spec_conf = np.clip((geometry_confidence - float(settings.min_geometry_confidence)) / 0.30, 0.0, 1.0)
+    spec_add = np.maximum(t_spec_eff, 0.0) * (spec_conf[..., None] * settings.specular_scale)
+    if float(settings.highlight_relocation_strength) > 0.0:
+        spec_add = spec_add * (1.0 + 0.55 * float(settings.highlight_relocation_strength))
+    relit = relit + spec_add
+
+    # Tier 1C: Anchor intrinsic relight to real photographic luminance/chroma delta when requested.
+    real_pres = float(settings.real_image_preservation)
+    if real_pres > 0.0 and source_diffuse is not None:
+        src_delta_srgb, _ = compose_source_preserving(
+            scene,
+            source_diffuse,
+            t_pos,
+            source_specular if source_specular is not None else np.zeros_like(t_spec_eff),
+            t_spec_eff,
+            geometry_confidence,
+            EngineSettings(
+                base_blur_sigma=settings.base_blur_sigma,
+                detail_power=settings.detail_power,
+                ratio_min=settings.ratio_min,
+                ratio_max=settings.ratio_max,
+                color_ratio_min=settings.color_ratio_min,
+                color_ratio_max=settings.color_ratio_max,
+                specular_scale=settings.specular_scale,
+                min_geometry_confidence=settings.min_geometry_confidence,
+                output_exposure=settings.output_exposure,
+                edge_aware_base=settings.edge_aware_base,
+                detail_preservation_mode="baseline",
+                detail_lock_strength=settings.detail_lock_strength,
+                preserve_source_lighting=settings.preserve_source_lighting,
+                lighting_smooth_sigma=settings.lighting_smooth_sigma,
+                color_transfer_strength=settings.color_transfer_strength,
+                background_light_influence=1.0,  # already attenuated on t_pos / t_spec_eff
+                real_image_preservation=real_pres,
+                highlight_relocation_strength=settings.highlight_relocation_strength,
+                filmic_highlight_rolloff=False,
+            ),
+            target_rig=target_rig,
+        )
+        src_delta_lin = srgb_to_linear(src_delta_srgb)
+        relit = (1.0 - real_pres) * relit + real_pres * src_delta_lin
+
+    if settings.detail_preservation_mode == "wavelet":
+        relit = compose_wavelet_identity_lock(
+            src,
+            relit,
+            levels=settings.wavelet_levels,
+            detail_lock_strength=settings.detail_lock_strength,
+            mid_blend=settings.wavelet_mid_blend,
+            eps=eps,
+        )
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]
     relit = _apply_highlight_shoulder(relit, src, eps, filmic=bool(settings.filmic_highlight_rolloff))
 
-    t_y = np.maximum(luminance(target_diffuse), eps)
+    t_y = np.maximum(luminance(t_pos), eps)
     if scene.source_shading is not None:
         sh = scene.source_shading[..., None] if scene.source_shading.ndim == 2 else scene.source_shading
         s_y = np.maximum(luminance(np.broadcast_to(sh, (*scene.shape, 3))), eps)
@@ -240,6 +746,39 @@ def compose_intrinsic(
     else:
         ratio = np.clip(t_y, settings.ratio_min, settings.ratio_max)
     return linear_to_srgb(relit).astype(np.float32), ratio.astype(np.float32)
+
+
+def compose_intrinsic(
+    scene: SceneBuffers,
+    target_diffuse: np.ndarray,
+    target_specular: np.ndarray,
+    geometry_confidence: np.ndarray,
+    settings: EngineSettings,
+    *,
+    source_diffuse: np.ndarray | None = None,
+    source_specular: np.ndarray | None = None,
+    target_rig: LightingRig | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Re-render from estimated albedo + target shading while locking source high-frequency detail."""
+    if scene.albedo is None:
+        raise ValueError("compose_intrinsic requires scene.albedo.")
+    eps = 1e-4
+    albedo_corr, detail_factor = _get_or_compute_intrinsic_priors(scene, settings, eps=eps)
+    residual_layers = _get_or_compute_intrinsic_residual(scene, settings, eps=eps)
+    return _compose_intrinsic_output(
+        scene,
+        albedo_corr,
+        detail_factor,
+        residual_layers,
+        target_diffuse,
+        target_specular,
+        geometry_confidence,
+        settings,
+        eps=eps,
+        source_diffuse=source_diffuse,
+        source_specular=source_specular,
+        target_rig=target_rig,
+    )
 
 
 def compose_hybrid_neural(
@@ -253,19 +792,29 @@ def compose_hybrid_neural(
     neural_lin = srgb_to_linear(neural_rgb_srgb)
     eps = 1e-4
 
-    y_src = np.maximum(luminance(src), eps)
-    log_y_src = np.log(y_src)
-    log_detail_src = np.clip(log_y_src - _compute_log_base(log_y_src, settings), -1.5, 1.5)
+    if settings.detail_preservation_mode == "wavelet":
+        relit = compose_wavelet_identity_lock(
+            src,
+            neural_lin,
+            levels=settings.wavelet_levels,
+            detail_lock_strength=settings.detail_lock_strength,
+            mid_blend=settings.wavelet_mid_blend,
+            eps=eps,
+        ) * settings.output_exposure
+    else:
+        y_src = np.maximum(luminance(src), eps)
+        log_y_src = np.log(y_src)
+        log_detail_src = np.clip(log_y_src - _compute_log_base(log_y_src, settings), -1.5, 1.5)
 
-    y_neu = np.maximum(luminance(neural_lin), eps)
-    log_y_neu = np.log(y_neu)
-    log_base_neu = _compute_log_base(log_y_neu, settings)
-    log_detail_neu = np.clip(log_y_neu - log_base_neu, -1.5, 1.5)
+        y_neu = np.maximum(luminance(neural_lin), eps)
+        log_y_neu = np.log(y_neu)
+        log_base_neu = _compute_log_base(log_y_neu, settings)
+        log_detail_neu = np.clip(log_y_neu - log_base_neu, -1.5, 1.5)
 
-    alpha_detail = float(settings.detail_lock_strength)
-    log_y_locked = log_base_neu + alpha_detail * log_detail_src + (1.0 - alpha_detail) * log_detail_neu
-    y_locked = np.maximum(np.exp(log_y_locked), eps)
-    relit = neural_lin * (y_locked / y_neu)[..., None] * settings.output_exposure
+        alpha_detail = float(settings.detail_lock_strength)
+        log_y_locked = log_base_neu + alpha_detail * log_detail_src + (1.0 - alpha_detail) * log_detail_neu
+        y_locked = np.maximum(np.exp(log_y_locked), eps)
+        relit = neural_lin * (y_locked / y_neu)[..., None] * settings.output_exposure
 
     mask = _active_blend_mask(scene, geometry_confidence, settings)
     relit = src * (1 - mask[..., None]) + relit * mask[..., None]

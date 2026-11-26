@@ -1,7 +1,7 @@
-from .contracts import CameraModel, SceneBuffers, Light, LightingRig, EngineSettings, RelightResult
-from .engine import relight
+from .contracts import CameraModel, SceneBuffers, Light, LightingRig, EnvironmentLight, EngineSettings, RelightResult
+from .engine import relight, RelightSession, prepare_relight_session
 
-__all__ = ['CameraModel', 'SceneBuffers', 'Light', 'LightingRig', 'EngineSettings', 'RelightResult', 'relight']
+__all__ = ['CameraModel', 'SceneBuffers', 'Light', 'LightingRig', 'EnvironmentLight', 'EngineSettings', 'RelightResult', 'relight', 'RelightSession', 'prepare_relight_session']
 
 from .calibration import SourceLightCalibration, MaterialAssignment, MaterialMaps, build_material_maps, kelvin_to_linear_rgb
 

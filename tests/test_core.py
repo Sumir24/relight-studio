@@ -233,6 +233,18 @@ def test_zero_material_confidence_blends_supplied_maps_to_declared_priors():
     assert np.allclose(supplied_specular, prior_specular, atol=1e-7)
 
 
+def test_effective_material_maps_broadcasts_specular_color_consistently():
+    from relight_engine.lighting import _effective_material_maps
+    scene, _ = make_plane()
+    # 2D monochrome specular color
+    scene.specular_color = np.full(scene.shape, 0.45, dtype=np.float32)
+    *_, spec_col_resolved, _, _, _ = _effective_material_maps(scene)
+    assert spec_col_resolved.shape == (*scene.shape, 3)
+    assert np.allclose(spec_col_resolved[..., 0], 0.45)
+    assert np.allclose(spec_col_resolved[..., 1], 0.45)
+    assert np.allclose(spec_col_resolved[..., 2], 0.45)
+
+
 def test_scene_contract_rejects_invalid_material_map_shapes_and_values():
     scene, _ = make_plane()
     scene.specular_color = np.zeros((*scene.shape, 4), dtype=np.float32)
@@ -635,7 +647,39 @@ def test_hybrid_neural_rejects_bad_shape_nonfinite_and_out_of_range():
         relight(scene, camera, rig, rig, settings, neural_relighter=_BadRelighter(bad_range))
 
 
-def test_auto_mode_defaults_to_source_preserving_ratio_even_when_albedo_present():
+def test_auto_mode_selects_intrinsic_when_albedo_available():
+    from relight_engine.color import linear_to_srgb
+
+    h, w = 24, 32
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    albedo_lin = np.full((h, w, 3), 0.50, dtype=np.float32)
+    source_sh = np.full((h, w), 0.35, dtype=np.float32)
+    rgb = linear_to_srgb(albedo_lin * source_sh[..., None])
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    scene = SceneBuffers(
+        rgb_srgb=rgb,
+        depth=np.full((h, w), 2.0, dtype=np.float32),
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=source_sh,
+        non_diffuse_residual=np.full((h, w, 3), 0.05, dtype=np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    rig = LightingRig(ambient_strength=0.2, lights=(
+        Light("key", "directional", strength=0.8, direction=(0.0, 0.0, -1.0), casts_shadows=False),
+    ))
+    res_auto = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="auto", base_blur_sigma=4.0))
+    res_intr = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="intrinsic", base_blur_sigma=4.0))
+    assert res_auto.metrics["renderer_mode"] == "intrinsic"
+    assert np.allclose(res_auto.rgb_srgb, res_intr.rgb_srgb, atol=0.0, rtol=0.0)
+
+
+def test_auto_mode_falls_back_to_ratio_when_albedo_missing():
     h, w = 24, 32
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     rgb = np.clip(0.45 + 0.15 * np.sin(xx * 0.4) * np.cos(yy * 0.3), 0.0, 1.0)[..., None]
@@ -650,17 +694,47 @@ def test_auto_mode_defaults_to_source_preserving_ratio_even_when_albedo_present(
         depth_kind="relative",
         normals=normals,
         geometry_confidence=np.ones((h, w), dtype=np.float32),
-        # Intentionally flat blurry albedo — auto mode must keep original rgb identity
-        albedo=np.full((h, w, 3), 0.5, dtype=np.float32),
+        albedo=None,
         source_shading=np.ones((h, w), dtype=np.float32),
     )
     camera = CameraModel(60.0, 60.0, w / 2, h / 2)
     rig = LightingRig(ambient_strength=0.2, lights=(
         Light("key", "directional", strength=0.8, direction=(0.0, 0.0, -1.0), casts_shadows=False),
     ))
-    res = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="auto"))
-    assert res.metrics["renderer_mode"] == "ratio"
-    assert np.allclose(res.rgb_srgb, rgb, atol=1e-4)
+    res_auto = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="auto"))
+    res_ratio = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="ratio"))
+    assert res_auto.metrics["renderer_mode"] == "ratio"
+    assert np.allclose(res_auto.rgb_srgb, res_ratio.rgb_srgb, atol=0.0, rtol=0.0)
+    assert np.allclose(res_auto.rgb_srgb, rgb, atol=1e-4)
+
+
+def test_explicit_ratio_mode_overrides_available_intrinsic_buffers():
+    from relight_engine.color import linear_to_srgb
+
+    h, w = 24, 32
+    albedo_lin = np.full((h, w, 3), 0.50, dtype=np.float32)
+    source_sh = np.full((h, w), 0.35, dtype=np.float32)
+    rgb = linear_to_srgb(albedo_lin * source_sh[..., None])
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    scene = SceneBuffers(
+        rgb_srgb=rgb,
+        depth=np.full((h, w), 2.0, dtype=np.float32),
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=source_sh,
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    rig = LightingRig(ambient_strength=0.2, lights=(
+        Light("key", "directional", strength=0.8, direction=(0.0, 0.0, -1.0), casts_shadows=False),
+    ))
+    res_ratio = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="ratio", base_blur_sigma=4.0))
+    assert res_ratio.metrics["renderer_mode"] == "ratio"
+    assert np.allclose(res_ratio.rgb_srgb, rgb, atol=1e-4)
 
 
 def test_preserve_source_lighting_adds_colored_point_light_leaving_shadow_unchanged():
@@ -1025,3 +1099,497 @@ def test_pcss_light_radius_softens_far_shadow_more_than_contact_shadow():
     vis_soft = ray_visibility(points, normals, depth, camera, to_light, max_dist, "relative", EngineSettings(shadow_steps=20), light_radius=0.35)
     # Soft radius light introduces smooth gradient differences across penumbra boundary
     assert float(np.max(np.abs(vis_soft - vis_hard))) > 0.05
+
+
+def test_intrinsic_chroma_preservation_restores_fine_color_detail_without_source_casts_or_halos():
+    from relight_engine.color import linear_to_srgb, luminance, srgb_to_linear
+
+    h, w = 48, 64
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+
+    # 1. Fine high-frequency chromatic variation in source RGB (alternating warm/cool stripes)
+    #    while predicted albedo is spatially smoothed neutral grey.
+    albedo_lin = np.full((h, w, 3), 0.35, dtype=np.float32)
+    stripe = np.sin(xx * 1.4)
+    src_lin = albedo_lin.copy()
+    src_lin[..., 0] += 0.10 * stripe
+    src_lin[..., 2] -= 0.10 * stripe
+    src_lin = np.clip(src_lin, 0.01, 0.99)
+    scene_fine = SceneBuffers(
+        rgb_srgb=linear_to_srgb(src_lin),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), np.float32),
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=np.ones((h, w), np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    rig_dim = LightingRig(ambient_strength=0.15, lights=(
+        Light("key", "directional", direction=(0.0, 0.0, -1.0), strength=0.35, casts_shadows=False),
+    ))
+    rig_bright = LightingRig(ambient_strength=0.25, lights=(
+        Light("key", "directional", direction=(0.0, 0.0, -1.0), strength=0.95, casts_shadows=False),
+    ))
+    res_fine = relight(scene_fine, camera, rig_bright, rig_bright, EngineSettings(renderer_mode="intrinsic", base_blur_sigma=8.0))
+    res_dim = relight(scene_fine, camera, rig_bright, rig_dim, EngineSettings(renderer_mode="intrinsic", base_blur_sigma=8.0))
+
+    # Fine R-B chromatic oscillation must survive instead of collapsing to neutral grey
+    rb_diff = res_fine.rgb_srgb[12:36, 12:52, 0] - res_fine.rgb_srgb[12:36, 12:52, 2]
+    assert float(np.std(rb_diff)) > 0.04
+    # Relighting still changes luminance according to requested target rig
+    assert float(np.mean(luminance(srgb_to_linear(res_fine.rgb_srgb)))) > float(np.mean(luminance(srgb_to_linear(res_dim.rgb_srgb)))) + 0.12
+
+    # 2. Broad low-frequency source color cast gradient on smooth albedo must NOT be inherited
+    grad = np.linspace(-0.08, 0.08, w, dtype=np.float32)[None, :]
+    cast_lin = albedo_lin.copy()
+    cast_lin[..., 0] += grad
+    cast_lin[..., 2] -= grad
+    scene_cast = SceneBuffers(
+        rgb_srgb=linear_to_srgb(np.clip(cast_lin, 0.01, 0.99)),
+        depth=scene_fine.depth,
+        depth_confidence=scene_fine.depth_confidence,
+        lightable_mask=scene_fine.lightable_mask,
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=scene_fine.geometry_confidence,
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=np.ones((h, w), np.float32),
+    )
+    res_cast = relight(scene_cast, camera, rig_bright, rig_bright, EngineSettings(renderer_mode="intrinsic", base_blur_sigma=8.0))
+    left_rb = float(np.mean(res_cast.rgb_srgb[8:40, 4:12, 0] - res_cast.rgb_srgb[8:40, 4:12, 2]))
+    right_rb = float(np.mean(res_cast.rgb_srgb[8:40, w - 12 : w - 4, 0] - res_cast.rgb_srgb[8:40, w - 12 : w - 4, 2]))
+    assert abs(right_rb - left_rb) < 0.04
+
+    # 3. Sharp step edge between vivid red object and neutral grey background must not produce color halos
+    step_lin = np.full((h, w, 3), 0.35, dtype=np.float32)
+    step_lin[:, : w // 2] = np.array([0.55, 0.20, 0.20], dtype=np.float32)
+    protected = np.zeros((h, w), dtype=np.float32)
+    protected[:6, :] = 1.0
+    scene_step = SceneBuffers(
+        rgb_srgb=linear_to_srgb(step_lin),
+        depth=scene_fine.depth,
+        depth_confidence=scene_fine.depth_confidence,
+        lightable_mask=1.0 - protected,
+        protected_mask=protected,
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=scene_fine.geometry_confidence,
+        albedo=linear_to_srgb(step_lin),
+        source_shading=np.ones((h, w), np.float32),
+    )
+    res_step = relight(scene_step, camera, rig_bright, rig_bright, EngineSettings(renderer_mode="intrinsic", base_blur_sigma=8.0))
+    # Protected rows remain exact
+    assert np.allclose(res_step.rgb_srgb[:6, :], scene_step.rgb_srgb[:6, :], atol=1e-6)
+    # Neutral right side near the boundary (w//2 + 2) stays neutral without red halo bleed
+    near_edge_rb = float(np.mean(res_step.rgb_srgb[12:36, w // 2 + 1 : w // 2 + 5, 0] - res_step.rgb_srgb[12:36, w // 2 + 1 : w // 2 + 5, 2]))
+    assert abs(near_edge_rb) < 0.015
+
+    # 4. Exact no-op when albedo matches src / source_shading and target_rig == unit shading
+    unit_rig = LightingRig(ambient_strength=1.0, lights=())
+    res_noop = relight(scene_step, camera, unit_rig, unit_rig, EngineSettings(renderer_mode="intrinsic", base_blur_sigma=8.0))
+    assert np.allclose(res_noop.rgb_srgb, scene_step.rgb_srgb, atol=1e-4)
+
+
+def test_optional_f3_detail_mode_and_cache_invalidation():
+    from relight_engine.color import linear_to_srgb, luminance, srgb_to_linear
+
+    h, w = 48, 64
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+
+    # Texture combining medium-scale structure (~10px) and fine detail (~3px) smoothed out of albedo
+    texture = 0.06 * np.sin(xx * 0.6) + 0.05 * np.sin(xx * 1.8) * np.cos(yy * 1.2)
+    src_lin = np.clip(0.38 + texture, 0.02, 0.98)[..., None].repeat(3, axis=-1).astype(np.float32)
+    albedo_lin = np.full((h, w, 3), 0.38, dtype=np.float32)
+    protected = np.zeros((h, w), dtype=np.float32)
+    protected[:6, :] = 1.0
+
+    scene = SceneBuffers(
+        rgb_srgb=linear_to_srgb(src_lin),
+        depth=np.full((h, w), 2.0, dtype=np.float32),
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=1.0 - protected,
+        protected_mask=protected,
+        alpha_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=np.ones((h, w), dtype=np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    rig_a = LightingRig(ambient_strength=0.2, lights=(
+        Light("key_r", "directional", direction=(0.6, 0.2, -0.7), strength=0.9, casts_shadows=False),
+    ))
+    rig_b = LightingRig(ambient_strength=0.2, lights=(
+        Light("key_l", "directional", direction=(-0.6, 0.2, -0.7), strength=1.2, casts_shadows=False),
+    ))
+
+    # Default stays 'baseline'
+    assert EngineSettings().detail_preservation_mode == "baseline"
+    res_def = relight(scene, camera, rig_a, rig_a, EngineSettings(renderer_mode="intrinsic"))
+    res_base = relight(scene, camera, rig_a, rig_a, EngineSettings(renderer_mode="intrinsic", detail_preservation_mode="baseline"))
+    assert np.allclose(res_def.rgb_srgb, res_base.rgb_srgb, atol=0.0, rtol=0.0)
+
+    # F3 recovers more structured luminance variation than baseline while keeping protected pixels exact
+    res_f3_a = relight(scene, camera, rig_a, rig_a, EngineSettings(renderer_mode="intrinsic", detail_preservation_mode="f3"))
+    assert np.allclose(res_f3_a.rgb_srgb[:6, :], scene.rgb_srgb[:6, :], atol=1e-6)
+    std_base = float(np.std(res_base.rgb_srgb[12:40, 12:52]))
+    std_f3 = float(np.std(res_f3_a.rgb_srgb[12:40, 12:52]))
+    assert std_f3 >= std_base
+
+    # Cache hit on different target rig keeps exact lighting response & invalidates on buffer mutation
+    res_f3_b = relight(scene, camera, rig_a, rig_b, EngineSettings(renderer_mode="intrinsic", detail_preservation_mode="f3"))
+    assert float(np.mean(luminance(srgb_to_linear(res_f3_b.rgb_srgb[12:40, :])))) != pytest.approx(
+        float(np.mean(luminance(srgb_to_linear(res_f3_a.rgb_srgb[12:40, :])))), abs=1e-3
+    )
+
+    scene.albedo[:] = linear_to_srgb(np.full((h, w, 3), 0.62, dtype=np.float32))
+    res_mutated = relight(scene, camera, rig_a, rig_a, EngineSettings(renderer_mode="intrinsic", detail_preservation_mode="f3"))
+    assert float(np.mean(res_mutated.rgb_srgb[12:40, 12:52])) > float(np.mean(res_f3_a.rgb_srgb[12:40, 12:52])) + 0.05
+
+    # Ratio renderer remains unaffected regardless of detail_preservation_mode
+    res_ratio_base = relight(scene, camera, rig_a, rig_b, EngineSettings(renderer_mode="ratio", detail_preservation_mode="baseline"))
+    res_ratio_f3 = relight(scene, camera, rig_a, rig_b, EngineSettings(renderer_mode="ratio", detail_preservation_mode="f3"))
+    assert np.allclose(res_ratio_base.rgb_srgb, res_ratio_f3.rgb_srgb, atol=0.0, rtol=0.0)
+
+
+def test_adaptive_bias_suppresses_grazing_acne_while_preserving_contact_shadows():
+    h, w = 96, 96
+    camera = CameraModel(120.0, 120.0, w / 2, h / 2)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx_px = xx - 48.0
+    dy_px = yy - 48.0
+    r2 = dx_px * dx_px + dy_px * dy_px
+    r_px = 20.0
+    inside = r2 < r_px * r_px
+    bg_z = np.full((h, w), 3.2, dtype=np.float32)
+    dome = np.where(inside, np.sqrt(np.maximum(r_px * r_px - r2, 0.0)) * (3.2 / 120.0), 0.0)
+    depth = (bg_z - dome).astype(np.float32)
+    points = backproject_depth(depth, camera)
+    normals, _ = estimate_normals(points, depth, np.ones((h, w), dtype=np.float32))
+
+    # Grazing light from right (+X)
+    l_dir = np.array([0.85, 0.20, -0.49], dtype=np.float32)
+    l_dir /= np.linalg.norm(l_dir)
+    to_light = np.broadcast_to(l_dir, (h, w, 3))
+    ndotl = np.sum(normals * l_dir, axis=-1)
+
+    vis_adaptive = ray_visibility(
+        points, normals, depth, camera, to_light, np.full((h, w), 3.0, np.float32),
+        "relative", EngineSettings(shadow_steps=24, shadow_adaptive_sampling=True),
+        depth_confidence=np.full((h, w), 0.45, dtype=np.float32),
+    )
+    vis_dense = ray_visibility(
+        points, normals, depth, camera, to_light, np.full((h, w), 3.0, np.float32),
+        "relative", EngineSettings(shadow_steps=24, shadow_adaptive_sampling=False),
+        depth_confidence=np.full((h, w), 0.45, dtype=np.float32),
+    )
+
+    grazing_lit = inside & (dx_px > 0) & (ndotl > 0.05) & (ndotl < 0.30)
+    contact_shadow = (~inside) & (np.abs(dy_px) < 8.0) & (dx_px < -r_px - 1.0) & (dx_px > -r_px - 6.0)
+    assert float(np.mean(vis_adaptive[grazing_lit])) > 0.90
+    assert float(np.mean(vis_adaptive[contact_shadow])) < 0.45
+    assert float(np.mean(np.abs(vis_adaptive - vis_dense))) < 0.02
+
+
+def test_preview_and_final_quality_modes_and_lighting_scale_metrics():
+    h, w = 80, 96
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    depth = np.where(xx < 40, 1.8, 3.4).astype(np.float32)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    protected = np.zeros((h, w), dtype=np.float32)
+    protected[:8, :] = 1.0
+    alpha = np.full((h, w), 0.75, dtype=np.float32)
+    scene = SceneBuffers(
+        rgb_srgb=np.full((h, w, 3), 0.42, dtype=np.float32),
+        depth=depth,
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=1.0 - protected,
+        protected_mask=protected,
+        alpha_mask=alpha,
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+        albedo=np.full((h, w, 3), 0.50, dtype=np.float32),
+        source_shading=np.ones((h, w), dtype=np.float32),
+    )
+    camera = CameraModel(80.0, 80.0, w / 2, h / 2)
+    src_rig = LightingRig(ambient_strength=0.4, lights=(Light("s", "directional", direction=(0, 0, -1), casts_shadows=False),))
+    tgt_rig = LightingRig(ambient_strength=0.15, lights=(Light("k", "directional", direction=(-0.7, 0.1, -0.7), strength=1.2, casts_shadows=True),))
+
+    # Preview with depth-guided upsampling preserves full output resolution & protected pixels
+    res_prev_up = relight(
+        scene, camera, src_rig, tgt_rig,
+        EngineSettings(quality_mode="preview", preview_max_side=48, preview_upsample=True),
+    )
+    assert res_prev_up.rgb_srgb.shape == (h, w, 3)
+    assert res_prev_up.metrics["quality_mode"] == "preview"
+    assert res_prev_up.metrics["preview_downscaled"] is True
+    assert res_prev_up.metrics["preview_upsampled"] is True
+    assert res_prev_up.metrics["shadow_steps_effective"] == 12
+    assert np.allclose(res_prev_up.rgb_srgb[:8, :], scene.rgb_srgb[:8, :], atol=1e-6)
+    assert res_prev_up.metrics["lighting_scale"]["calibrated_metric_scale"] is False
+
+    # Native downscaled preview without upsampling
+    res_prev_lo = relight(
+        scene, camera, src_rig, tgt_rig,
+        EngineSettings(quality_mode="preview", preview_max_side=48, preview_upsample=False),
+    )
+    assert max(res_prev_lo.rgb_srgb.shape[:2]) == 48
+    assert res_prev_lo.metrics["preview_downscaled"] is True
+    assert res_prev_lo.metrics["preview_upsampled"] is False
+
+    # Final quality mode runs at full res with >= 48 shadow steps
+    res_final = relight(
+        scene, camera, src_rig, tgt_rig,
+        EngineSettings(quality_mode="final"),
+    )
+    assert res_final.rgb_srgb.shape == (h, w, 3)
+    assert res_final.metrics["quality_mode"] == "final"
+    assert res_final.metrics["shadow_steps_effective"] >= 48
+    assert float(np.mean(np.abs(res_prev_up.rgb_srgb - res_final.rgb_srgb))) < 0.04
+
+    # RelightSession caches scene geometry/priors and reproduces relight() cleanly
+    from relight_engine import prepare_relight_session
+    session = prepare_relight_session(
+        scene, camera, src_rig,
+        EngineSettings(quality_mode="standard"), preview_max_side=48,
+    )
+    sess_prev_up = session.render(tgt_rig, EngineSettings(quality_mode="preview", preview_max_side=48, preview_upsample=True))
+    sess_prev_lo = session.render(tgt_rig, EngineSettings(quality_mode="preview", preview_max_side=48, preview_upsample=False))
+    sess_final = session.render(tgt_rig, EngineSettings(quality_mode="final"))
+    assert sess_prev_up.metrics["session_cached"] is True
+    assert np.allclose(sess_prev_up.rgb_srgb, res_prev_up.rgb_srgb, atol=1e-5)
+    assert np.allclose(sess_prev_lo.rgb_srgb, res_prev_lo.rgb_srgb, atol=1e-5)
+    assert np.allclose(sess_final.rgb_srgb, res_final.rgb_srgb, atol=1e-5)
+
+
+def test_phase6_intrinsic_residual_separation_suppresses_shadow_glare_and_tints_with_target():
+    from relight_engine.color import linear_to_srgb
+    from relight_engine import prepare_relight_session
+
+    h, w = 32, 48
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    depth = np.full((h, w), 3.0, dtype=np.float32)
+    # Near blocker column on center-left so right half falls into cast shadow from left directional light
+    depth[:, 18:22] = 1.2
+    albedo_lin = np.full((h, w, 3), 0.35, dtype=np.float32)
+    residual = np.full((h, w, 3), 0.80, dtype=np.float32)  # strong baked white source specular glare
+    source_sh = np.full((h, w), 1.0, dtype=np.float32)
+
+    scene = SceneBuffers(
+        rgb_srgb=linear_to_srgb(np.clip(albedo_lin * source_sh[..., None] + residual * 0.2, 0.0, 1.0)),
+        depth=depth,
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=source_sh,
+        non_diffuse_residual=residual,
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src_rig = LightingRig(ambient_strength=0.3, lights=(
+        Light("src", "directional", direction=(0.0, 0.0, -1.0), strength=0.7, casts_shadows=False),
+    ))
+    red_rig = LightingRig(ambient_color=(0.08, 0.04, 0.04), ambient_strength=0.08, lights=(
+        Light("red_left", "directional", direction=(-0.85, 0.0, -0.52), color=(1.0, 0.05, 0.08), strength=1.5, casts_shadows=True),
+    ))
+    res = relight(scene, camera, src_rig, red_rig, EngineSettings(renderer_mode="intrinsic"))
+    session = prepare_relight_session(scene, camera, src_rig, EngineSettings(renderer_mode="intrinsic"))
+    res_sess = session.render(red_rig)
+    assert np.allclose(res.rgb_srgb, res_sess.rgb_srgb, atol=1e-5)
+
+    # Lit left patch takes vivid red illumination; shadowed right patch stays dark without a 0.25x white glare floor
+    lit_px = res.rgb_srgb[16, 8]
+    shadow_px = res.rgb_srgb[16, 36]
+    assert float(lit_px[0] - lit_px[2]) > 0.25
+    assert float(np.mean(shadow_px)) < 0.16
+
+
+def test_phase6_ratio_renderer_avoids_global_red_tint_and_suppresses_old_white_glare():
+    h, w = 40, 64
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    depth = np.full((h, w), 3.0, dtype=np.float32)
+    depth[:, 24:28] = 1.2  # casts shadow onto right half from left red light
+    rgb = np.full((h, w, 3), 0.35, dtype=np.float32)
+    # Baked white highlight blob inside the shadowed right zone
+    rgb[12:28, 42:54] = 0.92
+    scene = SceneBuffers(
+        rgb_srgb=rgb,
+        depth=depth,
+        depth_confidence=np.ones((h, w), dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), dtype=np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src_rig = LightingRig(ambient_strength=0.6, lights=(
+        Light("src", "directional", direction=(0.0, 0.0, -1.0), strength=0.6, casts_shadows=False),
+    ))
+    red_rig = LightingRig(ambient_color=(0.1, 0.02, 0.03), ambient_strength=0.10, lights=(
+        Light("red_left", "directional", direction=(-0.85, 0.0, -0.52), color=(1.0, 0.05, 0.10), strength=2.4, casts_shadows=True),
+    ))
+    res = relight(scene, camera, src_rig, red_rig, EngineSettings(renderer_mode="ratio", base_blur_sigma=4.0))
+    lit_px = res.rgb_srgb[20, 10]
+    shadow_old_blob = res.rgb_srgb[20, 48]
+    # Lit side glows red while the shadowed old white blob stays dark and neutral rather than turning into a red spotlight
+    assert float(lit_px[0] - lit_px[2]) > 0.25
+    assert float(shadow_old_blob[0]) < float(lit_px[0]) * 0.70
+    assert float(shadow_old_blob[0] - shadow_old_blob[2]) < 0.03
+
+
+def test_phase7_observability_reports_ratio_fallback_and_intrinsic_paths():
+    scene, camera = make_plane()
+    rig = LightingRig(ambient_strength=0.2, lights=(
+        Light("key", "directional", direction=(0.0, 0.0, -1.0), strength=1.0, casts_shadows=False),
+    ))
+    res_fallback = relight(scene, camera, rig, rig, EngineSettings(renderer_mode="auto"))
+    assert res_fallback.metrics["requested_renderer_mode"] == "auto"
+    assert res_fallback.metrics["renderer_mode"] == "ratio"
+    assert res_fallback.metrics["fallback_reason"] == "intrinsic_albedo_unavailable_using_ratio_fallback"
+    assert res_fallback.metrics["scene_buffers_available"]["albedo"] is False
+    assert res_fallback.metrics["residual_decomposition_active"] is False
+    assert res_fallback.metrics["environment_lighting_active"] is False
+    assert res_fallback.metrics["active_specular_path"] == "authored_material_ggx"
+
+    scene_intr = SceneBuffers(
+        rgb_srgb=scene.rgb_srgb, depth=scene.depth, depth_confidence=scene.depth_confidence,
+        lightable_mask=scene.lightable_mask, depth_kind="relative",
+        albedo=scene.rgb_srgb, source_shading=np.ones(scene.shape, np.float32),
+        non_diffuse_residual=np.full((*scene.shape, 3), 0.08, np.float32),
+    )
+    res_intr = relight(scene_intr, camera, rig, rig, EngineSettings(renderer_mode="auto"))
+    assert res_intr.metrics["renderer_mode"] == "intrinsic"
+    assert res_intr.metrics["fallback_reason"] is None
+    assert res_intr.metrics["residual_decomposition_active"] is True
+    assert res_intr.metrics["active_specular_path"] == "conservative_prior_dielectric_ggx"
+
+
+def test_phase7_environment_light_studio_probe_and_validation():
+    from relight_engine import EnvironmentLight
+
+    scene, camera = make_plane()
+    scene.roughness[:] = 0.18
+    scene.metalness[:] = 1.0
+    scene.specular_color = np.full((*scene.shape, 3), 0.85, dtype=np.float32)
+    pts = backproject_depth(scene.depth, camera)
+    nrm = np.zeros_like(pts)
+    nrm[..., 2] = -1.0
+
+    env = EnvironmentLight(
+        sky_color=(0.4, 0.7, 1.0),
+        horizon_color=(0.8, 0.85, 0.9),
+        ground_color=(0.2, 0.15, 0.1),
+        strength=0.6,
+        key_azimuth_deg=0.0,
+        key_elevation_deg=0.0,
+        key_color=(1.0, 0.85, 0.7),
+        key_strength=1.2,
+        key_sharpness=8.0,
+    )
+    rig_no_env = LightingRig(ambient_strength=0.05, lights=())
+    rig_with_env = LightingRig(ambient_strength=0.05, lights=(), environment=env)
+
+    d0, s0, _ = evaluate_rig(scene, camera, pts, nrm, rig_no_env, EngineSettings())
+    d1, s1, _ = evaluate_rig(scene, camera, pts, nrm, rig_with_env, EngineSettings())
+    assert float(np.mean(s1)) > float(np.mean(s0)) + 0.25
+    res_env = relight(scene, camera, rig_no_env, rig_with_env)
+    assert res_env.metrics["environment_lighting_active"] is True
+    assert "+environment_ibl" in res_env.metrics["active_specular_path"]
+
+    with pytest.raises(ValueError, match="key_sharpness"):
+        EnvironmentLight(key_sharpness=0.0).validate()
+
+
+def test_phase7_ratio_preserves_bright_diffuse_surfaces_without_darkening():
+    h, w = 24, 32
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    # Uniform bright white wall / shirt albedo (0.78 sRGB ~ 0.57 linear) must stay bright under equal-strength directional relight
+    rgb = np.full((h, w, 3), 0.78, dtype=np.float32)
+    scene = SceneBuffers(
+        rgb_srgb=rgb, depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.ones((h, w), np.float32), lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative", normals=normals, geometry_confidence=np.ones((h, w), np.float32),
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src = LightingRig(ambient_strength=0.3, lights=(Light("s", "directional", direction=(0, 0, -1), strength=0.7, casts_shadows=False),))
+    tgt = LightingRig(ambient_strength=0.3, lights=(Light("t", "directional", direction=(-0.5, 0.2, -0.84), strength=0.83, casts_shadows=False),))
+    res = relight(scene, camera, src, tgt, EngineSettings(renderer_mode="ratio"))
+    assert abs(float(np.mean(res.rgb_srgb)) - 0.78) < 0.05
+
+
+def test_phase7_intrinsic_residual_untinted_glare_and_low_conf_guard():
+    from relight_engine.color import linear_to_srgb
+
+    h, w = 32, 48
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    albedo_lin = np.full((h, w, 3), 0.25, dtype=np.float32)
+    # Broad white source reflection in non_diffuse_residual
+    residual = np.full((h, w, 3), 0.50, dtype=np.float32)
+    scene = SceneBuffers(
+        rgb_srgb=linear_to_srgb(np.clip(albedo_lin + residual * 0.5, 0.0, 1.0)),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.ones((h, w), np.float32),
+        albedo=linear_to_srgb(albedo_lin),
+        source_shading=np.ones((h, w), np.float32),
+        non_diffuse_residual=residual,
+    )
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src = LightingRig(ambient_strength=0.3, lights=(Light("s", "directional", direction=(0, 0, -1), strength=0.7, casts_shadows=False),))
+    red = LightingRig(ambient_color=(0.1, 0.05, 0.05), ambient_strength=0.05, lights=(
+        Light("r", "directional", direction=(0, 0, -1), color=(1.0, 0.02, 0.02), strength=1.0, casts_shadows=False),
+    ))
+    res_with_res = relight(scene, camera, src, red, EngineSettings(renderer_mode="intrinsic"))
+    scene_no_res = SceneBuffers(
+        rgb_srgb=scene.rgb_srgb, depth=scene.depth, depth_confidence=scene.depth_confidence,
+        lightable_mask=scene.lightable_mask, depth_kind="relative", normals=normals,
+        geometry_confidence=scene.geometry_confidence, albedo=scene.albedo,
+        source_shading=scene.source_shading, non_diffuse_residual=None,
+    )
+    res_no_res = relight(scene_no_res, camera, src, red, EngineSettings(renderer_mode="intrinsic"))
+    # Broad original reflection contribution stays untinted: blue/green difference from residual is nearly neutral, not bright red!
+    res_delta = res_with_res.rgb_srgb - res_no_res.rgb_srgb
+    assert float(np.mean(res_delta[..., 0] - res_delta[..., 2])) < 0.03
+
+
+
+def test_phase6_metallic_sheen_and_finite_radius_specular_response():
+    scene, camera = make_plane()
+    scene.roughness[:] = 0.20
+    scene.metalness[:] = 1.0
+    scene.specular_color = np.full((*scene.shape, 3), 0.85, dtype=np.float32)
+    pts = backproject_depth(scene.depth, camera)
+    nrm = np.zeros_like(pts)
+    nrm[..., 2] = -1.0
+
+    rig_point_zero_r = LightingRig(ambient_strength=0.0, lights=(
+        Light("pt", "point", position=(-0.4, 0.0, 1.5), color=(1.0, 0.1, 0.1), strength=3.0, radius=0.0, casts_shadows=False),
+    ))
+    rig_point_finite_r = LightingRig(ambient_strength=0.0, lights=(
+        Light("pt", "point", position=(-0.4, 0.0, 1.5), color=(1.0, 0.1, 0.1), strength=3.0, radius=0.15, casts_shadows=False),
+    ))
+    _, spec_zero_r, _ = evaluate_rig(scene, camera, pts, nrm, rig_point_zero_r, EngineSettings())
+    _, spec_finite_r, _ = evaluate_rig(scene, camera, pts, nrm, rig_point_finite_r, EngineSettings())
+    # Finite radius broadens metallic specular highlights across neighboring off-axis normals
+    assert float(np.mean(spec_finite_r[..., 0] > 0.05)) >= float(np.mean(spec_zero_r[..., 0] > 0.05))
+    assert float(np.max(spec_finite_r[..., 0])) > float(np.max(spec_finite_r[..., 2])) * 4.0
+

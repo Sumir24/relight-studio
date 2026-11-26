@@ -108,10 +108,14 @@ def test_engine_settings_validates_renderer_mode_and_detail_lock_strength():
     assert defaults.lighting_smooth_sigma >= 0.0
     EngineSettings(
         renderer_mode="intrinsic",
+        detail_preservation_mode="f3",
         detail_lock_strength=0.9,
         preserve_source_lighting=True,
         lighting_smooth_sigma=1.5,
     ).validate()
+    assert defaults.detail_preservation_mode == "baseline"
+    with pytest.raises(ValueError, match="detail_preservation_mode"):
+        EngineSettings(detail_preservation_mode="invalid").validate()
     with pytest.raises(ValueError, match="renderer_mode"):
         EngineSettings(renderer_mode="unknown").validate()
     with pytest.raises(ValueError, match="detail_lock_strength"):
@@ -142,4 +146,15 @@ def test_engine_settings_validates_renderer_mode_and_detail_lock_strength():
         indirect_bounce_radius=18.0,
         filmic_highlight_rolloff=True,
         refine_depth_edges=True,
+        quality_mode="preview",
+        preview_max_side=384,
+        preview_upsample=True,
+        shadow_adaptive_sampling=True,
+        shadow_smooth_passes=2,
     ).validate()
+    with pytest.raises(ValueError, match="quality_mode"):
+        EngineSettings(quality_mode="ultra").validate()
+    with pytest.raises(ValueError, match="preview_max_side"):
+        EngineSettings(preview_max_side=16).validate()
+    with pytest.raises(ValueError, match="shadow_smooth_passes"):
+        EngineSettings(shadow_smooth_passes=0).validate()

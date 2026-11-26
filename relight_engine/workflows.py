@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 import numpy as np
 
-from .contracts import CameraModel, EngineSettings, LightingRig, Light, SceneBuffers
+from .contracts import CameraModel, EngineSettings, EnvironmentLight, LightingRig, Light, SceneBuffers
+from .color import srgb_to_linear
 from .calibration import (
     MaterialAssignment,
     SourceLightCalibration,
@@ -38,7 +39,7 @@ def target_rig_from_dict(data: dict) -> LightingRig:
         raise ValueError("target_rig must be an object.")
     allowed = {
         "ambient_strength", "ambient_temperature_kelvin", "ambient_color",
-        "ambient_ground_color", "ambient_ground_temperature_kelvin", "lights",
+        "ambient_ground_color", "ambient_ground_temperature_kelvin", "lights", "environment",
     }
     unknown = set(data) - allowed
     if unknown:
@@ -86,11 +87,50 @@ def target_rig_from_dict(data: dict) -> LightingRig:
             wrap=float(item.get("wrap", 0.0)),
             radius=float(item.get("radius", 0.0)),
         ))
+    env_obj = None
+    if data.get("environment") is not None:
+        env_raw = data["environment"]
+        if not isinstance(env_raw, dict):
+            raise ValueError("target_rig.environment must be an object.")
+        env_allowed = {
+            "sky_color", "horizon_color", "ground_color", "strength",
+            "key_azimuth_deg", "key_elevation_deg", "key_color", "key_strength", "key_sharpness",
+            "env_map", "env_map_path", "env_map_strength", "diffuse_strength", "specular_strength", "rotation_deg",
+        }
+        env_unknown = set(env_raw) - env_allowed
+        if env_unknown:
+            raise ValueError(f"Unknown target_rig.environment fields: {sorted(env_unknown)}")
+        env_kwargs: dict = {}
+        for k, v in env_raw.items():
+            if k == "env_map":
+                env_kwargs["env_map"] = None if v is None else np.asarray(v, dtype=np.float32)
+            elif k == "env_map_path":
+                if v is not None:
+                    p = Path(str(v))
+                    if p.suffix.lower() == ".npy":
+                        env_kwargs["env_map"] = np.asarray(np.load(p), dtype=np.float32)
+                    else:
+                        import cv2
+                        raw_env = cv2.imread(str(p), cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH)
+                        if raw_env is None:
+                            raise ValueError(f"Failed to load environment map: {p}")
+                        rgb_env = cv2.cvtColor(raw_env, cv2.COLOR_BGR2RGB).astype(np.float32)
+                        if raw_env.dtype == np.uint8:
+                            rgb_env = srgb_to_linear(np.clip(rgb_env / 255.0, 0.0, 1.0))
+                        elif raw_env.dtype == np.uint16:
+                            rgb_env = srgb_to_linear(np.clip(rgb_env / 65535.0, 0.0, 1.0))
+                        env_kwargs["env_map"] = np.maximum(rgb_env, 0.0).astype(np.float32)
+            elif k.endswith("_color"):
+                env_kwargs[k] = tuple(float(x) for x in v)
+            else:
+                env_kwargs[k] = float(v)
+        env_obj = EnvironmentLight(**env_kwargs)
     rig = LightingRig(
         ambient_color=ambient_color,
         ambient_strength=ambient_strength,
         lights=tuple(lights),
         ambient_ground_color=ambient_ground_color,
+        environment=env_obj,
     )
     rig.validate()
     return rig
@@ -135,6 +175,8 @@ def load_scene_artifacts(scene_dir: str | Path) -> tuple[SceneBuffers, CameraMod
         metalness=arrays.get("metalness"),
         specular_level=arrays.get("specular_level"),
         specular_color=arrays.get("specular_color"),
+        anisotropy=arrays.get("anisotropy"),
+        anisotropy_angle=arrays.get("anisotropy_angle"),
         material_confidence=arrays.get("material_confidence"),
         material_metadata=manifest.get("material_metadata", {}),
         albedo=arrays.get("albedo"),
@@ -201,7 +243,7 @@ def apply_user_material_assignments(
         allowed = {
             "name", "mask_key", "roughness", "metalness", "specular_level",
             "specular_color", "clearcoat", "clearcoat_roughness", "subsurface",
-            "blend", "confidence",
+            "anisotropy", "anisotropy_angle", "blend", "confidence",
         }
         unknown = set(item) - allowed
         if unknown:
@@ -218,45 +260,90 @@ def apply_user_material_assignments(
             clearcoat=float(item.get("clearcoat", 0.0)),
             clearcoat_roughness=float(item.get("clearcoat_roughness", 0.15)),
             subsurface=float(item.get("subsurface", 0.0)),
+            anisotropy=float(item.get("anisotropy", 0.0)),
+            anisotropy_angle=float(item.get("anisotropy_angle", 0.0)),
             confidence=float(item.get("confidence", 1.0)),
         ))
+    had_model_priors = bool(
+        scene.metadata.get("material_maps_estimated", False)
+        or (scene.roughness is not None and any(
+            isinstance(v, dict) and v.get("source") == "model_estimated"
+            for v in (scene.material_metadata or {}).values()
+        ))
+    )
+    prior_roughness = scene.roughness.copy() if scene.roughness is not None else None
+    prior_metalness = scene.metalness.copy() if scene.metalness is not None else None
+    prior_spec_level = scene.specular_level.copy() if scene.specular_level is not None else None
+    prior_spec_color = scene.specular_color.copy() if scene.specular_color is not None else None
+    prior_conf = scene.material_confidence.copy() if scene.material_confidence is not None else None
+
     maps = build_material_maps(scene.shape, assignments)
     if assignments:
-        scene.roughness = maps.roughness
-        scene.metalness = maps.metalness
-        scene.specular_level = maps.specular_level
-        scene.material_confidence = maps.confidence
+        cov = maps.coverage
+        inv = 1.0 - cov
+        def _overlay_prior(prior: np.ndarray | None, user_arr: np.ndarray, base_val) -> np.ndarray:
+            if prior is None:
+                return user_arr
+            user_delta = user_arr - inv[..., None] * np.asarray(base_val, dtype=np.float32) if user_arr.ndim == 3 else (user_arr - inv * float(base_val))
+            prior_weight = inv[..., None] if user_arr.ndim == 3 else inv
+            return np.clip(prior * prior_weight + user_delta, 0.0, 1.0).astype(np.float32)
+
+        scene.roughness = _overlay_prior(prior_roughness, maps.roughness, 0.75)
+        scene.metalness = _overlay_prior(prior_metalness, maps.metalness, 0.0)
+        scene.specular_level = _overlay_prior(prior_spec_level, maps.specular_level, 0.04)
+        if prior_conf is not None:
+            scene.material_confidence = np.clip(prior_conf * inv + maps.confidence * cov, 0.0, 1.0).astype(np.float32)
+        else:
+            scene.material_confidence = maps.confidence
         if maps.specular_color is not None:
-            scene.specular_color = maps.specular_color
+            scene.specular_color = _overlay_prior(prior_spec_color, maps.specular_color, (0.65, 0.65, 0.65))
         if maps.clearcoat is not None:
             scene.clearcoat = maps.clearcoat
         if maps.clearcoat_roughness is not None:
             scene.clearcoat_roughness = maps.clearcoat_roughness
         if maps.subsurface is not None:
             scene.subsurface = maps.subsurface
+        if maps.anisotropy is not None:
+            scene.anisotropy = maps.anisotropy
+        if maps.anisotropy_angle is not None:
+            scene.anisotropy_angle = maps.anisotropy_angle
+
+        map_source = "user_override_over_model_priors" if had_model_priors else "user_assignment_plus_renderer_prior"
         scalar_map_metadata = {
-            "source": "user_assignment_plus_renderer_prior",
+            "source": map_source,
             "calibrated": False,
-            "notes": "Per-mask user overrides blended over conservative renderer priors; unassigned pixels retain the prior.",
+            "notes": (
+                "Per-mask user overrides blended over model-estimated material priors."
+                if had_model_priors
+                else "Per-mask user overrides blended over conservative renderer priors; unassigned pixels retain the prior."
+            ),
         }
-        scene.material_metadata = {
+        existing_meta = dict(scene.material_metadata) if isinstance(scene.material_metadata, dict) else {}
+        existing_meta.update({
             "roughness": dict(scalar_map_metadata),
             "metalness": dict(scalar_map_metadata),
             "specular_level": dict(scalar_map_metadata),
             "material_confidence": {
-                "source": "user_declared_assignment_confidence",
+                "source": "user_override_plus_model_confidence" if had_model_priors else "user_declared_assignment_confidence",
                 "calibrated": False,
-                "notes": "Caller-supplied reliability weight; zero outside assigned mask coverage. Not a calibrated probability.",
+                "notes": (
+                    "User assignment confidence in masked areas merged with model estimation confidence elsewhere."
+                    if had_model_priors
+                    else "Caller-supplied reliability weight; zero outside assigned mask coverage. Not a calibrated probability."
+                ),
             },
-        }
+        })
         if maps.specular_color is not None:
-            scene.material_metadata["specular_color"] = {
-                "source": "user_assignment_plus_renderer_prior",
+            existing_meta["specular_color"] = {
+                "source": map_source,
                 "calibrated": False,
-                "notes": "Linear-RGB conductor F0 user overrides; unassigned pixels retain the neutral 0.65 RGB prior.",
+                "notes": "Linear-RGB conductor F0 user overrides; unassigned pixels retain existing priors.",
             }
-        scene.metadata["material_maps_estimated"] = False
-    return maps.metadata
+        scene.material_metadata = existing_meta
+        scene.metadata["material_maps_estimated"] = had_model_priors
+    meta_out = dict(maps.metadata)
+    meta_out["neural_material_estimation_used"] = had_model_priors
+    return meta_out
 
 
 def run_scene_relight(

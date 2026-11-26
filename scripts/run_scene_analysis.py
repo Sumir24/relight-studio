@@ -123,17 +123,23 @@ def main() -> int:
     parser.add_argument("--segmenter-revision", default=None,
                         help="Optional SAM2 revision; use a full 40-character commit SHA for immutable pinning.")
     parser.add_argument("--normal-backend", default="depth_derived",
-                        help="Surface normal backend: 'depth_derived' or a registered normal backend (e.g. 'marigold_normals').")
+                        help="Surface normal backend: 'depth_derived' (lightweight CLI default) or a registered backend such as 'marigold_normals' (server default).")
     parser.add_argument("--normal-ensemble", type=int, default=3,
                         help="Ensemble size for diffusion-based normal backends (default: 3).")
     parser.add_argument("--normal-revision", default=None,
                         help="Optional Hugging Face revision for external normal backend.")
     parser.add_argument("--intrinsic-backend", default="none",
-                        help="Optional intrinsic backend: 'none' or a registered backend (e.g. 'marigold_intrinsics_lighting').")
+                        help="Optional intrinsic backend: 'none' (lightweight CLI default; renderer_mode='auto' falls back to 'ratio') or a registered backend such as 'marigold_intrinsics_lighting' (server default; enables 'intrinsic' in 'auto' mode).")
     parser.add_argument("--intrinsic-ensemble", type=int, default=3,
                         help="Ensemble size for diffusion-based intrinsic backends (default: 3).")
     parser.add_argument("--intrinsic-revision", default=None,
                         help="Optional Hugging Face revision for intrinsic backend.")
+    parser.add_argument("--material-backend", default="none",
+                        help="Optional material appearance backend: 'none' (default) or a registered backend such as 'marigold_intrinsics_appearance' (predicts roughness, calibrated metalness prior, and material confidence).")
+    parser.add_argument("--material-ensemble", type=int, default=3,
+                        help="Ensemble size for material appearance estimation; >= 3 enables ensemble uncertainty (default: 3).")
+    parser.add_argument("--material-revision", default=None,
+                        help="Optional Hugging Face revision for material appearance backend.")
     parser.add_argument("--strict-model-revisions", action="store_true",
                         help="Require full 40-character commit SHAs for every model used in this run.")
     args = parser.parse_args()
@@ -150,6 +156,8 @@ def main() -> int:
             required_revisions[f"Normals ({args.normal_backend})"] = args.normal_revision
         if args.intrinsic_backend != "none":
             required_revisions[f"Intrinsics ({args.intrinsic_backend})"] = args.intrinsic_revision
+        if args.material_backend != "none":
+            required_revisions[f"Materials ({args.material_backend})"] = args.material_revision
         missing = [
             model_name for model_name, revision in required_revisions.items()
             if not is_full_commit_sha(revision)
@@ -191,6 +199,11 @@ def main() -> int:
             "intrinsics": (
                 revision_descriptor(args.intrinsic_revision)
                 if args.intrinsic_backend != "none"
+                else {"revision": None, "revision_kind": "disabled"}
+            ),
+            "materials": (
+                revision_descriptor(args.material_revision)
+                if args.material_backend != "none"
                 else {"revision": None, "revision_kind": "disabled"}
             ),
         },
@@ -322,8 +335,60 @@ def main() -> int:
     intr_roughness = None
     intr_metalness = None
     intr_spec_level = None
+    intr_spec_color = None
+    intr_anisotropy = None
+    intr_mat_conf = None
     intr_meta: dict = {}
     mat_meta: dict = {}
+
+    def _record_intrinsic_materials(pred, backend_name: str) -> None:
+        nonlocal intr_roughness, intr_metalness, intr_spec_level, intr_spec_color, intr_anisotropy, intr_mat_conf
+        if pred.roughness is None and pred.metalness is None:
+            return
+        from relight_engine.calibration import assign_estimated_material_priors
+        assigned = assign_estimated_material_priors(
+            roughness=pred.roughness,
+            metalness=pred.metalness,
+            albedo_srgb=pred.albedo,
+            source_rgb_srgb=rgb,
+            specular_level=pred.specular_level,
+            specular_color=pred.specular_color,
+            anisotropy=pred.anisotropy,
+            material_confidence=pred.material_confidence,
+            roughness_uncertainty=pred.roughness_uncertainty,
+            metalness_uncertainty=pred.metalness_uncertainty,
+        )
+        intr_roughness = assigned.roughness
+        intr_metalness = assigned.metalness
+        intr_spec_level = assigned.specular_level
+        intr_spec_color = assigned.specular_color
+        intr_anisotropy = assigned.anisotropy
+        intr_mat_conf = assigned.confidence
+        unc_src = pred.metadata.get("material_target_semantics", {}).get("uncertainty_source")
+        for mname, marr in (
+            ("roughness", intr_roughness),
+            ("metalness", intr_metalness),
+            ("specular_level", intr_spec_level),
+            ("specular_color", intr_spec_color),
+            ("anisotropy", intr_anisotropy),
+        ):
+            if marr is not None:
+                mat_meta[mname] = {"source": "model_estimated", "backend": backend_name, "calibrated": False}
+        if intr_mat_conf is not None:
+            mat_meta["material_confidence"] = {
+                "source": "model_estimated",
+                "backend": backend_name,
+                "calibrated": False,
+                "notes": f"Confidence prior derived from {unc_src or 'model dispersion and signal SNR'}.",
+            }
+        if "material_target_semantics" in pred.metadata:
+            mat_meta["material_target_semantics"] = {
+                **pred.metadata["material_target_semantics"],
+                "assigned_metalness_mean": float(np.mean(intr_metalness)),
+                "assigned_roughness_mean": float(np.mean(intr_roughness)),
+                **assigned.metadata.get("metalness_calibration", {}),
+            }
+
     if args.intrinsic_backend != "none":
         from relight_engine.adapters.registry import create_intrinsic_backend
         print(f"[4c/5] Estimating intrinsic buffers with {args.intrinsic_backend}...")
@@ -337,13 +402,8 @@ def main() -> int:
             intr_albedo = intr_pred.albedo
             intr_shading = intr_pred.source_shading
             intr_residual = intr_pred.non_diffuse_residual
-            intr_roughness = intr_pred.roughness
-            intr_metalness = intr_pred.metalness
-            intr_spec_level = intr_pred.specular_level
             intr_meta = dict(intr_pred.metadata)
-            for mname, marr in (("roughness", intr_roughness), ("metalness", intr_metalness), ("specular_level", intr_spec_level)):
-                if marr is not None:
-                    mat_meta[mname] = {"source": "model_estimated", "calibrated": False}
+            _record_intrinsic_materials(intr_pred, args.intrinsic_backend)
         except Exception as exc:
             print(f"ERROR: Intrinsic decomposition failed: {exc}", file=sys.stderr)
             return 2
@@ -352,11 +412,41 @@ def main() -> int:
                 close_model_stage("intrinsics", args.intrinsic_backend, intr_started, intrinsic_backend)
             )
 
+    if args.material_backend != "none":
+        from relight_engine.adapters.registry import create_intrinsic_backend
+        print(f"[4d/5] Estimating material appearance priors with {args.material_backend}...")
+        mat_kwargs = {"device": args.device, "ensemble_size": max(1, int(args.material_ensemble))}
+        if args.material_revision:
+            mat_kwargs["revision"] = args.material_revision
+        material_backend = create_intrinsic_backend(args.material_backend, **mat_kwargs)
+        mat_started = perf_counter()
+        try:
+            mat_pred = material_backend.estimate(rgb)
+            if intr_albedo is None:
+                intr_albedo = mat_pred.albedo
+            if intr_shading is None:
+                intr_shading = mat_pred.source_shading
+            if not intr_meta:
+                intr_meta = dict(mat_pred.metadata)
+            else:
+                intr_meta["material_model"] = dict(mat_pred.metadata)
+            _record_intrinsic_materials(mat_pred, args.material_backend)
+        except Exception as exc:
+            print(f"ERROR: Material appearance estimation failed: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            inference_runtime["stages"].append(
+                close_model_stage("materials", args.material_backend, mat_started, material_backend)
+            )
+
+    if mat_meta:
+        seg.metadata["material_maps_estimated"] = True
     semantics = SemanticPrediction(
         lightable_mask=seg.lightable_mask, protected_mask=seg.protected_mask,
         class_masks=seg.masks, instance_masks=seg.instance_masks, metadata=seg.metadata,
         roughness=intr_roughness, metalness=intr_metalness, specular_level=intr_spec_level,
-        material_metadata=mat_meta,
+        specular_color=intr_spec_color, anisotropy=intr_anisotropy,
+        material_confidence=intr_mat_conf, material_metadata=mat_meta,
         albedo=intr_albedo, source_shading=intr_shading, non_diffuse_residual=intr_residual,
         intrinsic_metadata=intr_meta,
     )
@@ -403,10 +493,16 @@ def main() -> int:
         save_gray(args.out / "intrinsic_shading.png", sh_vis)
     if scene.non_diffuse_residual is not None:
         buffers["non_diffuse_residual"] = scene.non_diffuse_residual
-    for mname in ("roughness", "metalness", "specular_level"):
+    for mname in ("roughness", "metalness", "specular_level", "specular_color", "anisotropy", "anisotropy_angle", "material_confidence"):
         mval = getattr(scene, mname)
         if mval is not None:
             buffers[mname] = mval
+    if scene.roughness is not None:
+        save_mask(args.out / "material_roughness.png", scene.roughness)
+    if scene.metalness is not None:
+        save_mask(args.out / "material_metalness.png", scene.metalness)
+    if scene.material_confidence is not None:
+        save_mask(args.out / "material_confidence.png", scene.material_confidence)
     buffers.update({f"mask_{safe_filename(k)}": v for k, v in seg.masks.items()})
     buffers.update({f"mask_instance_{safe_filename(k)}": v for k, v in seg.instance_masks.items()})
     np.savez_compressed(args.out / "scene_buffers.npz", **buffers)
@@ -457,7 +553,7 @@ def main() -> int:
             "detections_count": len(seg.detections),
         },
         "material_estimation": (
-            f"model-estimated rough/metal/specular priors from {args.intrinsic_backend} (uncalibrated)"
+            f"model-estimated rough/metal/confidence priors from {args.material_backend if args.material_backend != 'none' else args.intrinsic_backend} (uncalibrated)"
             if mat_meta
             else "not implemented; no physical material labels are inferred by segmentation"
         ),

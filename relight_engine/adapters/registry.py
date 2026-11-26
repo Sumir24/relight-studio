@@ -74,10 +74,16 @@ def _register_builtin_backends() -> None:
         from .ic_light_relighter import ICLightRelighter
         return ICLightRelighter(**kwargs)
 
+    def _ic_light_v2(**kwargs: Any) -> Any:
+        from .flux_iclight_relighter import FluxICLightRelighter
+        return FluxICLightRelighter(**kwargs)
+
     register_normal_backend("marigold_normals", _marigold_normals)
     register_intrinsic_backend("marigold_intrinsics_lighting", _marigold_intrinsics_lighting)
     register_intrinsic_backend("marigold_intrinsics_appearance", _marigold_intrinsics_appearance)
     register_relighter_backend("ic_light", _ic_light)
+    register_relighter_backend("ic_light_v2", _ic_light_v2)
+    register_relighter_backend("flux_ic_light", _ic_light_v2)
 
 
 _register_builtin_backends()

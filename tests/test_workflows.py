@@ -411,3 +411,114 @@ def test_run_scene_relight_supports_intrinsic_and_registered_relighter(tmp_path,
     )
     assert rep_hyb["engine_metrics"]["renderer_mode"] == "hybrid_neural"
     assert rep_hyb["engine_metrics"]["neural_relighter"]["backend"] == "test_relighter"
+
+
+def test_built_scene_buffers_flow_through_artifacts_to_auto_intrinsic_and_ratio_fallback(tmp_path):
+    import json
+    from PIL import Image
+    from relight_engine.adapters import DepthPrediction, SemanticPrediction, build_scene_buffers
+    from relight_engine.workflows import run_scene_relight
+
+    h, w = 20, 24
+    rgb = np.full((h, w, 3), 0.35, dtype=np.float32)
+    depth = np.linspace(1.5, 2.5, w, dtype=np.float32)[None, :].repeat(h, axis=0)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    protected = np.zeros((h, w), dtype=np.float32)
+    protected[:4, :] = 1.0
+    lightable = 1.0 - protected
+    subject_mask = np.ones((h, w), dtype=np.float32)
+    albedo = np.full((h, w, 3), 0.60, dtype=np.float32)
+    source_shading = np.full((h, w), 0.25, dtype=np.float32)
+    residual = np.full((h, w, 3), 0.08, dtype=np.float32)
+
+    depth_pred = DepthPrediction(
+        depth=depth,
+        confidence=np.ones((h, w), dtype=np.float32),
+        kind="relative",
+    )
+    semantics = SemanticPrediction(
+        lightable_mask=lightable,
+        protected_mask=protected,
+        class_masks={"subject": subject_mask},
+        albedo=albedo,
+        source_shading=source_shading,
+        non_diffuse_residual=residual,
+        intrinsic_metadata={"source": "test_intrinsic", "calibrated": False},
+    )
+    built = build_scene_buffers(rgb, depth_pred, semantics)
+    built.normals = normals
+    built.geometry_confidence = np.ones((h, w), dtype=np.float32)
+    built.validate()
+
+    scene_dir = tmp_path / "intrinsic_scene"
+    scene_dir.mkdir()
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=built.rgb_srgb,
+        depth=built.depth,
+        depth_confidence=built.depth_confidence,
+        geometry_confidence=built.geometry_confidence,
+        normals=built.normals,
+        lightable_mask=built.lightable_mask,
+        protected_mask=built.protected_mask,
+        mask_subject=built.semantic_masks["subject"],
+        albedo=built.albedo,
+        source_shading=built.source_shading,
+        non_diffuse_residual=built.non_diffuse_residual,
+    )
+    manifest = {
+        "depth": {"depth_kind": built.depth_kind},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "intrinsic_metadata": built.intrinsic_metadata,
+        "camera": {"fx": 24.0, "fy": 24.0, "cx": w / 2, "cy": h / 2},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    cfg = {
+        "approved_for_test": True,
+        "source_calibration": {"key_direction": [0.0, 0.0, -1.0], "key_strength": 0.8, "ambient_strength": 0.2},
+        "target_rig": {
+            "ambient_strength": 0.2,
+            "lights": [{"kind": "directional", "direction": [0.0, 0.0, -1.0], "strength": 0.8, "casts_shadows": False}],
+        },
+        "settings": {"base_blur_sigma": 3.0},
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    out_auto = tmp_path / "out_auto.png"
+    out_intr = tmp_path / "out_intr.png"
+    out_ratio = tmp_path / "out_ratio.png"
+    rep_auto = run_scene_relight(scene_dir, cfg_path, out_auto)
+    rep_intr = run_scene_relight(scene_dir, cfg_path, out_intr, renderer_mode="intrinsic")
+    rep_ratio = run_scene_relight(scene_dir, cfg_path, out_ratio, renderer_mode="ratio")
+
+    assert rep_auto["engine_metrics"]["renderer_mode"] == "intrinsic"
+    assert rep_intr["engine_metrics"]["renderer_mode"] == "intrinsic"
+    assert rep_ratio["engine_metrics"]["renderer_mode"] == "ratio"
+    assert rep_auto["engine_metrics"]["mean_abs_srgb_change_protected"] == pytest.approx(0.0, abs=1e-6)
+    with Image.open(out_auto) as im_auto, Image.open(out_intr) as im_intr:
+        assert np.array_equal(np.asarray(im_auto), np.asarray(im_intr))
+
+    # Same scene without intrinsic buffers must fall back to ratio in automatic mode.
+    fallback_dir = tmp_path / "fallback_scene"
+    fallback_dir.mkdir()
+    np.savez_compressed(
+        fallback_dir / "scene_buffers.npz",
+        rgb_srgb=built.rgb_srgb,
+        depth=built.depth,
+        depth_confidence=built.depth_confidence,
+        geometry_confidence=built.geometry_confidence,
+        normals=built.normals,
+        lightable_mask=built.lightable_mask,
+        protected_mask=built.protected_mask,
+        mask_subject=built.semantic_masks["subject"],
+    )
+    (fallback_dir / "scene_manifest.json").write_text(json.dumps({
+        "depth": {"depth_kind": built.depth_kind},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "camera": {"fx": 24.0, "fy": 24.0, "cx": w / 2, "cy": h / 2},
+    }), encoding="utf-8")
+    rep_fb = run_scene_relight(fallback_dir, cfg_path, tmp_path / "out_fallback.png")
+    assert rep_fb["engine_metrics"]["renderer_mode"] == "ratio"

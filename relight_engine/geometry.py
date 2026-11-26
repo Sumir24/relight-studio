@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
+import threading
 import numpy as np
 
 from .contracts import CameraModel, SceneBuffers
+
+_GEOMETRY_CACHE: OrderedDict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray]] = OrderedDict()
+_GEOMETRY_CACHE_LOCK = threading.Lock()
+_GEOMETRY_CACHE_MAX = 4
+
+
+def _geom_digest(arr: np.ndarray | None) -> tuple | None:
+    if arr is None:
+        return None
+    buf = np.ascontiguousarray(arr)
+    return (buf.shape, str(buf.dtype), hashlib.blake2b(memoryview(buf), digest_size=16).digest())
 
 
 def backproject_depth(depth: np.ndarray, camera: CameraModel) -> np.ndarray:
@@ -245,7 +259,23 @@ def prepare_geometry(
     scene: SceneBuffers,
     camera: CameraModel,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Prepare points, normalized normals and a [0,1] geometry-reliability map."""
+    """Prepare points, normalized normals and a [0,1] geometry-reliability map (content-keyed LRU cached)."""
+    key = (
+        _geom_digest(scene.depth),
+        _geom_digest(scene.depth_confidence),
+        _geom_digest(scene.normals),
+        _geom_digest(scene.geometry_confidence),
+        float(camera.fx),
+        float(camera.fy),
+        float(camera.cx),
+        float(camera.cy),
+    )
+    with _GEOMETRY_CACHE_LOCK:
+        cached = _GEOMETRY_CACHE.get(key)
+        if cached is not None:
+            _GEOMETRY_CACHE.move_to_end(key)
+            return cached
+
     points = backproject_depth(scene.depth, camera)
     valid_depth = scene.depth > 0
 
@@ -265,4 +295,14 @@ def prepare_geometry(
 
     geometry_confidence = np.clip(geometry_confidence, 0.0, 1.0)
     geometry_confidence[~valid_depth] = 0.0
-    return points, normals.astype(np.float32), geometry_confidence.astype(np.float32)
+    normals_out = normals.astype(np.float32)
+    conf_out = geometry_confidence.astype(np.float32)
+    points.setflags(write=False)
+    normals_out.setflags(write=False)
+    conf_out.setflags(write=False)
+    with _GEOMETRY_CACHE_LOCK:
+        _GEOMETRY_CACHE[key] = (points, normals_out, conf_out)
+        _GEOMETRY_CACHE.move_to_end(key)
+        while len(_GEOMETRY_CACHE) > _GEOMETRY_CACHE_MAX:
+            _GEOMETRY_CACHE.popitem(last=False)
+    return points, normals_out, conf_out

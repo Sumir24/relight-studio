@@ -107,6 +107,8 @@ def downsample_scene_for_preview(
         clearcoat=_opt(scene.clearcoat, clip01=True),
         clearcoat_roughness=_opt(scene.clearcoat_roughness, clip01=True),
         subsurface=_opt(scene.subsurface, clip01=True),
+        anisotropy=_opt(scene.anisotropy, clip01=True),
+        anisotropy_angle=_opt(scene.anisotropy_angle),
         normals=scaled_normals,
         geometry_confidence=_opt(scene.geometry_confidence, mask=True, clip01=True),
         alpha_mask=_opt(scene.alpha_mask, mask=True, clip01=True),

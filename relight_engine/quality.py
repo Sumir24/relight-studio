@@ -90,6 +90,11 @@ def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
             "prior": 0.0,
             "shape": "HxW",
         },
+        "anisotropy": {
+            "array": scene.anisotropy,
+            "prior": 0.0,
+            "shape": "HxW",
+        },
     }
 
     maps: dict[str, dict[str, Any]] = {}

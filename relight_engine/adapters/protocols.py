@@ -26,6 +26,13 @@ class IntrinsicPrediction:
     roughness: np.ndarray | None = None
     metalness: np.ndarray | None = None
     specular_level: np.ndarray | None = None
+    specular_color: np.ndarray | None = None
+    clearcoat: np.ndarray | None = None
+    clearcoat_roughness: np.ndarray | None = None
+    anisotropy: np.ndarray | None = None
+    material_confidence: np.ndarray | None = None
+    roughness_uncertainty: np.ndarray | None = None
+    metalness_uncertainty: np.ndarray | None = None
     metadata: dict = field(default_factory=dict)
 
 
