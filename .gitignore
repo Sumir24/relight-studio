@@ -1,11 +1,3 @@
-__pycache__/
-.pytest_cache/
-*.py[cod]
-scene_analysis/
-checkpoints/
-.cache/
-.venv/
-
 # Python environments and caches
 .venv/
 **/.venv/
@@ -18,6 +10,8 @@ test_inputs/
 outputs/
 depth_polarity_review/
 scene_analysis/
+checkpoints/
+.cache/
 
 # Model files
 *.safetensors

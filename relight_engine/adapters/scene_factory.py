@@ -10,6 +10,19 @@ class SemanticPrediction:
     roughness: np.ndarray | None = None
     metalness: np.ndarray | None = None
     specular_level: np.ndarray | None = None
+    specular_color: np.ndarray | None = None
+    clearcoat: np.ndarray | None = None
+    clearcoat_roughness: np.ndarray | None = None
+    subsurface: np.ndarray | None = None
+    anisotropy: np.ndarray | None = None
+    anisotropy_angle: np.ndarray | None = None
+    material_confidence: np.ndarray | None = None
+    material_metadata: dict = field(default_factory=dict)
+    raw_material_maps: dict[str, np.ndarray] = field(default_factory=dict)
+    albedo: np.ndarray | None = None
+    source_shading: np.ndarray | None = None
+    non_diffuse_residual: np.ndarray | None = None
+    intrinsic_metadata: dict = field(default_factory=dict)
     protected_mask: np.ndarray | None = None
     class_masks: dict[str, np.ndarray] = field(default_factory=dict)
     instance_masks: dict[str, np.ndarray] = field(default_factory=dict)
@@ -31,6 +44,27 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
         raise ValueError('Semantic masks must exactly match RGB resolution.')
     if semantics.protected_mask is not None and semantics.protected_mask.shape != (h, w):
         raise ValueError('Protected mask must exactly match RGB resolution.')
+    for name, value in (
+        ("roughness", semantics.roughness),
+        ("metalness", semantics.metalness),
+        ("specular_level", semantics.specular_level),
+        ("clearcoat", semantics.clearcoat),
+        ("clearcoat_roughness", semantics.clearcoat_roughness),
+        ("subsurface", semantics.subsurface),
+        ("anisotropy", semantics.anisotropy),
+        ("anisotropy_angle", semantics.anisotropy_angle),
+        ("material_confidence", semantics.material_confidence),
+    ):
+        if value is not None and np.asarray(value).shape != (h, w):
+            raise ValueError(f"{name} must exactly match RGB resolution.")
+    if semantics.specular_color is not None and np.asarray(semantics.specular_color).shape != (h, w, 3):
+        raise ValueError("specular_color must exactly match RGB resolution with three channels.")
+    if semantics.albedo is not None and np.asarray(semantics.albedo).shape != (h, w, 3):
+        raise ValueError("albedo must exactly match RGB resolution with three channels.")
+    if semantics.source_shading is not None and np.asarray(semantics.source_shading).shape not in ((h, w), (h, w, 3)):
+        raise ValueError("source_shading must exactly match RGB resolution (HxW or HxWx3).")
+    if semantics.non_diffuse_residual is not None and np.asarray(semantics.non_diffuse_residual).shape != (h, w, 3):
+        raise ValueError("non_diffuse_residual must exactly match RGB resolution with three channels.")
     if alpha_mask is not None and np.asarray(alpha_mask).shape != (h, w):
         raise ValueError("alpha_mask must exactly match RGB resolution.")
     for family_name, masks in (("class", semantics.class_masks), ("instance", semantics.instance_masks)):
@@ -54,6 +88,19 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
         roughness=None if semantics.roughness is None else semantics.roughness.astype(np.float32),
         metalness=None if semantics.metalness is None else semantics.metalness.astype(np.float32),
         specular_level=None if semantics.specular_level is None else semantics.specular_level.astype(np.float32),
+        specular_color=None if semantics.specular_color is None else semantics.specular_color.astype(np.float32),
+        clearcoat=None if semantics.clearcoat is None else semantics.clearcoat.astype(np.float32),
+        clearcoat_roughness=None if semantics.clearcoat_roughness is None else semantics.clearcoat_roughness.astype(np.float32),
+        subsurface=None if semantics.subsurface is None else semantics.subsurface.astype(np.float32),
+        anisotropy=None if semantics.anisotropy is None else semantics.anisotropy.astype(np.float32),
+        anisotropy_angle=None if semantics.anisotropy_angle is None else semantics.anisotropy_angle.astype(np.float32),
+        material_confidence=None if semantics.material_confidence is None else semantics.material_confidence.astype(np.float32),
+        material_metadata=dict(semantics.material_metadata),
+        raw_material_maps={k: np.asarray(v, dtype=np.float32) for k, v in semantics.raw_material_maps.items()},
+        albedo=None if semantics.albedo is None else np.asarray(semantics.albedo, dtype=np.float32),
+        source_shading=None if semantics.source_shading is None else np.asarray(semantics.source_shading, dtype=np.float32),
+        non_diffuse_residual=None if semantics.non_diffuse_residual is None else np.asarray(semantics.non_diffuse_residual, dtype=np.float32),
+        intrinsic_metadata=dict(semantics.intrinsic_metadata),
         metadata={
             'depth': depth.metadata,
             'semantics': semantics.metadata,
@@ -62,7 +109,7 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
             'instance_mask_keys': sorted(semantics.instance_masks.keys()),
             'semantic_routing_is_domain_agnostic': True,
             'alpha_preserved': alpha_mask is not None,
-            'material_maps_estimated': bool(semantics.roughness is not None or semantics.metalness is not None or semantics.specular_level is not None),
+            'material_maps_estimated': bool(semantics.metadata.get('material_maps_estimated', False)),
             'neural_scene_estimation_used': bool(depth.metadata.get('model_id') or semantics.metadata.get('detector_id') or semantics.metadata.get('model_id')),
         }
     )

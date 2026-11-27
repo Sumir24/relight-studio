@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+import hashlib
+import threading
 import numpy as np
 
 from .contracts import CameraModel, SceneBuffers
+
+_GEOMETRY_CACHE: OrderedDict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray]] = OrderedDict()
+_AO_CACHE: OrderedDict[tuple, np.ndarray] = OrderedDict()
+_GEOMETRY_CACHE_LOCK = threading.Lock()
+_GEOMETRY_CACHE_MAX = 4
+
+
+def _geom_digest(arr: np.ndarray | None) -> tuple | None:
+    if arr is None:
+        return None
+    buf = np.ascontiguousarray(arr)
+    return (buf.shape, str(buf.dtype), hashlib.blake2b(memoryview(buf), digest_size=16).digest())
 
 
 def backproject_depth(depth: np.ndarray, camera: CameraModel) -> np.ndarray:
@@ -209,11 +224,298 @@ def estimate_normals(
     return normals.astype(np.float32), np.clip(confidence, 0.0, 1.0).astype(np.float32)
 
 
+def refine_depth_to_rgb_edges(
+    depth: np.ndarray,
+    rgb_srgb: np.ndarray,
+    *,
+    sigma: float = 3.5,
+    eps_guide: float = 0.004,
+) -> np.ndarray:
+    """Multi-scale RGB-guided edge snap tightening blurry depth silhouettes onto crisp RGB edges."""
+    from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
+
+    d = np.asarray(depth, dtype=np.float32)
+    valid = d > 0
+    if not np.any(valid):
+        return d
+    guide = (
+        0.299 * rgb_srgb[..., 0] + 0.587 * rgb_srgb[..., 1] + 0.114 * rgb_srgb[..., 2]
+    ).astype(np.float32)
+
+    def _guided_pass(src_d: np.ndarray, sig: float) -> np.ndarray:
+        mean_i = gaussian_filter(guide, sig, mode='reflect')
+        mean_ii = gaussian_filter(guide * guide, sig, mode='reflect')
+        var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+        mean_p = gaussian_filter(src_d, sig, mode='reflect')
+        mean_pp = gaussian_filter(src_d * src_d, sig, mode='reflect')
+        var_p = np.maximum(mean_pp - mean_p * mean_p, 0.0)
+        mean_ip = gaussian_filter(guide * src_d, sig, mode='reflect')
+        cov_ip = mean_ip - mean_i * mean_p
+        a = cov_ip / (var_i + eps_guide)
+        d_scale = max(float(np.median(src_d[valid])), 1e-3)
+        geom_edge_support = np.clip(np.sqrt(var_p) / (0.015 * d_scale), 0.10, 1.0)
+        a = a * geom_edge_support
+        b = mean_p - a * mean_i
+        return gaussian_filter(a, sig, mode='reflect') * guide + gaussian_filter(b, sig, mode='reflect')
+
+    coarse = _guided_pass(d, float(sigma))
+    fine = _guided_pass(coarse, max(1.2, float(sigma) * 0.4))
+    refined = 0.45 * coarse + 0.55 * fine
+    # Clamp strictly to local valid neighborhood bounds so guided filtering never overshoots.
+    loc_min = minimum_filter(np.where(valid, d, np.inf), size=7)
+    loc_max = maximum_filter(np.where(valid, d, 0.0), size=7)
+    loc_min = np.where(np.isfinite(loc_min), loc_min, float(np.min(d[valid])))
+    refined = np.clip(refined, loc_min, np.maximum(loc_max, loc_min))
+    return np.where(valid, refined, 0.0).astype(np.float32)
+
+
+def clean_depth_background_skirt(
+    depth: np.ndarray,
+    rgb_srgb: np.ndarray,
+    semantic_masks: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Snap monocular depth skirts on smooth background pixels back to the background manifold.
+
+    Monocular depth models often bleed foreground depth onto adjacent or enclosed smooth
+    background pixels (e.g., hair gaps, finger spaces, sculptural cutouts). This detects
+    low-gradient background pixels outside foreground masks whose depth was pulled below
+    the background manifold and restores them toward the local background depth.
+    """
+    from scipy.ndimage import gaussian_filter, maximum_filter, sobel
+    import cv2
+
+    d = np.asarray(depth, dtype=np.float32)
+    valid = d > 0
+    if not np.any(valid):
+        return d
+
+    z_fg_p15, z_bg_med = np.percentile(d[valid], [15.0, 82.0])
+    if z_bg_med <= 1.25 * max(float(z_fg_p15), 1e-4):
+        return d
+
+    rgb = np.asarray(rgb_srgb, dtype=np.float32)
+    y = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+    gx = sobel(y, axis=1) / 8.0
+    gy = sobel(y, axis=0) / 8.0
+    edge_mag = np.hypot(gx, gy)
+
+    bg_seed = valid & (d >= 0.80 * z_bg_med)
+    if not np.any(bg_seed):
+        return d
+
+    bg_y_med = float(np.median(y[bg_seed]))
+    bg_y_std = float(np.std(y[bg_seed]))
+    # Only clean background depth skirts on genuinely dark, smooth studio/cutout backdrops.
+    # Medium-bright or textured room/desk backdrops (e.g. out-of-focus hands/tables) should not
+    # match shaded foreground skin or objects.
+    if bg_y_med >= 0.14 or bg_y_std >= 0.09:
+        return d
+
+    y_tol = min(max(bg_y_std * 1.4, 0.03), 0.065)
+    looks_like_bg = (np.abs(y - bg_y_med) <= y_tol) & (y < 0.14) & (edge_mag < 0.045)
+    if semantic_masks:
+        fg_union = np.zeros(d.shape, dtype=np.float32)
+        for mv in semantic_masks.values():
+            fg_union = np.maximum(fg_union, np.clip(np.asarray(mv, dtype=np.float32), 0.0, 1.0))
+        if float(np.mean(fg_union > 0.2)) >= 0.015:
+            looks_like_bg = looks_like_bg & (fg_union < 0.12)
+
+    # Require pixels to be connected to a far background seed or form a tiny dark enclosed cutout.
+    cand_u8 = (valid & looks_like_bg).astype(np.uint8)
+    n_lbl, labels = cv2.connectedComponents(cand_u8, connectivity=8)
+    if n_lbl <= 1:
+        return d
+    keep_mask = np.zeros(d.shape, dtype=bool)
+    max_hole_area = max(16, int(0.015 * d.size))
+    for lbl in range(1, n_lbl):
+        comp = labels == lbl
+        if np.any(comp & bg_seed) or (int(np.sum(comp)) <= max_hole_area and float(np.median(y[comp])) < 0.08):
+            keep_mask |= comp
+
+    pulled_near = valid & (d < 0.75 * z_bg_med) & keep_mask
+    if not np.any(pulled_near):
+        return d
+
+    # Estimate local background depth from nearby confident background seeds.
+    h, w = d.shape
+    k = max(15, (min(h, w) // 10) | 1)
+    k = min(k, 65)
+    local_bg_depth = maximum_filter(np.where(bg_seed, d, 0.0), size=k)
+    local_bg_depth = np.where(local_bg_depth >= 0.78 * z_bg_med, local_bg_depth, float(z_bg_med))
+
+    # Smooth transition weight so crisp foreground edges don't get eroded.
+    skirt_w = gaussian_filter(pulled_near.astype(np.float32), sigma=1.0, mode="reflect")
+    skirt_w = np.where(pulled_near, np.clip(skirt_w * 1.35, 0.0, 1.0), 0.0).astype(np.float32)
+    cleaned = d * (1.0 - skirt_w) + local_bg_depth * skirt_w
+    return np.where(valid, cleaned, 0.0).astype(np.float32)
+
+
+def integrate_normals_with_depth_prior(
+    depth: np.ndarray,
+    normals: np.ndarray,
+    camera: CameraModel,
+    *,
+    screen_lambda: float = 0.06,
+    edge_threshold: float = 0.12,
+) -> np.ndarray:
+    """Fuse high-frequency surface normals with coarse depth via Screened Poisson DCT integration.
+
+    Minimizes ||grad Z - (p, q)||_2^2 + lambda ||Z - Z_0||_2^2 with edge-aware
+    discontinuity gating so depth relief aligns with surface normals without bleeding
+    across foreground-to-background depth cliffs.
+    """
+    from scipy.fft import dctn, idctn
+
+    z0 = np.asarray(depth, dtype=np.float32)
+    n = np.asarray(normals, dtype=np.float32)
+    valid = z0 > 0
+    if not np.any(valid) or n.shape[:2] != z0.shape:
+        return z0
+
+    h, w = z0.shape
+    z_lo, z_hi = np.percentile(z0[valid], [10.0, 90.0])
+    # Suppress normal-depth re-sculpting on distant terrain/horizon cliffs where monocular normals smooth jagged silhouettes.
+    fg_gate = np.clip((2.8 * max(float(z_lo), 0.2) - z0) / max(0.8 * float(z_lo), 0.35), 0.0, 1.0).astype(np.float32)
+    if float(z_hi) <= 1.2 * max(float(z_lo), 0.2):
+        fg_gate = np.ones_like(z0, dtype=np.float32)
+
+    n_len = np.linalg.norm(n, axis=-1, keepdims=True)
+    n_unit = n / np.maximum(n_len, 1e-8)
+
+    # Pixel-space depth gradients implied by camera-space normals (+X right, +Y up, +Z away).
+    inv_nz = 1.0 / np.maximum(-n_unit[..., 2], 0.15)
+    p_n = (z0 / max(float(camera.fx), 1.0)) * (n_unit[..., 0] * inv_nz)
+    q_n = -(z0 / max(float(camera.fy), 1.0)) * (n_unit[..., 1] * inv_nz)
+
+    max_slope = 0.15 * z0
+    p_n = np.clip(p_n, -max_slope, max_slope)
+    q_n = np.clip(q_n, -max_slope, max_slope)
+
+    dx_z = np.zeros_like(z0)
+    dx_z[:, :-1] = z0[:, 1:] - z0[:, :-1]
+    dy_z = np.zeros_like(z0)
+    dy_z[:-1, :] = z0[1:, :] - z0[:-1, :]
+
+    # Attenuate normal integration across sharp depth discontinuities and distant horizon backgrounds.
+    et = max(float(edge_threshold), 1e-3)
+    wx = (np.exp(-((np.abs(dx_z) / np.maximum(z0, 1e-3)) / et) ** 2) * fg_gate).astype(np.float32)
+    wy = (np.exp(-((np.abs(dy_z) / np.maximum(z0, 1e-3)) / et) ** 2) * fg_gate).astype(np.float32)
+
+    p = wx * p_n + (1.0 - wx) * dx_z
+    q = wy * q_n + (1.0 - wy) * dy_z
+    p[:, -1] = 0.0
+    q[-1, :] = 0.0
+
+    # Exact adjoint divergence: D_x^T p + D_y^T q + lambda * Z_0
+    rhs_x = np.zeros_like(p)
+    rhs_x[:, 0] = -p[:, 0]
+    rhs_x[:, 1:-1] = p[:, :-2] - p[:, 1:-1]
+    rhs_x[:, -1] = p[:, -2]
+
+    rhs_y = np.zeros_like(q)
+    rhs_y[0, :] = -q[0, :]
+    rhs_y[1:-1, :] = q[:-2, :] - q[1:-1, :]
+    rhs_y[-1, :] = q[-2, :]
+
+    lam = max(float(screen_lambda), 1e-4)
+    rhs = (rhs_x + rhs_y + lam * z0).astype(np.float64)
+
+    ky = np.arange(h, dtype=np.float64)[:, None]
+    kx = np.arange(w, dtype=np.float64)[None, :]
+    denom = lam + 4.0 * np.sin(np.pi * ky / (2.0 * h)) ** 2 + 4.0 * np.sin(np.pi * kx / (2.0 * w)) ** 2
+
+    z_hat = dctn(rhs, type=2, norm="ortho") / np.maximum(denom, 1e-8)
+    z_out = idctn(z_hat, type=2, norm="ortho").astype(np.float32)
+
+    z_min = float(np.min(z0[valid]))
+    z_max = float(np.max(z0[valid]))
+    z_out = np.clip(z_out, 0.1 * z_min, 1.5 * z_max)
+    return np.where(valid, z_out, 0.0).astype(np.float32)
+
+
+def extract_micro_normal_bump(
+    normals: np.ndarray,
+    rgb_srgb: np.ndarray,
+    *,
+    strength: float = 0.05,
+    roughness: np.ndarray | None = None,
+) -> np.ndarray:
+    """Subtly perturb macro surface normals with band-limited RGB micro-relief without over-sharpening pores/grain."""
+    if strength <= 0.0:
+        return normals
+    from scipy.ndimage import gaussian_filter
+
+    n = np.asarray(normals, dtype=np.float32)
+    rgb = np.asarray(rgb_srgb, dtype=np.float32)
+    y = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+    # Band-limit micro-relief (sigma 1.6 - 4.0) so 1px JPEG/skin noise never becomes crispy AI-upscaled emboss.
+    hp = gaussian_filter(y, sigma=1.4, mode="reflect") - gaussian_filter(y, sigma=3.5, mode="reflect")
+
+    gx = np.zeros_like(hp)
+    gx[:, 1:-1] = 0.5 * (hp[:, 2:] - hp[:, :-2])
+    gy = np.zeros_like(hp)
+    gy[1:-1, :] = 0.5 * (hp[2:, :] - hp[:-2, :])
+
+    gx = 0.04 * np.tanh(gx / 0.04)
+    gy = 0.04 * np.tanh(gy / 0.04)
+
+    bump_w = np.full(y.shape, float(strength) * 1.6, dtype=np.float32)
+    if roughness is not None:
+        r = np.clip(np.asarray(roughness, dtype=np.float32), 0.0, 1.0)
+        bump_w = bump_w * np.clip((r - 0.12) / 0.25, 0.10, 1.0)
+
+    pert = np.stack([-gx * bump_w, gy * bump_w, np.zeros_like(gx)], axis=-1)
+    n_out = n + pert
+    n_out = n_out / np.maximum(np.linalg.norm(n_out, axis=-1, keepdims=True), 1e-8)
+    return n_out.astype(np.float32)
+
+
+def compute_depth_normal_consistency(
+    points: np.ndarray,
+    depth: np.ndarray,
+    normals: np.ndarray,
+) -> dict[str, object]:
+    """Compare supplied surface normals against edge-aware depth-derived normals."""
+    valid = depth > 0
+    n_depth, depth_rel = estimate_normals(points, depth, np.ones_like(depth, dtype=np.float32))
+    n_sup = np.asarray(normals, dtype=np.float32)
+    n_sup = n_sup / np.maximum(np.linalg.norm(n_sup, axis=-1, keepdims=True), 1e-8)
+    cos_sim = np.clip(np.sum(n_sup * n_depth, axis=-1), -1.0, 1.0).astype(np.float32)
+    support = valid & (depth_rel > 0.25)
+    if not np.any(support):
+        support = valid
+    angles = np.degrees(np.arccos(np.clip(cos_sim, -1.0, 1.0))).astype(np.float32)
+    disagreement = np.clip(0.5 * (1.0 - cos_sim), 0.0, 1.0).astype(np.float32)
+    return {
+        "cos_similarity": cos_sim,
+        "disagreement": disagreement,
+        "mean_angle_deg": float(np.mean(angles[support])) if np.any(support) else 0.0,
+        "p95_angle_deg": float(np.percentile(angles[support], 95)) if np.any(support) else 0.0,
+        "disagreement_fraction": float(np.mean(angles[support] > 35.0)) if np.any(support) else 0.0,
+    }
+
+
 def prepare_geometry(
     scene: SceneBuffers,
     camera: CameraModel,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Prepare points, normalized normals and a [0,1] geometry-reliability map."""
+    """Prepare points, normalized normals and a [0,1] geometry-reliability map (content-keyed LRU cached)."""
+    key = (
+        _geom_digest(scene.depth),
+        _geom_digest(scene.depth_confidence),
+        _geom_digest(scene.normals),
+        _geom_digest(scene.geometry_confidence),
+        float(camera.fx),
+        float(camera.fy),
+        float(camera.cx),
+        float(camera.cy),
+    )
+    with _GEOMETRY_CACHE_LOCK:
+        cached = _GEOMETRY_CACHE.get(key)
+        if cached is not None:
+            _GEOMETRY_CACHE.move_to_end(key)
+            return cached
+
     points = backproject_depth(scene.depth, camera)
     valid_depth = scene.depth > 0
 
@@ -225,7 +527,9 @@ def prepare_geometry(
         if scene.geometry_confidence is not None:
             geometry_confidence = np.asarray(scene.geometry_confidence, dtype=np.float32).copy()
         else:
-            geometry_confidence = np.asarray(scene.depth_confidence, dtype=np.float32).copy()
+            consistency = compute_depth_normal_consistency(points, scene.depth, normals)
+            cons_w = 1.0 - 0.85 * consistency["disagreement"]  # type: ignore[operator]
+            geometry_confidence = (np.asarray(scene.depth_confidence, dtype=np.float32) * cons_w).astype(np.float32)
     else:
         normals, geometry_confidence = estimate_normals(
             points, scene.depth, scene.depth_confidence
@@ -233,4 +537,229 @@ def prepare_geometry(
 
     geometry_confidence = np.clip(geometry_confidence, 0.0, 1.0)
     geometry_confidence[~valid_depth] = 0.0
-    return points, normals.astype(np.float32), geometry_confidence.astype(np.float32)
+    normals_out = normals.astype(np.float32)
+    conf_out = geometry_confidence.astype(np.float32)
+    points.setflags(write=False)
+    normals_out.setflags(write=False)
+    conf_out.setflags(write=False)
+    with _GEOMETRY_CACHE_LOCK:
+        _GEOMETRY_CACHE[key] = (points, normals_out, conf_out)
+        _GEOMETRY_CACHE.move_to_end(key)
+        while len(_GEOMETRY_CACHE) > _GEOMETRY_CACHE_MAX:
+            _GEOMETRY_CACHE.popitem(last=False)
+    return points, normals_out, conf_out
+
+
+def place_point_light_at_uv(
+    scene: SceneBuffers,
+    camera: CameraModel,
+    u: float,
+    v: float,
+    *,
+    standoff_fraction: float = 0.25,
+    min_z: float = 0.45,
+) -> tuple[float, float, float]:
+    """Place a 3D point light in camera space aligned with normalized image coordinates (u, v).
+
+    Prevents placing the bulb behind foreground subjects when (u, v) falls on distant
+    background or sky pixels by clamping depth safely ahead of local/scene foreground depth.
+    """
+    u_c = float(np.clip(u, 0.0, 1.0))
+    v_c = float(np.clip(v, 0.0, 1.0))
+    h, w = scene.shape
+    depth = np.asarray(scene.depth, dtype=np.float32)
+    valid = (depth > 0) & np.isfinite(depth)
+    if not np.any(valid):
+        return (0.0, 0.0, 1.0)
+
+    # Determine foreground-safe depth envelope excluding sky/horizon masks if present.
+    from .scene_policy import detect_sky_horizon_mask
+    sky_mask = detect_sky_horizon_mask(scene)
+    fg_cand = valid & (scene.lightable_mask > 0.05) & (sky_mask < 0.25)
+    if scene.semantic_masks:
+        subj = np.zeros((h, w), dtype=bool)
+        for k, m in scene.semantic_masks.items():
+            kl = k.lower()
+            if not any(tok in kl for tok in ("sky", "cloud", "background", "wall", "floor", "ground", "asphalt")):
+                subj |= (np.asarray(m, dtype=np.float32) > 0.5)
+        if np.any(subj & fg_cand):
+            fg_cand = subj & fg_cand
+    fg_depths = depth[fg_cand] if np.any(fg_cand) else depth[valid]
+    z_fg_ref = float(np.percentile(fg_depths, 35))
+
+    px = int(np.clip(round(u_c * (w - 1)), 0, w - 1))
+    py = int(np.clip(round(v_c * (h - 1)), 0, h - 1))
+    y0, y1 = max(0, py - 6), min(h, py + 7)
+    x0, x1 = max(0, px - 6), min(w, px + 7)
+    patch_d = depth[y0:y1, x0:x1]
+    patch_valid = patch_d[patch_d > 0]
+    z_local = float(np.median(patch_valid)) if patch_valid.size else z_fg_ref
+
+    # Clamp local depth to stay in front of foreground subjects (never place bulb behind a person/face).
+    z_anchor = min(z_local, z_fg_ref * 1.10)
+    z_med = float(np.median(depth[valid]))
+    pull = float(np.clip(float(standoff_fraction) * z_med, 0.35, 1.15))
+    z_light = max(z_anchor - pull, float(min_z))
+
+    # Project along exact camera ray for pixel (px, py) at depth z_light.
+    lx = (float(px) - float(camera.cx)) / max(float(camera.fx), 1e-6) * z_light
+    ly = (float(camera.cy) - float(py)) / max(float(camera.fy), 1e-6) * z_light
+    return (round(lx, 4), round(ly, 4), round(z_light, 4))
+
+
+def place_studio_light(
+    scene: SceneBuffers,
+    camera: CameraModel,
+    *,
+    azimuth_deg: float = -48.0,
+    elevation_deg: float = 24.0,
+    distance_scale: float = 1.35,
+    min_z: float = 0.45,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Place an off-axis 3D studio or sky-scale light orbiting the relevant scene mass.
+
+    For studio scenes, orbits the foreground subject so subject and background walls/floors
+    react together. For macroscopic outdoor landscapes (where terrain dominates and a hiker/subject
+    occupies a small foreground fraction), anchors to the full non-sky terrain volume above peak height
+    so illumination covers valley and distant ridges cohesively instead of pooling inside the valley.
+
+    Returns `(position_xyz, aim_direction_xyz)` in camera coordinates (+X right, +Y up, +Z into scene).
+    """
+    from .scene_policy import classify_scene_scale
+
+    points = backproject_depth(scene.depth, camera)
+    valid = (scene.depth > 0) & np.isfinite(scene.depth)
+    if not np.any(valid):
+        return ((-1.2, 0.8, 1.0), (0.6, -0.35, 0.71))
+
+    scale_info = classify_scene_scale(scene)
+    subj = scale_info["subject_mask"]
+    env_surf = scale_info["env_surface_mask"]
+    is_landscape = bool(scale_info["is_landscape"])
+
+    if is_landscape:
+        fg = valid & (scale_info["macro_anchor_mask"] > 0.25)
+    else:
+        fg = valid & (subj > 0.35)
+        if not np.any(fg):
+            fg = valid & (env_surf > 0.1)
+    if not np.any(fg):
+        fg = valid
+
+    fg_pts = points[fg]
+    center = np.median(fg_pts, axis=0).astype(np.float64)
+    p15 = np.percentile(fg_pts, 15, axis=0)
+    p85 = np.percentile(fg_pts, 85, axis=0)
+    span = float(np.linalg.norm(p85 - p15))
+    if is_landscape:
+        # Place landscape lights at sky/sun standoff well above visible mountain ridges.
+        radius = max(1.65 * span, 6.0) * float(max(distance_scale, 0.35))
+        eff_el = max(float(elevation_deg), 26.0)
+    else:
+        radius = float(np.clip(0.55 * span, 0.75, 3.2)) * float(max(distance_scale, 0.35))
+        eff_el = float(elevation_deg)
+
+    az = np.radians(float(azimuth_deg))
+    el = np.radians(eff_el)
+    dir_to_light = np.array([
+        np.sin(az) * np.cos(el),
+        np.sin(el),
+        -np.cos(az) * np.cos(el),
+    ], dtype=np.float64)
+    pos = center + dir_to_light * radius
+    if is_landscape:
+        ridge_top_y = float(np.percentile(fg_pts[:, 1], 95))
+        min_sky_y = ridge_top_y + 0.35 * max(span, 1.0)
+        if pos[1] < min_sky_y:
+            pos[1] = min_sky_y
+    if pos[2] < float(min_z):
+        t = (float(min_z) - float(center[2])) / min(float(dir_to_light[2]), -1e-4)
+        pos = center + dir_to_light * max(t, 0.25)
+        pos[2] = float(min_z)
+
+    aim = center - pos
+    aim = aim / max(float(np.linalg.norm(aim)), 1e-8)
+    pos_t = (round(float(pos[0]), 4), round(float(pos[1]), 4), round(float(pos[2]), 4))
+    aim_t = (round(float(aim[0]), 4), round(float(aim[1]), 4), round(float(aim[2]), 4))
+    return pos_t, aim_t
+
+
+def compute_screen_space_ao(
+    points: np.ndarray,
+    normals: np.ndarray,
+    depth: np.ndarray,
+    *,
+    radii: tuple[int, ...] = (3, 9, 20),
+) -> np.ndarray:
+    """Compute cached multi-scale depth-horizon ambient occlusion in [0.35, 1.0] for crease/contact grounding."""
+    import cv2
+    from scipy.ndimage import gaussian_filter
+
+    h, w = depth.shape
+    key = (_geom_digest(depth), _geom_digest(normals), tuple(radii), h, w)
+    with _GEOMETRY_CACHE_LOCK:
+        hit = _AO_CACHE.get(key)
+        if hit is not None:
+            _AO_CACHE.move_to_end(key)
+            return hit
+
+    scale = min(1.0, 384.0 / float(max(h, w)))
+    if scale < 0.99:
+        hw = max(16, int(round(h * scale)))
+        ww = max(16, int(round(w * scale)))
+        pts_w = cv2.resize(points, (ww, hw), interpolation=cv2.INTER_AREA)
+        nrm_w = cv2.resize(normals, (ww, hw), interpolation=cv2.INTER_AREA)
+        nrm_w = nrm_w / np.maximum(np.linalg.norm(nrm_w, axis=-1, keepdims=True), 1e-8)
+        dep_w = cv2.resize(depth, (ww, hw), interpolation=cv2.INTER_AREA)
+        eff_radii = tuple(max(1, int(round(r * scale))) for r in radii)
+    else:
+        hw, ww = h, w
+        pts_w, nrm_w, dep_w = points, normals, depth
+        eff_radii = radii
+
+    valid = dep_w > 0
+    if not np.any(valid):
+        out = np.ones((h, w), dtype=np.float32)
+        out.setflags(write=False)
+        return out
+
+    z_med = max(float(np.median(dep_w[valid])), 1e-3)
+    max_r = max(0.35 * z_med, 0.40)
+    occ_sum = np.zeros((hw, ww), dtype=np.float32)
+    count = 0
+
+    for rad in eff_radii:
+        diag = max(1, int(round(rad * 0.7071)))
+        offsets = (
+            (0, rad), (0, -rad), (rad, 0), (-rad, 0),
+            (diag, diag), (diag, -diag), (-diag, diag), (-diag, -diag),
+        )
+        for dy, dx in offsets:
+            pts_n = np.roll(np.roll(pts_w, dy, axis=0), dx, axis=1)
+            val_n = np.roll(np.roll(valid, dy, axis=0), dx, axis=1).copy()
+            if dy > 0:
+                val_n[:dy, :] = False
+            elif dy < 0:
+                val_n[dy:, :] = False
+            if dx > 0:
+                val_n[:, :dx] = False
+            elif dx < 0:
+                val_n[:, dx:] = False
+            delta = pts_n - pts_w
+            dist = np.sqrt(np.maximum(np.sum(delta * delta, axis=-1), 1e-8))
+            sin_elev = np.sum(nrm_w * (delta / dist[..., None]), axis=-1)
+            range_w = np.clip(1.0 - dist / max_r, 0.0, 1.0)
+            hit = np.where(valid & val_n & (sin_elev > 0.12), np.clip((sin_elev - 0.12) * 1.15, 0.0, 1.0) * range_w, 0.0)
+            occ_sum += hit.astype(np.float32)
+            count += 1
+
+    ao_raw = 1.0 - np.clip(occ_sum / max(float(count) * 0.25, 1.0), 0.0, 0.65)
+    ao_lo = np.clip(gaussian_filter(ao_raw, 1.2, mode="reflect"), 0.35, 1.0).astype(np.float32)
+    out = cv2.resize(ao_lo, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32) if scale < 0.99 else ao_lo
+    out.setflags(write=False)
+    with _GEOMETRY_CACHE_LOCK:
+        _AO_CACHE[key] = out
+        _AO_CACHE.move_to_end(key)
+        while len(_AO_CACHE) > _GEOMETRY_CACHE_MAX:
+            _AO_CACHE.popitem(last=False)
+    return out

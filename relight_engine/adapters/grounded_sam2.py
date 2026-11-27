@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..scene_policy import SemanticRoutingPolicy, semantic_key, compose_scene_masks
-from .runtime import memory_snapshot, release_device_cache, resolve_torch_device
+from .runtime import memory_snapshot, release_device_cache, release_model_from_device, resolve_torch_device, revision_descriptor
 
 
 @dataclass
@@ -49,6 +49,10 @@ class HuggingFaceGroundedSAM2:
         text_threshold: float = 0.22,
         max_detections_per_prompt: int = 3,
         min_area_fraction: float = 0.002,
+        detector_revision: str | None = None,
+        segmenter_revision: str | None = None,
+        weight_masks_by_confidence: bool = False,
+        dedup_iou_threshold: float = 0.85,
     ) -> None:
         if not 0 < box_threshold < 1 or not 0 < text_threshold < 1:
             raise ValueError("Detection thresholds must be in (0,1).")
@@ -56,6 +60,8 @@ class HuggingFaceGroundedSAM2:
             raise ValueError("max_detections_per_prompt must be >= 1.")
         if not 0 <= min_area_fraction < 1:
             raise ValueError("min_area_fraction must be in [0,1).")
+        if not 0 < dedup_iou_threshold <= 1.0:
+            raise ValueError("dedup_iou_threshold must be in (0,1].")
         self.detector_id = detector_id
         self.segmenter_id = segmenter_id
         self.device_request = device
@@ -63,6 +69,10 @@ class HuggingFaceGroundedSAM2:
         self.text_threshold = text_threshold
         self.max_detections_per_prompt = max_detections_per_prompt
         self.min_area_fraction = min_area_fraction
+        self.detector_revision = detector_revision
+        self.segmenter_revision = segmenter_revision
+        self.weight_masks_by_confidence = bool(weight_masks_by_confidence)
+        self.dedup_iou_threshold = float(dedup_iou_threshold)
 
         self._torch = None
         self._device = None
@@ -92,9 +102,14 @@ class HuggingFaceGroundedSAM2:
                 "No heuristic segmentation fallback is silently substituted."
             ) from exc
         if self._det_model is None:
-            self._det_processor = AutoProcessor.from_pretrained(self.detector_id)
+            revision_kwargs = {"revision": self.detector_revision} if self.detector_revision else {}
+            self._det_processor = AutoProcessor.from_pretrained(
+                self.detector_id, **revision_kwargs
+            )
             self._det_model = (
-                AutoModelForZeroShotObjectDetection.from_pretrained(self.detector_id)
+                AutoModelForZeroShotObjectDetection.from_pretrained(
+                    self.detector_id, **revision_kwargs
+                )
                 .to(self._device)
                 .eval()
             )
@@ -108,9 +123,14 @@ class HuggingFaceGroundedSAM2:
                 "Install a Transformers version with SAM2 support to generate masks."
             ) from exc
         if self._sam_model is None:
-            self._sam_processor = Sam2Processor.from_pretrained(self.segmenter_id)
+            revision_kwargs = {"revision": self.segmenter_revision} if self.segmenter_revision else {}
+            self._sam_processor = Sam2Processor.from_pretrained(
+                self.segmenter_id, **revision_kwargs
+            )
             self._sam_model = (
-                Sam2Model.from_pretrained(self.segmenter_id)
+                Sam2Model.from_pretrained(
+                    self.segmenter_id, **revision_kwargs
+                )
                 .to(self._device)
                 .eval()
             )
@@ -132,6 +152,7 @@ class HuggingFaceGroundedSAM2:
             det_outputs = self._det_model(**det_inputs)
         det_results = self._det_processor.post_process_grounded_object_detection(
             det_outputs,
+            input_ids=det_inputs["input_ids"],
             threshold=self.box_threshold,
             text_threshold=self.text_threshold,
             target_sizes=[(height, width)],
@@ -211,6 +232,7 @@ class HuggingFaceGroundedSAM2:
 
         masks_by_label: dict[str, np.ndarray] = {}
         instance_masks: dict[str, np.ndarray] = {}
+        accepted_binary_by_label: dict[str, list[np.ndarray]] = {}
         instance_counts: dict[str, int] = {}
         detections: list[DetectionRecord] = []
 
@@ -221,11 +243,26 @@ class HuggingFaceGroundedSAM2:
             mask_logits = candidate_logits[best_index].numpy().astype(np.float32)
             mask_prob = 1.0 / (1.0 + np.exp(-np.clip(mask_logits, -30.0, 30.0)))
             quality = float(iou[index, best_index].item())
-            weighted = np.clip(mask_prob * detector_score * quality, 0.0, 1.0)
+            if self.weight_masks_by_confidence:
+                weighted = np.clip(mask_prob * detector_score * quality, 0.0, 1.0)
+            else:
+                weighted = np.clip(mask_prob, 0.0, 1.0)
             if weighted.shape != (height, width):
                 raise RuntimeError(
                     f"SAM2 returned mask shape {weighted.shape}; expected {(height, width)}."
                 )
+
+            binary = mask_prob > 0.5
+            is_duplicate = False
+            for prev_binary in accepted_binary_by_label.get(label_key, []):
+                union = np.count_nonzero(binary | prev_binary)
+                mask_iou = float(np.count_nonzero(binary & prev_binary) / union) if union else 0.0
+                if mask_iou >= self.dedup_iou_threshold:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+            accepted_binary_by_label.setdefault(label_key, []).append(binary)
 
             instance_counts[label_key] = instance_counts.get(label_key, 0) + 1
             instance_id = f"{label_key}__{instance_counts[label_key]:03d}"
@@ -256,10 +293,12 @@ class HuggingFaceGroundedSAM2:
         before = memory_snapshot(torch, self._device)
         if component == "grounding_dino":
             was_loaded = self._det_model is not None or self._det_processor is not None
+            release_model_from_device(self._det_model)
             self._det_model = None
             self._det_processor = None
         elif component == "sam2":
             was_loaded = self._sam_model is not None or self._sam_processor is not None
+            release_model_from_device(self._sam_model)
             self._sam_model = None
             self._sam_processor = None
         else:
@@ -386,12 +425,19 @@ class HuggingFaceGroundedSAM2:
             detections=detections,
             metadata={
                 "detector_id": self.detector_id,
+                "detector_model_revision": revision_descriptor(self.detector_revision),
                 "segmenter_id": self.segmenter_id,
+                "segmenter_model_revision": revision_descriptor(self.segmenter_revision),
                 "device": self._device,
                 "prompts": normalized_prompts,
                 "box_threshold": self.box_threshold,
                 "text_threshold": self.text_threshold,
                 "scores_are_calibrated": False,
+                "mask_weighting": (
+                    "uncalibrated_score_weighted"
+                    if self.weight_masks_by_confidence
+                    else "sam2_sigmoid_probability"
+                ),
                 "mask_generation": "Grounding DINO open-vocabulary boxes refined by SAM2",
                 "semantic_policy": effective_policy.to_metadata(),
                 "material_maps_estimated": False,

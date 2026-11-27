@@ -15,6 +15,8 @@ Relight Studio is a general-purpose 2.5D virtual lighting engine for existing ph
 - Directional, point and sampled rectangular-area lights.
 - Lambertian diffuse and GGX microfacet specular response.
 - Approximate screen-space 2.5D visibility for cast-shadow occlusion.
+- GGX specular response with optional roughness, metalness, dielectric specular-level and RGB conductor F0 maps.
+- Optional material-confidence blending toward declared conservative priors, with per-map provenance in scene QA and render metrics.
 - Source-to-target shading transfer with detail retention, confidence-aware compositing and highlight protection.
 
 ### General-purpose scene understanding path
@@ -69,11 +71,60 @@ Optional neural inference dependencies:
 python -m pip install -r requirements-models.txt
 ```
 
+The optional model requirements include the `einops` and `timm` packages imported by the official Florence-2 custom implementation.
+
+For repeatable runs, pass a full 40-character Hugging Face commit SHA for each model:
+
+```bash
+python scripts/run_scene_analysis.py \
+  --image path/to/photo.jpg \
+  --out scene_analysis \
+  --hfov 60 \
+  --near-is-high \
+  --depth-revision FULL_DEPTH_COMMIT_SHA \
+  --discovery-revision FULL_FLORENCE_COMMIT_SHA \
+  --detector-revision FULL_GROUNDING_DINO_COMMIT_SHA \
+  --segmenter-revision FULL_SAM2_COMMIT_SHA \
+  --strict-model-revisions
+```
+
+The `--strict-model-revisions` option rejects missing, branch, tag, or abbreviated revisions. It requires full 40-character commit IDs for every model used by the selected run. If the user supplies `--prompts`, Florence-2 is skipped and does not require a revision. Without strict mode, the runner records whether each model uses the default ref, a named ref, or a full commit SHA in the manifest.
+
+Run the real-checkpoint CPU smoke test (downloads the configured model checkpoints and the documented car example):
+
+```bash
+python scripts/run_model_integration_smoke.py
+```
+
+This smoke test checks actual inference wiring and sequential cleanup on CPU. It pins immutable model commits recorded in `LICENSE_MODEL_NOTES.md`. It is not an Apple MPS test, depth-polarity validation, multi-domain benchmark, or visual-quality certification.
+
 Install the PyTorch build appropriate for the target device first. Florence-2 uses `trust_remote_code=True`; pin and audit the exact repository revision before deployment. The automatic model stack downloads checkpoints unless already cached.
+
+### User-authored material assignments
+
+Material assignments are applied to dynamic scene masks from `scene_buffers.npz`; the semantic label does not automatically imply a material. For example, add an assignment like this to `material_assignments` in the reviewed relight config:
+
+```json
+[
+  {
+    "name": "warm metal trim",
+    "mask_key": "metal_trim",
+    "roughness": 0.22,
+    "metalness": 1.0,
+    "specular_level": 0.04,
+    "specular_color": [0.78, 0.52, 0.28],
+    "blend": 1.0,
+    "confidence": 0.85
+  }
+]
+```
+
+`specular_color` is linear-RGB conductor F0, not an sRGB display colour or a light tint. `blend` controls the mask assignment mix; `confidence` is a separate caller-declared reliability weight. A missing confidence map uses authored map values as provided. The renderer's conservative fallback priors are roughness 0.75, metalness 0.0, dielectric specular level 0.04 and neutral conductor F0 [0.65, 0.65, 0.65]. These are declared fallbacks, not inferred material truth. Material provenance and supported/unsupported response families appear in the QA and render reports.
+
 
 ## Neural inference memory lifecycle
 
-Continuous Integration: Python 3.14 compile and pytest checks run for pull requests targeting `feature/geometry-v2-quality-gate`.
+Continuous Integration runs Python 3.14 compilation and unit tests for pull requests targeting `main`. A separate model-integration workflow downloads and executes the real Hugging Face checkpoints on CPU for the model-stack smoke milestone.
 
 The scene-analysis command runs neural stages sequentially and releases each model
 after extracting CPU-side results:
@@ -130,6 +181,12 @@ By default all visible image pixels are candidates. To restrict lighting to sele
 
 Artifacts include registered depth, normals, confidence, arbitrary `mask_<label>.png` class masks, `instance_mask_<label>__NNN.png` object masks, lightable/protected maps, an overlay, `scene_buffers.npz` and a provenance manifest.
 
+### CLI vs. Server Analysis Defaults
+
+- **`scripts/run_scene_analysis.py` (CLI)** defaults to `--normal-backend depth_derived` and `--intrinsic-backend none` so standalone/reproducible runs avoid downloading and running multi-GB Marigold diffusion pipelines unless requested. Without intrinsic buffers, `renderer_mode="auto"` falls back to the `ratio` renderer.
+- **FastAPI Server (`POST /v1/scenes/analyze`)** defaults to `normal_backend=marigold_normals` and `intrinsic_backend=marigold_intrinsics_lighting`, producing `albedo`, `source_shading`, and `non_diffuse_residual` so `renderer_mode="auto"` uses the `intrinsic` renderer out of the box.
+- To run the CLI with the full server stack, pass `--normal-backend marigold_normals --intrinsic-backend marigold_intrinsics_lighting`.
+
 ## Current model candidates and license screening
 
 - Florence-2 Base: MIT model card; detailed captions and dense-region captions provide per-image concept proposals. Audit/pin custom code.
@@ -149,9 +206,13 @@ See `LICENSE_MODEL_NOTES.md`, `ENGINE_V1_PLAN.md` and `MATERIAL_RESPONSE_ROADMAP
 - Approximate shadows cannot represent unseen backsides or true overhangs.
 - Florence-2 region labels and detector/mask outputs are proposals, not ground truth.
 - Source illumination is user-calibrated, not automatically estimated yet.
-- Materials are user-authored or generic priors; no material inference is claimed yet.
+- Material maps are user-authored or supplied by a future validated estimator; no automatic material inference is claimed. The current renderer accepts RGB conductor F0 and optional material confidence, and reports conservative priors explicitly.
 - Glass, mirrors, liquids, emissive objects, skin/hair and complex products need specialist response estimation and domain validation.
 - Neural inference and visual quality have not yet been validated across real photographs in this build environment.
+
+## Changelog / Notes
+
+- **Skin Fidelity Guard (`SkinFidelityParams`)**: `EngineSettings.studio_3d()` and `EngineSettings.real_preserving()` now enable `skin_fidelity=SkinFidelityParams(enabled=True)` by default to prevent over-brightening, pore/texture inflation, GGX pixel-speckle, and chroma clipping on detected human skin while leaving pixels where `skin_w == 0` bit-identical. Raw `EngineSettings()` keeps `skin_fidelity.enabled = False`. To opt out on preset builders, pass `skin_fidelity=SkinFidelityParams(enabled=False)`.
 
 ## Validation
 

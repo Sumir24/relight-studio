@@ -81,3 +81,80 @@ def test_scene_buffers_validate_dynamic_semantic_and_instance_maps():
     scene.instance_masks["ceramic_mug__001"][0, 0] = 1.2
     with pytest.raises(ValueError, match="instance mask"):
         scene.validate()
+
+
+def test_scene_buffers_validates_intrinsic_maps_and_rejects_bad_shapes_or_negatives():
+    scene = make_scene()
+    scene.albedo = np.full((*scene.shape, 3), 0.5, dtype=np.float32)
+    scene.source_shading = np.full(scene.shape, 0.8, dtype=np.float32)
+    scene.non_diffuse_residual = np.zeros((*scene.shape, 3), dtype=np.float32)
+    scene.validate()
+
+    bad = make_scene()
+    bad.albedo = np.full((*scene.shape, 4), 0.5, dtype=np.float32)
+    with pytest.raises(ValueError, match="albedo"):
+        bad.validate()
+
+    bad_shading = make_scene()
+    bad_shading.source_shading = np.full(scene.shape, -0.1, dtype=np.float32)
+    with pytest.raises(ValueError, match="source_shading"):
+        bad_shading.validate()
+
+
+def test_engine_settings_validates_renderer_mode_and_detail_lock_strength():
+    defaults = EngineSettings()
+    assert defaults.color_ratio_min <= 0.25 and defaults.color_ratio_max >= 3.0
+    assert 0.85 <= defaults.detail_power <= 1.0
+    assert defaults.lighting_smooth_sigma >= 0.0
+    EngineSettings(
+        renderer_mode="intrinsic",
+        detail_preservation_mode="f3",
+        detail_lock_strength=0.9,
+        preserve_source_lighting=True,
+        lighting_smooth_sigma=1.5,
+    ).validate()
+    assert defaults.detail_preservation_mode == "baseline"
+    with pytest.raises(ValueError, match="detail_preservation_mode"):
+        EngineSettings(detail_preservation_mode="invalid").validate()
+    with pytest.raises(ValueError, match="renderer_mode"):
+        EngineSettings(renderer_mode="unknown").validate()
+    with pytest.raises(ValueError, match="detail_lock_strength"):
+        EngineSettings(detail_lock_strength=1.5).validate()
+    with pytest.raises(ValueError, match="preserve_source_lighting"):
+        EngineSettings(preserve_source_lighting="yes").validate()
+    with pytest.raises(ValueError, match="lighting_smooth_sigma"):
+        EngineSettings(lighting_smooth_sigma=-0.5).validate()
+    with pytest.raises(ValueError, match="shadow_max_thickness"):
+        EngineSettings(shadow_max_thickness=0.0).validate()
+    with pytest.raises(ValueError, match="source_shading_blend"):
+        EngineSettings(source_shading_blend=1.2).validate()
+    with pytest.raises(ValueError, match="atmosphere_density"):
+        EngineSettings(atmosphere_density=-0.1).validate()
+    with pytest.raises(ValueError, match="wrap"):
+        Light("w", "directional", direction=(0, 0, -1), wrap=1.5).validate()
+    with pytest.raises(ValueError, match="radius"):
+        Light("r", "point", position=(0, 0, 1), radius=-0.2).validate()
+    with pytest.raises(ValueError, match="ground"):
+        LightingRig(ambient_ground_color=(-0.1, 0.2, 0.2)).validate()
+    with pytest.raises(ValueError, match="indirect_bounce_strength"):
+        EngineSettings(indirect_bounce_strength=-0.1).validate()
+    with pytest.raises(ValueError, match="indirect_bounce_radius"):
+        EngineSettings(indirect_bounce_radius=0.0).validate()
+    EngineSettings(
+        auto_sh_source=True,
+        indirect_bounce_strength=0.35,
+        indirect_bounce_radius=18.0,
+        filmic_highlight_rolloff=True,
+        refine_depth_edges=True,
+        quality_mode="preview",
+        preview_max_side=384,
+        preview_upsample=True,
+        shadow_adaptive_sampling=True,
+        shadow_smooth_passes=2,
+    ).validate()
+    with pytest.raises(ValueError, match="quality_mode"):
+        EngineSettings(quality_mode="ultra").validate()
+    with pytest.raises(ValueError, match="preview_max_side"):
+        EngineSettings(preview_max_side=16).validate()
+    with pytest.raises(ValueError, match="shadow_smooth_passes"):
+        EngineSettings(shadow_smooth_passes=0).validate()

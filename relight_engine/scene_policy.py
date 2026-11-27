@@ -99,3 +99,135 @@ def compose_scene_masks(
 
     lightable = base * (1.0 - protected)
     return np.clip(lightable, 0.0, 1.0), np.clip(protected, 0.0, 1.0)
+
+
+def detect_sky_horizon_mask(scene) -> np.ndarray:
+    """Detect infinite-depth sky / cloud horizon pixels that must not catch foreground point wash or cast shadows.
+
+    Combines explicit sky/cloud semantic masks (when present) with a conservative geometric
+    far-plane upper-frame saturation check on relative-depth scenes.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    h, w = scene.shape
+    sky = np.zeros((h, w), dtype=np.float32)
+    for k, mask in scene.semantic_masks.items():
+        kl = k.lower()
+        if any(tok in kl for tok in ("sky", "cloud", "heaven")):
+            sky = np.maximum(sky, np.clip(np.asarray(mask, dtype=np.float32), 0.0, 1.0))
+
+    depth = np.asarray(scene.depth, dtype=np.float32)
+    valid = depth > 0
+    if scene.depth_kind == "relative" and np.any(valid):
+        d_vals = depth[valid]
+        d_min = float(np.min(d_vals))
+        d_max = float(np.max(d_vals))
+        if d_max - d_min > 0.5 and d_max >= 4.0:
+            gy = np.abs(np.diff(depth, axis=0, prepend=depth[:1, :]))
+            gx = np.abs(np.diff(depth, axis=1, prepend=depth[:, :1]))
+            d_grad = np.hypot(gx, gy)
+            upper = (np.arange(h, dtype=np.float32)[:, None] / max(float(h - 1), 1.0)) < 0.62
+            sat_far = valid & (depth >= d_max * 0.965) & (d_grad < 0.04 * d_max)
+            # Only treat unlabeled saturated far depth as geometric sky when it touches top edge,
+            # does not extend across bottom ground rows, and is RGB-smooth (not a wall/checkerboard).
+            top_far_frac = float(np.mean(sat_far[0, :])) if h > 0 else 0.0
+            bot_far_frac = float(np.mean(sat_far[-1, :])) if h > 0 else 0.0
+            if top_far_frac > 0.15 and bot_far_frac < 0.15:
+                rgb_luma = 0.2126 * scene.rgb_srgb[..., 0] + 0.7152 * scene.rgb_srgb[..., 1] + 0.0722 * scene.rgb_srgb[..., 2]
+                rgb_hf = np.abs(rgb_luma - gaussian_filter(rgb_luma, 1.5, mode="reflect"))
+                cand = sat_far & upper & (rgb_hf < 0.03)
+                if np.any(cand):
+                    sat_smooth = gaussian_filter(cand.astype(np.float32), 2.5, mode="reflect")
+                    sky = np.maximum(sky, np.clip(sat_smooth, 0.0, 1.0))
+
+    if np.any(sky > 1e-4):
+        sky = np.clip(gaussian_filter(sky, 1.5, mode="reflect"), 0.0, 1.0).astype(np.float32)
+    return sky
+
+
+def classify_scene_layers(scene) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Classify finite scene into (subject_mask, env_surface_mask, sky_mask) in [0, 1].
+
+    Distinguishes foreground subjects from physical 3D walls/floors/grounds (`env_surface_mask`),
+    both of which participate in 3D room lighting and bounce, versus infinite `sky_mask`.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    h, w = scene.shape
+    sky = detect_sky_horizon_mask(scene)
+    subj = np.zeros((h, w), dtype=np.float32)
+
+    env_tokens = (
+        "sky", "cloud", "heaven", "background", "wall", "floor", "ground",
+        "asphalt", "road", "pavement", "grass", "mountain", "water", "sea",
+    )
+    if scene.semantic_masks:
+        for k, m in scene.semantic_masks.items():
+            kl = k.lower()
+            if not any(tok in kl for tok in env_tokens):
+                subj = np.maximum(subj, np.clip(np.asarray(m, dtype=np.float32), 0.0, 1.0))
+
+    depth = np.asarray(scene.depth, dtype=np.float32)
+    valid = (depth > 0) & (sky < 0.5)
+    if not np.any(subj > 0.15) and np.any(valid):
+        z_vals = depth[valid]
+        q15, q65 = np.quantile(z_vals, [0.15, 0.65])
+        if float(q65 - q15) > 0.25:
+            subj = np.clip((float(q65) - depth) / max(float(q65 - q15), 1e-3), 0.0, 1.0)
+
+    subj = np.clip(gaussian_filter(subj, 2.0, mode="reflect") * (1.0 - sky), 0.0, 1.0).astype(np.float32)
+    env_surface = np.clip((1.0 - sky) * (1.0 - subj), 0.0, 1.0).astype(np.float32)
+    return subj, env_surface, sky
+
+
+def classify_scene_scale(scene) -> dict[str, object]:
+    """Distinguish macroscopic outdoor landscapes from close studio scenes for scale-aware lighting.
+
+    A scene is treated as `landscape` when terrain/environment covers most of the frame while
+    foreground segmented subjects occupy only a small minority (`< 10%`), accompanied by either
+    landscape semantic masks or significant sky + depth range.
+    """
+    subj, env_surf, sky = classify_scene_layers(scene)
+    sky_frac = float(np.mean(sky > 0.5))
+    subj_frac = float(np.mean(subj > 0.35))
+    env_frac = float(np.mean(env_surf > 0.35))
+
+    landscape_tokens = (
+        "mountain", "majestic_mountains", "valley", "glacier", "hill",
+        "cliff", "canyon", "ocean", "sea", "landscape", "terrain",
+    )
+    has_landscape_sem = False
+    if getattr(scene, "semantic_masks", None):
+        for k, m in scene.semantic_masks.items():
+            kl = k.lower()
+            if any(tok in kl for tok in landscape_tokens) and np.any(np.asarray(m) > 0.10):
+                has_landscape_sem = True
+                break
+
+    depth = np.asarray(scene.depth, dtype=np.float32)
+    valid = (depth > 0) & np.isfinite(depth)
+    if np.any(valid):
+        z_vals = depth[valid]
+        z_p05, z_p95 = np.quantile(z_vals, [0.05, 0.95])
+        depth_span_ratio = float(z_p95 / max(float(z_p05), 1e-3))
+    else:
+        depth_span_ratio = 1.0
+
+    is_landscape = bool(
+        env_frac >= 0.40
+        and subj_frac < 0.10
+        and (has_landscape_sem or (sky_frac >= 0.12 and depth_span_ratio >= 2.2))
+    )
+    macro_anchor_mask = np.clip((env_surf + subj) * (1.0 - sky), 0.0, 1.0).astype(np.float32)
+    return {
+        "scene_scale": "landscape" if is_landscape else "studio",
+        "is_landscape": is_landscape,
+        "sky_frac": sky_frac,
+        "subj_frac": subj_frac,
+        "env_frac": env_frac,
+        "depth_span_ratio": depth_span_ratio,
+        "subject_mask": subj,
+        "env_surface_mask": env_surf,
+        "sky_mask": sky,
+        "macro_anchor_mask": macro_anchor_mask,
+    }

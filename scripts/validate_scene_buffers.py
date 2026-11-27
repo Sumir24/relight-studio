@@ -49,6 +49,12 @@ def main() -> int:
         normals=arrays.get("normals"), geometry_confidence=arrays.get("geometry_confidence"),
         alpha_mask=arrays.get("alpha_mask"), protected_mask=arrays.get("protected_mask"),
         semantic_masks=semantic_masks, instance_masks=instance_masks,
+        roughness=arrays.get("roughness"),
+        metalness=arrays.get("metalness"),
+        specular_level=arrays.get("specular_level"),
+        specular_color=arrays.get("specular_color"),
+        material_confidence=arrays.get("material_confidence"),
+        material_metadata=manifest.get("material_metadata", {}),
         metadata={
             "source_manifest": str(args.manifest.resolve()) if args.manifest else None,
             "source_npz": str(args.scene_npz.resolve()),

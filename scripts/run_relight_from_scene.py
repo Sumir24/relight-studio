@@ -15,9 +15,17 @@ def main() -> int:
     parser.add_argument("--scene-dir", required=True, type=Path, help="Directory produced by run_scene_analysis.py")
     parser.add_argument("--config", required=True, type=Path, help="User-reviewed JSON lighting/material calibration")
     parser.add_argument("--output", type=Path, default=Path("relight_output.png"))
+    parser.add_argument("--renderer", default=None, choices=["auto", "ratio", "intrinsic", "hybrid_neural"],
+                        help="Override settings.renderer_mode.")
+    parser.add_argument("--relighter", default=None,
+                        help="Registered neural relighter backend for hybrid_neural mode (e.g. ic_light).")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     args = parser.parse_args()
     try:
-        report = run_scene_relight(args.scene_dir, args.config, args.output)
+        report = run_scene_relight(
+            args.scene_dir, args.config, args.output,
+            renderer_mode=args.renderer, relighter_backend=args.relighter, device=args.device,
+        )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

@@ -17,9 +17,16 @@ def test_target_rig_builder_supports_temperature_and_directional_light():
     rig = target_rig_from_dict({
         "ambient_strength": 0.1,
         "ambient_temperature_kelvin": 6500,
-        "lights": [{"kind": "directional", "direction": [1, 1, -1], "color_temperature_kelvin": 5000}],
+        "ambient_ground_temperature_kelvin": 3200,
+        "lights": [{
+            "kind": "directional", "direction": [1, 1, -1],
+            "color_temperature_kelvin": 5000, "wrap": 0.35, "radius": 0.12,
+        }],
     })
     assert len(rig.lights) == 1
+    assert rig.lights[0].wrap == pytest.approx(0.35)
+    assert rig.lights[0].radius == pytest.approx(0.12)
+    assert rig.ambient_ground_color is not None
     rig.validate()
 
 
@@ -88,8 +95,22 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
         geometry_confidence=conf, normals=normals, lightable_mask=lightable,
         mask_surface_panel=surface_a, mask_fabric=surface_b,
         mask_instance_person__001=person_1, alpha_mask=alpha, protected_mask=protected,
+        roughness=np.full((h, w), 0.42, np.float32),
+        metalness=np.full((h, w), 0.25, np.float32),
+        specular_level=np.full((h, w), 0.06, np.float32),
+        specular_color=np.broadcast_to(
+            np.array([0.72, 0.38, 0.18], np.float32), (h, w, 3)
+        ).copy(),
+        material_confidence=np.full((h, w), 0.6, np.float32),
     )
     manifest = {
+        "material_metadata": {
+            "roughness": {"source": "user_authored", "calibrated": False},
+            "metalness": {"source": "user_authored", "calibrated": False},
+            "specular_level": {"source": "user_authored", "calibrated": False},
+            "specular_color": {"source": "user_authored", "calibrated": False},
+            "material_confidence": {"source": "user_reviewed", "calibrated": False},
+        },
         "depth": {"depth_kind": "relative", "model_id": "synthetic-test-fixture"},
         "geometry_confidence": {"source": "synthetic-test-heuristic", "calibrated": False},
         "segmentation": {"model_id": "synthetic-test-fixture"},
@@ -103,6 +124,10 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     assert sorted(loaded_scene.instance_masks) == ["person__001"]
     assert loaded_scene.alpha_mask is not None
     assert loaded_scene.protected_mask is not None
+    assert loaded_scene.specular_color is not None
+    assert np.allclose(loaded_scene.specular_color[0, 0], [0.72, 0.38, 0.18])
+    assert loaded_scene.material_confidence[0, 0] == pytest.approx(0.6)
+    assert loaded_scene.material_metadata["specular_color"]["source"] == "user_authored"
     assert loaded_scene.metadata["geometry_confidence_source"] == "synthetic-test-heuristic"
     assert np.all(loaded_scene.protected_mask[:2] == 1.0)
 
@@ -124,7 +149,8 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
         },
         "material_assignments": [{
             "name": "panel_test_material", "mask_key": "surface_panel",
-            "roughness": 0.9, "metalness": 0.0, "specular_level": 0.04,
+            "roughness": 0.9, "metalness": 1.0, "specular_level": 0.04,
+            "specular_color": [0.78, 0.32, 0.14], "confidence": 0.85,
         }],
         "settings": {"base_blur_sigma": 3.0, "shadow_steps": 4},
     }
@@ -144,5 +170,355 @@ def test_full_scene_to_relight_workflow_on_synthetic_fixture(tmp_path):
     assert report["status"] == "rendered_with_explicit_user_calibration"
     assert report["source_calibration"]["source"] == "user_calibration_not_automatic_estimation"
     assert report["material_maps"]["neural_material_estimation_used"] is False
+    assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["available"] is True
+    assert report["engine_metrics"]["material_response"]["material_confidence"]["available"] is True
+    assert report["engine_metrics"]["material_response"]["maps"]["specular_color"]["source"] == "user_assignment_plus_renderer_prior"
     assert report["engine_metrics"]["mean_abs_srgb_change_active"] > 0
     assert report["physical_accuracy_notes"]
+
+
+
+def test_user_material_assignment_applies_rgb_f0_confidence_and_provenance():
+    h, w = 6, 8
+    mask = np.zeros((h, w), np.float32)
+    mask[1:5, 2:6] = 1.0
+    scene = SceneBuffers(
+        rgb_srgb=np.zeros((h, w, 3), np.float32),
+        depth=np.ones((h, w), np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative",
+    )
+    metadata = apply_user_material_assignments(
+        scene,
+        {"mask_metal_trim": mask},
+        [{
+            "name": "metal trim",
+            "mask_key": "metal_trim",
+            "roughness": 0.18,
+            "metalness": 1.0,
+            "specular_level": 0.04,
+            "specular_color": [0.88, 0.55, 0.25],
+            "confidence": 0.7,
+        }],
+    )
+
+    assert scene.specular_color is not None
+    assert np.allclose(scene.specular_color[2, 3], [0.88, 0.55, 0.25])
+    assert scene.material_confidence[2, 3] == pytest.approx(0.7)
+    assert scene.material_confidence[0, 0] == pytest.approx(0.0)
+    assert scene.material_metadata["specular_color"]["source"] == "user_assignment_plus_renderer_prior"
+    assert "unassigned pixels retain" in scene.material_metadata["specular_color"]["notes"]
+    assert scene.material_metadata["roughness"]["source"] == "user_assignment_plus_renderer_prior"
+    assert scene.material_metadata["material_confidence"]["calibrated"] is False
+    assert "not a calibrated probability" in scene.material_metadata["material_confidence"]["notes"].lower()
+    assert metadata["neural_material_estimation_used"] is False
+
+
+def test_user_material_assignment_resolves_instance_mask_filename_stem():
+    h, w = 6, 8
+    mask = np.zeros((h, w), np.float32)
+    mask[1:4, 2:6] = 1.0
+    scene = SceneBuffers(
+        rgb_srgb=np.zeros((h, w, 3), np.float32),
+        depth=np.ones((h, w), np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        lightable_mask=np.ones((h, w), np.float32),
+        depth_kind="relative",
+    )
+    apply_user_material_assignments(
+        scene,
+        {"mask_instance_person__001": mask},
+        [{
+            "name": "person_one",
+            "mask_key": "instance_mask_person__001.png",
+            "roughness": 0.62,
+        }],
+    )
+    assert np.allclose(scene.roughness[1:4, 2:6], 0.62)
+
+
+def test_run_scene_relight_enforces_structural_geometry_gate_by_default(tmp_path):
+    import json
+    from relight_engine.workflows import run_scene_relight
+
+    scene_dir = tmp_path / "low_conf_scene"
+    scene_dir.mkdir()
+    h, w = 16, 20
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.4, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.full((h, w), 0.05, np.float32),
+        geometry_confidence=np.full((h, w), 0.05, np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative"},
+        "geometry_confidence": {"source": "test", "calibrated": False},
+        "camera": {"fx": 20.0, "fy": 20.0, "cx": w / 2, "cy": h / 2},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    config = {
+        "approved_for_test": True,
+        "source_calibration": {"key_direction": [0.0, 0.0, -1.0]},
+        "target_rig": {"lights": [{"kind": "directional", "direction": [0.5, 0.0, -0.8]}]},
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="structural gate"):
+        run_scene_relight(scene_dir, config_path, tmp_path / "blocked.png")
+
+    config["require_geometry_ready"] = False
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    report = run_scene_relight(scene_dir, config_path, tmp_path / "override.png")
+    assert report["engine_metrics"]["geometry_readiness_gate_enforced"] is False
+
+
+def test_load_scene_artifacts_preserves_neural_scene_estimation_flag(tmp_path):
+    import json
+    from relight_engine.workflows import load_scene_artifacts
+
+    scene_dir = tmp_path / "neural_scene"
+    scene_dir.mkdir()
+    h, w = 8, 10
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.4, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.full((h, w), 0.45, np.float32),
+        geometry_confidence=np.full((h, w), 0.45, np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative", "model_id": "depth-anything/Depth-Anything-V2-Small-hf"},
+        "segmentation": {"detector_id": "IDEA-Research/grounding-dino-tiny"},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "camera": {"fx": 10.0, "fy": 10.0, "cx": 5.0, "cy": 4.0},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    scene, _, _, _ = load_scene_artifacts(scene_dir)
+    assert scene.metadata["neural_scene_estimation_used"] is True
+
+
+def test_load_scene_artifacts_restores_intrinsic_buffers_and_metadata(tmp_path):
+    import json
+    from relight_engine.workflows import load_scene_artifacts
+
+    scene_dir = tmp_path / "intrinsic_scene"
+    scene_dir.mkdir()
+    h, w = 8, 10
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    albedo = np.full((h, w, 3), 0.55, np.float32)
+    source_shading = np.full((h, w), 0.72, np.float32)
+    residual = np.full((h, w, 3), 0.04, np.float32)
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.4, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.full((h, w), 0.45, np.float32),
+        geometry_confidence=np.full((h, w), 0.45, np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+        albedo=albedo,
+        source_shading=source_shading,
+        non_diffuse_residual=residual,
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative"},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "intrinsic_metadata": {"source": "test_intrinsic_estimator", "calibrated": False},
+        "camera": {"fx": 10.0, "fy": 10.0, "cx": 5.0, "cy": 4.0},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    scene, _, _, _ = load_scene_artifacts(scene_dir)
+    assert scene.albedo is not None and np.allclose(scene.albedo, albedo)
+    assert scene.source_shading is not None and np.allclose(scene.source_shading, source_shading)
+    assert scene.non_diffuse_residual is not None and np.allclose(scene.non_diffuse_residual, residual)
+    assert scene.intrinsic_metadata["source"] == "test_intrinsic_estimator"
+
+
+def test_run_scene_relight_supports_intrinsic_and_registered_relighter(tmp_path, monkeypatch):
+    import json
+    from relight_engine.adapters.protocols import NeuralRelightPrediction
+    from relight_engine.adapters import registry
+    from relight_engine.adapters.registry import register_relighter_backend
+    from relight_engine.workflows import run_scene_relight
+
+    monkeypatch.setattr(registry, "_RELIGHTER_BACKENDS", dict(registry._RELIGHTER_BACKENDS))
+
+    class _TestRelighter:
+        def render(self, sc, target_d, target_s, target_rig, settings):
+            return NeuralRelightPrediction(
+                rgb_srgb=np.full_like(sc.rgb_srgb, 0.7),
+                metadata={"backend": "test_relighter"},
+            )
+
+        def runtime_snapshot(self):
+            return {"device": "cpu"}
+
+        def close(self):
+            return {"released": False}
+
+    register_relighter_backend("test_registered_relighter", lambda **_kw: _TestRelighter())
+
+    scene_dir = tmp_path / "hybrid_scene"
+    scene_dir.mkdir()
+    h, w = 16, 20
+    normals = np.zeros((h, w, 3), np.float32)
+    normals[..., 2] = -1.0
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=np.full((h, w, 3), 0.35, np.float32),
+        depth=np.full((h, w), 2.0, np.float32),
+        depth_confidence=np.ones((h, w), np.float32),
+        geometry_confidence=np.ones((h, w), np.float32),
+        normals=normals,
+        lightable_mask=np.ones((h, w), np.float32),
+        albedo=np.full((h, w, 3), 0.6, np.float32),
+        source_shading=np.full((h, w), 0.25, np.float32),
+    )
+    manifest = {
+        "depth": {"depth_kind": "relative"},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "camera": {"fx": 20.0, "fy": 20.0, "cx": 10.0, "cy": 8.0},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    cfg = {
+        "approved_for_test": True,
+        "source_calibration": {"key_direction": [0.0, 0.0, -1.0]},
+        "target_rig": {"lights": [{"kind": "directional", "direction": [0.0, 0.0, -1.0], "casts_shadows": False}]},
+        "settings": {"base_blur_sigma": 3.0},
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    rep_intr = run_scene_relight(scene_dir, cfg_path, tmp_path / "out_intr.png", renderer_mode="intrinsic")
+    assert rep_intr["engine_metrics"]["renderer_mode"] == "intrinsic"
+
+    rep_hyb = run_scene_relight(
+        scene_dir, cfg_path, tmp_path / "out_hyb.png",
+        renderer_mode="hybrid_neural", relighter_backend="test_registered_relighter",
+    )
+    assert rep_hyb["engine_metrics"]["renderer_mode"] == "hybrid_neural"
+    assert rep_hyb["engine_metrics"]["neural_relighter"]["backend"] == "test_relighter"
+
+
+def test_built_scene_buffers_flow_through_artifacts_to_auto_intrinsic_and_ratio_fallback(tmp_path):
+    import json
+    from PIL import Image
+    from relight_engine.adapters import DepthPrediction, SemanticPrediction, build_scene_buffers
+    from relight_engine.workflows import run_scene_relight
+
+    h, w = 20, 24
+    rgb = np.full((h, w, 3), 0.35, dtype=np.float32)
+    depth = np.linspace(1.5, 2.5, w, dtype=np.float32)[None, :].repeat(h, axis=0)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    protected = np.zeros((h, w), dtype=np.float32)
+    protected[:4, :] = 1.0
+    lightable = 1.0 - protected
+    subject_mask = np.ones((h, w), dtype=np.float32)
+    albedo = np.full((h, w, 3), 0.60, dtype=np.float32)
+    source_shading = np.full((h, w), 0.25, dtype=np.float32)
+    residual = np.full((h, w, 3), 0.08, dtype=np.float32)
+
+    depth_pred = DepthPrediction(
+        depth=depth,
+        confidence=np.ones((h, w), dtype=np.float32),
+        kind="relative",
+    )
+    semantics = SemanticPrediction(
+        lightable_mask=lightable,
+        protected_mask=protected,
+        class_masks={"subject": subject_mask},
+        albedo=albedo,
+        source_shading=source_shading,
+        non_diffuse_residual=residual,
+        intrinsic_metadata={"source": "test_intrinsic", "calibrated": False},
+    )
+    built = build_scene_buffers(rgb, depth_pred, semantics)
+    built.normals = normals
+    built.geometry_confidence = np.ones((h, w), dtype=np.float32)
+    built.validate()
+
+    scene_dir = tmp_path / "intrinsic_scene"
+    scene_dir.mkdir()
+    np.savez_compressed(
+        scene_dir / "scene_buffers.npz",
+        rgb_srgb=built.rgb_srgb,
+        depth=built.depth,
+        depth_confidence=built.depth_confidence,
+        geometry_confidence=built.geometry_confidence,
+        normals=built.normals,
+        lightable_mask=built.lightable_mask,
+        protected_mask=built.protected_mask,
+        mask_subject=built.semantic_masks["subject"],
+        albedo=built.albedo,
+        source_shading=built.source_shading,
+        non_diffuse_residual=built.non_diffuse_residual,
+    )
+    manifest = {
+        "depth": {"depth_kind": built.depth_kind},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "intrinsic_metadata": built.intrinsic_metadata,
+        "camera": {"fx": 24.0, "fy": 24.0, "cx": w / 2, "cy": h / 2},
+    }
+    (scene_dir / "scene_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    cfg = {
+        "approved_for_test": True,
+        "source_calibration": {"key_direction": [0.0, 0.0, -1.0], "key_strength": 0.8, "ambient_strength": 0.2},
+        "target_rig": {
+            "ambient_strength": 0.2,
+            "lights": [{"kind": "directional", "direction": [0.0, 0.0, -1.0], "strength": 0.8, "casts_shadows": False}],
+        },
+        "settings": {"base_blur_sigma": 3.0},
+    }
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    out_auto = tmp_path / "out_auto.png"
+    out_intr = tmp_path / "out_intr.png"
+    out_ratio = tmp_path / "out_ratio.png"
+    rep_auto = run_scene_relight(scene_dir, cfg_path, out_auto)
+    rep_intr = run_scene_relight(scene_dir, cfg_path, out_intr, renderer_mode="intrinsic")
+    rep_ratio = run_scene_relight(scene_dir, cfg_path, out_ratio, renderer_mode="ratio")
+
+    assert rep_auto["engine_metrics"]["renderer_mode"] == "intrinsic"
+    assert rep_intr["engine_metrics"]["renderer_mode"] == "intrinsic"
+    assert rep_ratio["engine_metrics"]["renderer_mode"] == "ratio"
+    assert rep_auto["engine_metrics"]["mean_abs_srgb_change_protected"] == pytest.approx(0.0, abs=1e-6)
+    with Image.open(out_auto) as im_auto, Image.open(out_intr) as im_intr:
+        assert np.array_equal(np.asarray(im_auto), np.asarray(im_intr))
+
+    # Same scene without intrinsic buffers must fall back to ratio in automatic mode.
+    fallback_dir = tmp_path / "fallback_scene"
+    fallback_dir.mkdir()
+    np.savez_compressed(
+        fallback_dir / "scene_buffers.npz",
+        rgb_srgb=built.rgb_srgb,
+        depth=built.depth,
+        depth_confidence=built.depth_confidence,
+        geometry_confidence=built.geometry_confidence,
+        normals=built.normals,
+        lightable_mask=built.lightable_mask,
+        protected_mask=built.protected_mask,
+        mask_subject=built.semantic_masks["subject"],
+    )
+    (fallback_dir / "scene_manifest.json").write_text(json.dumps({
+        "depth": {"depth_kind": built.depth_kind},
+        "geometry_confidence": {"source": "heuristic", "calibrated": False},
+        "camera": {"fx": 24.0, "fy": 24.0, "cx": w / 2, "cy": h / 2},
+    }), encoding="utf-8")
+    rep_fb = run_scene_relight(fallback_dir, cfg_path, tmp_path / "out_fallback.png")
+    assert rep_fb["engine_metrics"]["renderer_mode"] == "ratio"

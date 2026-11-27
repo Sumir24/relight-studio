@@ -98,6 +98,18 @@ def memory_snapshot(torch: Any, device: str | None) -> dict[str, Any]:
     return result
 
 
+def release_model_from_device(model: Any) -> None:
+    """Move an accelerator-resident model back to CPU before dropping references."""
+    if model is None:
+        return
+    to_fn = getattr(model, "to", None)
+    if callable(to_fn):
+        try:
+            to_fn("cpu")
+        except Exception:
+            pass
+
+
 def release_device_cache(torch: Any, device: str | None) -> dict[str, Any]:
     """Collect Python objects and ask the active accelerator allocator to release cache."""
     gc.collect()
@@ -108,6 +120,12 @@ def release_device_cache(torch: Any, device: str | None) -> dict[str, Any]:
     }
     if device == "mps":
         mps = getattr(torch, "mps", None)
+        synchronize = getattr(mps, "synchronize", None)
+        if callable(synchronize):
+            try:
+                synchronize()
+            except Exception as exc:
+                result["synchronize_error"] = str(exc)
         empty_cache = getattr(mps, "empty_cache", None)
         if callable(empty_cache):
             try:
@@ -125,3 +143,26 @@ def release_device_cache(torch: Any, device: str | None) -> dict[str, Any]:
             except Exception as exc:
                 result["cache_clear_error"] = str(exc)
     return result
+
+
+def is_full_commit_sha(revision: str | None) -> bool:
+    """Return True only for a full 40-hex Git commit ID, not a branch or tag."""
+    import re
+
+    return isinstance(revision, str) and re.fullmatch(r"[0-9a-fA-F]{40}", revision) is not None
+
+
+def revision_descriptor(revision: str | None) -> dict[str, Any]:
+    """Describe whether model loading uses an immutable commit or a mutable ref."""
+    if revision is None or not str(revision).strip():
+        return {
+            "revision": None,
+            "revision_kind": "default_model_ref",
+            "immutable_commit_pinned": False,
+        }
+    value = str(revision).strip()
+    return {
+        "revision": value,
+        "revision_kind": "full_commit_sha" if is_full_commit_sha(value) else "named_ref",
+        "immutable_commit_pinned": is_full_commit_sha(value),
+    }
