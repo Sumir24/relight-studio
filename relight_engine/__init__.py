@@ -1,7 +1,7 @@
-from .contracts import CameraModel, SceneBuffers, Light, LightingRig, EnvironmentLight, EngineSettings, RelightResult
+from .contracts import CameraModel, SceneBuffers, Light, LightingRig, EnvironmentLight, EngineSettings, SkinFidelityParams, RelightResult
 from .engine import relight, RelightSession, prepare_relight_session
 
-__all__ = ['CameraModel', 'SceneBuffers', 'Light', 'LightingRig', 'EnvironmentLight', 'EngineSettings', 'RelightResult', 'relight', 'RelightSession', 'prepare_relight_session']
+__all__ = ['CameraModel', 'SceneBuffers', 'Light', 'LightingRig', 'EnvironmentLight', 'EngineSettings', 'SkinFidelityParams', 'RelightResult', 'relight', 'RelightSession', 'prepare_relight_session']
 
 from .calibration import (
     SourceIllumination,
@@ -10,6 +10,7 @@ from .calibration import (
     MaterialMaps,
     build_material_maps,
     compute_intrinsic_reconstruction_error,
+    compute_skin_likelihood_map,
     estimate_source_illumination,
     kelvin_to_linear_rgb,
     refine_source_shading_with_albedo,
@@ -23,6 +24,7 @@ __all__ += [
     'MaterialMaps',
     'build_material_maps',
     'compute_intrinsic_reconstruction_error',
+    'compute_skin_likelihood_map',
     'estimate_source_illumination',
     'kelvin_to_linear_rgb',
     'refine_source_shading_with_albedo',

@@ -2,6 +2,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import hashlib
 import math
+import os
 import threading
 import cv2
 import numpy as np
@@ -547,7 +548,7 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
     diffuse_energy = np.clip(1.0 - 0.88 * metalness, 0.08, 1.0).astype(np.float32)[..., None]
     diffuse_energy = diffuse_energy * (1.0 - 0.5 * np.clip(spec_level, 0.0, 0.35)[..., None])
     has_coat = bool(np.any(clearcoat > 1e-4))
-    has_sss = bool(np.any(subsurface > 1e-4))
+    has_sss = bool(np.any(subsurface > 1e-4)) and os.environ.get("RELIGHT_ABLATE_NO_SSS_WRAP") != "1"
     view = _normalize(-points)
     if has_coat:
         ndotv_coat = np.clip(np.sum(normals * view, axis=-1), 0.0, 1.0)
@@ -919,6 +920,89 @@ def compute_indirect_specular(
     return (spec_bounce * strength).astype(np.float32)
 
 
+def _evaluate_virtual_studio_reflection(
+    scene: SceneBuffers,
+    points: np.ndarray,
+    normals: np.ndarray,
+    rig: LightingRig,
+    settings: EngineSettings,
+    roughness: np.ndarray,
+    metalness: np.ndarray,
+    spec_level: np.ndarray,
+    specular_color: np.ndarray,
+    clearcoat: np.ndarray,
+    clearcoat_roughness: np.ndarray,
+) -> np.ndarray:
+    """Synthesize view-dependent reflection transport along R = reflect(-V, N) when no HDRI env is bound."""
+    h, w = scene.depth.shape
+    if not rig.lights:
+        return np.zeros((h, w, 3), dtype=np.float32)
+
+    view = _normalize(-points)
+    ndotv = np.clip(np.sum(normals * view, axis=-1), 0.0, 1.0)
+    # R = 2*(N.V)*N - V
+    refl = _normalize(2.0 * ndotv[..., None] * normals - view)
+
+    f0_dielectric = (0.04 + 0.12 * np.clip(spec_level, 0.0, 1.0))[..., None]
+    f0 = specular_color * metalness[..., None] + f0_dielectric * (1.0 - metalness[..., None])
+    fresnel = f0 + (1.0 - f0) * np.power(1.0 - ndotv[..., None], 5.0)
+    has_coat = bool(np.any(clearcoat > 1e-4))
+    coat_fresnel = (0.04 + 0.96 * np.power(1.0 - ndotv, 5.0)) * clearcoat if has_coat else 0.0
+
+    valid_d = scene.depth > 0
+    z_ref = max(float(np.median(scene.depth[valid_d])) if np.any(valid_d) else 2.0, 1.0)
+    self_occ = np.clip(np.sum(refl * normals, axis=-1) + 0.15, 0.0, 1.0)
+    horizon_gate = (0.35 + 0.65 * self_occ)[..., None].astype(np.float32)
+    rough_energy = np.clip(1.0 - 0.55 * roughness, 0.15, 1.0)[..., None].astype(np.float32)
+
+    total_refl = np.zeros((h, w, 3), dtype=np.float32)
+    for light in rig.lights:
+        col = np.asarray(light.color, dtype=np.float32)[None, None, :]
+        eff_str = (
+            float(light.strength) / math.pi
+            if (light.intensity_mode == 'physical' and light.kind in ('point', 'area', 'spot'))
+            else float(light.strength)
+        )
+        eff_radius = max(float(light.radius), 0.25)
+        if light.kind == 'area':
+            eff_radius = max(eff_radius, 0.35 * math.hypot(float(light.area_size[0]), float(light.area_size[1])))
+
+        if light.kind == 'directional':
+            toward = np.asarray(light.direction, dtype=np.float32)
+            toward /= max(float(np.linalg.norm(toward)), 1e-8)
+            ldir = np.broadcast_to(toward, (h, w, 3))
+            atten = np.full((h, w), eff_str, dtype=np.float32)
+            ang_light = 0.18
+        else:
+            lp = np.asarray(light.position, dtype=np.float32)
+            vec = lp[None, None, :] - points
+            dist = np.linalg.norm(vec, axis=-1)
+            ldir = vec / np.maximum(dist[..., None], 1e-8)
+            if scene.depth_kind == 'metric':
+                atten = eff_str / np.maximum(dist * dist, 0.04)
+            else:
+                dist_ref = float(np.median(dist[valid_d])) if np.any(valid_d) else z_ref
+                rel_scale = max(0.45 * z_ref, 0.48 * dist_ref, 1.0)
+                d_scaled = dist / rel_scale
+                atten = eff_str / (1.0 + 0.30 * d_scaled * d_scaled)
+            ang_light = np.arctan(eff_radius / np.maximum(dist, 0.25))
+
+        cos_r = np.clip(np.sum(refl * ldir, axis=-1), -1.0, 1.0)
+        angle = np.arccos(cos_r)
+        alpha = np.maximum(ang_light + 0.12 + 0.72 * roughness, 0.10)
+        lobe = np.exp(-0.5 * (angle / alpha) ** 2).astype(np.float32)
+        radiance = col * (atten * lobe)[..., None]
+
+        contrib = radiance * fresnel * rough_energy
+        if has_coat:
+            alpha_c = np.maximum(ang_light + 0.08 + 0.65 * clearcoat_roughness, 0.08)
+            lobe_c = np.exp(-0.5 * (angle / alpha_c) ** 2).astype(np.float32)
+            contrib = contrib + col * (atten * lobe_c * coat_fresnel)[..., None]
+        total_refl += contrib
+
+    return (total_refl * horizon_gate * float(settings.specular_scale)).astype(np.float32)
+
+
 def evaluate_rig(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
                  normals: np.ndarray, rig: LightingRig, settings: EngineSettings,
                  *, return_details: bool = False):
@@ -984,6 +1068,20 @@ def evaluate_rig(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
             * (amb_metal_w * amb_gloss * min(ind_spec_s, 0.65))[..., None]
             * eff_ao
         ).astype(np.float32)
+    if rig.environment is None and getattr(settings, "virtual_studio_reflection", False) and rig.lights:
+        specular += _evaluate_virtual_studio_reflection(
+            scene,
+            points,
+            normals,
+            rig,
+            settings,
+            roughness,
+            metalness,
+            spec_level,
+            specular_color,
+            clearcoat,
+            clearcoat_roughness,
+        ) * eff_ao
     visibility = np.ones((h, w), np.float32)
     vis_weight_sum = np.zeros((h, w), np.float32)
     vis_weighted_acc = np.zeros((h, w), np.float32)

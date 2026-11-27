@@ -269,6 +269,207 @@ def refine_depth_to_rgb_edges(
     return np.where(valid, refined, 0.0).astype(np.float32)
 
 
+def clean_depth_background_skirt(
+    depth: np.ndarray,
+    rgb_srgb: np.ndarray,
+    semantic_masks: dict[str, np.ndarray] | None = None,
+) -> np.ndarray:
+    """Snap monocular depth skirts on smooth background pixels back to the background manifold.
+
+    Monocular depth models often bleed foreground depth onto adjacent or enclosed smooth
+    background pixels (e.g., hair gaps, finger spaces, sculptural cutouts). This detects
+    low-gradient background pixels outside foreground masks whose depth was pulled below
+    the background manifold and restores them toward the local background depth.
+    """
+    from scipy.ndimage import gaussian_filter, maximum_filter, sobel
+    import cv2
+
+    d = np.asarray(depth, dtype=np.float32)
+    valid = d > 0
+    if not np.any(valid):
+        return d
+
+    z_fg_p15, z_bg_med = np.percentile(d[valid], [15.0, 82.0])
+    if z_bg_med <= 1.25 * max(float(z_fg_p15), 1e-4):
+        return d
+
+    rgb = np.asarray(rgb_srgb, dtype=np.float32)
+    y = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+    gx = sobel(y, axis=1) / 8.0
+    gy = sobel(y, axis=0) / 8.0
+    edge_mag = np.hypot(gx, gy)
+
+    bg_seed = valid & (d >= 0.80 * z_bg_med)
+    if not np.any(bg_seed):
+        return d
+
+    bg_y_med = float(np.median(y[bg_seed]))
+    bg_y_std = float(np.std(y[bg_seed]))
+    # Only clean background depth skirts on genuinely dark, smooth studio/cutout backdrops.
+    # Medium-bright or textured room/desk backdrops (e.g. out-of-focus hands/tables) should not
+    # match shaded foreground skin or objects.
+    if bg_y_med >= 0.14 or bg_y_std >= 0.09:
+        return d
+
+    y_tol = min(max(bg_y_std * 1.4, 0.03), 0.065)
+    looks_like_bg = (np.abs(y - bg_y_med) <= y_tol) & (y < 0.14) & (edge_mag < 0.045)
+    if semantic_masks:
+        fg_union = np.zeros(d.shape, dtype=np.float32)
+        for mv in semantic_masks.values():
+            fg_union = np.maximum(fg_union, np.clip(np.asarray(mv, dtype=np.float32), 0.0, 1.0))
+        if float(np.mean(fg_union > 0.2)) >= 0.015:
+            looks_like_bg = looks_like_bg & (fg_union < 0.12)
+
+    # Require pixels to be connected to a far background seed or form a tiny dark enclosed cutout.
+    cand_u8 = (valid & looks_like_bg).astype(np.uint8)
+    n_lbl, labels = cv2.connectedComponents(cand_u8, connectivity=8)
+    if n_lbl <= 1:
+        return d
+    keep_mask = np.zeros(d.shape, dtype=bool)
+    max_hole_area = max(16, int(0.015 * d.size))
+    for lbl in range(1, n_lbl):
+        comp = labels == lbl
+        if np.any(comp & bg_seed) or (int(np.sum(comp)) <= max_hole_area and float(np.median(y[comp])) < 0.08):
+            keep_mask |= comp
+
+    pulled_near = valid & (d < 0.75 * z_bg_med) & keep_mask
+    if not np.any(pulled_near):
+        return d
+
+    # Estimate local background depth from nearby confident background seeds.
+    h, w = d.shape
+    k = max(15, (min(h, w) // 10) | 1)
+    k = min(k, 65)
+    local_bg_depth = maximum_filter(np.where(bg_seed, d, 0.0), size=k)
+    local_bg_depth = np.where(local_bg_depth >= 0.78 * z_bg_med, local_bg_depth, float(z_bg_med))
+
+    # Smooth transition weight so crisp foreground edges don't get eroded.
+    skirt_w = gaussian_filter(pulled_near.astype(np.float32), sigma=1.0, mode="reflect")
+    skirt_w = np.where(pulled_near, np.clip(skirt_w * 1.35, 0.0, 1.0), 0.0).astype(np.float32)
+    cleaned = d * (1.0 - skirt_w) + local_bg_depth * skirt_w
+    return np.where(valid, cleaned, 0.0).astype(np.float32)
+
+
+def integrate_normals_with_depth_prior(
+    depth: np.ndarray,
+    normals: np.ndarray,
+    camera: CameraModel,
+    *,
+    screen_lambda: float = 0.06,
+    edge_threshold: float = 0.12,
+) -> np.ndarray:
+    """Fuse high-frequency surface normals with coarse depth via Screened Poisson DCT integration.
+
+    Minimizes ||grad Z - (p, q)||_2^2 + lambda ||Z - Z_0||_2^2 with edge-aware
+    discontinuity gating so depth relief aligns with surface normals without bleeding
+    across foreground-to-background depth cliffs.
+    """
+    from scipy.fft import dctn, idctn
+
+    z0 = np.asarray(depth, dtype=np.float32)
+    n = np.asarray(normals, dtype=np.float32)
+    valid = z0 > 0
+    if not np.any(valid) or n.shape[:2] != z0.shape:
+        return z0
+
+    h, w = z0.shape
+    z_lo, z_hi = np.percentile(z0[valid], [10.0, 90.0])
+    # Suppress normal-depth re-sculpting on distant terrain/horizon cliffs where monocular normals smooth jagged silhouettes.
+    fg_gate = np.clip((2.8 * max(float(z_lo), 0.2) - z0) / max(0.8 * float(z_lo), 0.35), 0.0, 1.0).astype(np.float32)
+    if float(z_hi) <= 1.2 * max(float(z_lo), 0.2):
+        fg_gate = np.ones_like(z0, dtype=np.float32)
+
+    n_len = np.linalg.norm(n, axis=-1, keepdims=True)
+    n_unit = n / np.maximum(n_len, 1e-8)
+
+    # Pixel-space depth gradients implied by camera-space normals (+X right, +Y up, +Z away).
+    inv_nz = 1.0 / np.maximum(-n_unit[..., 2], 0.15)
+    p_n = (z0 / max(float(camera.fx), 1.0)) * (n_unit[..., 0] * inv_nz)
+    q_n = -(z0 / max(float(camera.fy), 1.0)) * (n_unit[..., 1] * inv_nz)
+
+    max_slope = 0.15 * z0
+    p_n = np.clip(p_n, -max_slope, max_slope)
+    q_n = np.clip(q_n, -max_slope, max_slope)
+
+    dx_z = np.zeros_like(z0)
+    dx_z[:, :-1] = z0[:, 1:] - z0[:, :-1]
+    dy_z = np.zeros_like(z0)
+    dy_z[:-1, :] = z0[1:, :] - z0[:-1, :]
+
+    # Attenuate normal integration across sharp depth discontinuities and distant horizon backgrounds.
+    et = max(float(edge_threshold), 1e-3)
+    wx = (np.exp(-((np.abs(dx_z) / np.maximum(z0, 1e-3)) / et) ** 2) * fg_gate).astype(np.float32)
+    wy = (np.exp(-((np.abs(dy_z) / np.maximum(z0, 1e-3)) / et) ** 2) * fg_gate).astype(np.float32)
+
+    p = wx * p_n + (1.0 - wx) * dx_z
+    q = wy * q_n + (1.0 - wy) * dy_z
+    p[:, -1] = 0.0
+    q[-1, :] = 0.0
+
+    # Exact adjoint divergence: D_x^T p + D_y^T q + lambda * Z_0
+    rhs_x = np.zeros_like(p)
+    rhs_x[:, 0] = -p[:, 0]
+    rhs_x[:, 1:-1] = p[:, :-2] - p[:, 1:-1]
+    rhs_x[:, -1] = p[:, -2]
+
+    rhs_y = np.zeros_like(q)
+    rhs_y[0, :] = -q[0, :]
+    rhs_y[1:-1, :] = q[:-2, :] - q[1:-1, :]
+    rhs_y[-1, :] = q[-2, :]
+
+    lam = max(float(screen_lambda), 1e-4)
+    rhs = (rhs_x + rhs_y + lam * z0).astype(np.float64)
+
+    ky = np.arange(h, dtype=np.float64)[:, None]
+    kx = np.arange(w, dtype=np.float64)[None, :]
+    denom = lam + 4.0 * np.sin(np.pi * ky / (2.0 * h)) ** 2 + 4.0 * np.sin(np.pi * kx / (2.0 * w)) ** 2
+
+    z_hat = dctn(rhs, type=2, norm="ortho") / np.maximum(denom, 1e-8)
+    z_out = idctn(z_hat, type=2, norm="ortho").astype(np.float32)
+
+    z_min = float(np.min(z0[valid]))
+    z_max = float(np.max(z0[valid]))
+    z_out = np.clip(z_out, 0.1 * z_min, 1.5 * z_max)
+    return np.where(valid, z_out, 0.0).astype(np.float32)
+
+
+def extract_micro_normal_bump(
+    normals: np.ndarray,
+    rgb_srgb: np.ndarray,
+    *,
+    strength: float = 0.05,
+    roughness: np.ndarray | None = None,
+) -> np.ndarray:
+    """Subtly perturb macro surface normals with band-limited RGB micro-relief without over-sharpening pores/grain."""
+    if strength <= 0.0:
+        return normals
+    from scipy.ndimage import gaussian_filter
+
+    n = np.asarray(normals, dtype=np.float32)
+    rgb = np.asarray(rgb_srgb, dtype=np.float32)
+    y = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+    # Band-limit micro-relief (sigma 1.6 - 4.0) so 1px JPEG/skin noise never becomes crispy AI-upscaled emboss.
+    hp = gaussian_filter(y, sigma=1.4, mode="reflect") - gaussian_filter(y, sigma=3.5, mode="reflect")
+
+    gx = np.zeros_like(hp)
+    gx[:, 1:-1] = 0.5 * (hp[:, 2:] - hp[:, :-2])
+    gy = np.zeros_like(hp)
+    gy[1:-1, :] = 0.5 * (hp[2:, :] - hp[:-2, :])
+
+    gx = 0.04 * np.tanh(gx / 0.04)
+    gy = 0.04 * np.tanh(gy / 0.04)
+
+    bump_w = np.full(y.shape, float(strength) * 1.6, dtype=np.float32)
+    if roughness is not None:
+        r = np.clip(np.asarray(roughness, dtype=np.float32), 0.0, 1.0)
+        bump_w = bump_w * np.clip((r - 0.12) / 0.25, 0.10, 1.0)
+
+    pert = np.stack([-gx * bump_w, gy * bump_w, np.zeros_like(gx)], axis=-1)
+    n_out = n + pert
+    n_out = n_out / np.maximum(np.linalg.norm(n_out, axis=-1, keepdims=True), 1e-8)
+    return n_out.astype(np.float32)
+
+
 def compute_depth_normal_consistency(
     points: np.ndarray,
     depth: np.ndarray,

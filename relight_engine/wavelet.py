@@ -63,6 +63,9 @@ def compose_wavelet_identity_lock(
     mid_blend: float = 0.55,
     chroma_lock_strength: float = 0.75,
     detail_weight_map: np.ndarray | None = None,
+    organic_skin_mask: np.ndarray | None = None,
+    skin_detail_exponent: float = 0.75,
+    skin_detail_floor: float = 0.72,
     eps: float = 1e-4,
 ) -> np.ndarray:
     """Lock original multi-scale texture and fine chroma onto a relit image in wavelet space.
@@ -94,12 +97,26 @@ def compose_wavelet_identity_lock(
         else None
     )
 
-    # Preserve fine micro-contrast when metallic/shaded relighting lowers base luminance below source.
+    # Gate fine detail boost strictly to crisp high-contrast typography/edges (|log_band| > 0.10)
+    # so natural photographic skin pores, fabric, and rock texture never get AI-upscaled micro-sharpening.
+    crisp_feature = np.clip((np.abs(src_bands[0]) - 0.10) / 0.12, 0.0, 1.0).astype(np.float32)
     fine_gain = np.where(
         y_relit < y_src,
-        1.0 + 0.80 * np.clip(np.sqrt(y_src / np.maximum(y_relit, eps)) - 1.0, 0.0, 0.90) * np.clip((y_relit - 0.020) / 0.09, 0.0, 1.0),
+        1.0 + 0.80 * crisp_feature * np.clip(np.sqrt(y_src / np.maximum(y_relit, eps)) - 1.0, 0.0, 0.90) * np.clip((y_relit - 0.020) / 0.09, 0.0, 1.0),
         1.0,
     ).astype(np.float32)
+    skin_w = (
+        np.clip(np.asarray(organic_skin_mask, dtype=np.float32), 0.0, 1.0)
+        if organic_skin_mask is not None
+        else None
+    )
+    if skin_w is not None:
+        fine_gain = (1.0 - skin_w) * fine_gain + skin_w * 1.0
+        raw_ratio = np.minimum(1.0, y_src / np.maximum(y_relit, eps))
+        d_scale = np.maximum(np.power(raw_ratio, float(skin_detail_exponent)), float(skin_detail_floor))
+        detail_scale = ((1.0 - skin_w) * 1.0 + skin_w * d_scale).astype(np.float32)
+    else:
+        detail_scale = None
 
     blended_bands: list[np.ndarray] = []
     for idx in range(levels):
@@ -126,6 +143,8 @@ def compose_wavelet_identity_lock(
                 src_band * fine_gain,
             )
             band = w_eff * src_target + (1.0 - w_eff) * rel_bands[idx]
+            if detail_scale is not None:
+                band = band * detail_scale
         else:
             band = w_eff * src_band + (1.0 - w_eff) * rel_bands[idx]
         # Clamp extreme log-detail amplification so harsh shadows stay clean.

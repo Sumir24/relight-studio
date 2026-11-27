@@ -360,6 +360,38 @@ class LightingRig:
 
 
 @dataclass(frozen=True)
+class SkinFidelityParams:
+    enabled: bool = False
+    floor_k: float = 0.85
+    shoulder_start: float = 1.05
+    ratio_ceiling: float = 1.25
+    bounce_k: float = 0.55
+    wrap_damp: float = 0.0  # dropped per Phase 1 ablation (0.0% share)
+    detail_exponent: float = 0.75
+    detail_floor: float = 0.82
+    chroma_blend_cap: float = 0.60
+    min_skin_confidence: float = 0.35
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError('skin_fidelity.enabled must be a boolean.')
+        for fname in (
+            'floor_k', 'shoulder_start', 'ratio_ceiling', 'bounce_k', 'wrap_damp',
+            'detail_exponent', 'detail_floor', 'chroma_blend_cap', 'min_skin_confidence',
+        ):
+            _finite_scalar(f'skin_fidelity.{fname}', getattr(self, fname))
+        if not (0.0 <= self.floor_k <= 2.0):
+            raise ValueError('skin_fidelity.floor_k must be in [0, 2].')
+        if not (0.5 <= self.shoulder_start <= self.ratio_ceiling <= 4.0):
+            raise ValueError('skin_fidelity.shoulder_start and ratio_ceiling must satisfy 0.5 <= shoulder_start <= ratio_ceiling <= 4.0.')
+        for unit in ('bounce_k', 'wrap_damp', 'detail_floor', 'chroma_blend_cap', 'min_skin_confidence'):
+            if not (0.0 <= getattr(self, unit) <= 1.0):
+                raise ValueError(f'skin_fidelity.{unit} must be in [0, 1].')
+        if not (0.0 <= self.detail_exponent <= 2.0):
+            raise ValueError('skin_fidelity.detail_exponent must be in [0, 2].')
+
+
+@dataclass(frozen=True)
 class EngineSettings:
     base_blur_sigma: float = 18.0
     detail_power: float = 0.90
@@ -414,10 +446,20 @@ class EngineSettings:
     indirect_specular_strength: float = 0.0
     preserve_fill_balance: float = 0.0
     lossless_ratio_detail: bool = False
+    normal_depth_fusion: bool = False
+    clean_depth_skirt: bool = False
+    micro_normal_bump: float = 0.0
+    area_shadow_samples: int = 1
+    virtual_studio_reflection: bool = False
+    auto_conductor_calibration: bool = False
+    skin_fidelity: SkinFidelityParams = field(default_factory=SkinFidelityParams)
 
     @classmethod
     def real_preserving(cls, **overrides) -> 'EngineSettings':
-        """Return calibrated Tier 1 + Wavelet identity-lock settings that preserve the real photograph."""
+        """Return calibrated Tier 1 + Wavelet identity-lock settings that preserve the real photograph.
+
+        `skin_fidelity` is enabled by default; opt out via `skin_fidelity=SkinFidelityParams(enabled=False)`.
+        """
         defaults = {
             'detail_preservation_mode': 'wavelet',
             'color_transfer_strength': 0.50,
@@ -432,6 +474,13 @@ class EngineSettings:
             'wavelet_levels': 4,
             'wavelet_mid_blend': 0.55,
             'shadow_width_aware': True,
+            'normal_depth_fusion': True,
+            'clean_depth_skirt': True,
+            'micro_normal_bump': 0.03,
+            'area_shadow_samples': 2,
+            'virtual_studio_reflection': True,
+            'auto_conductor_calibration': True,
+            'skin_fidelity': SkinFidelityParams(enabled=True),
         }
         defaults.update(overrides)
         settings = cls(**defaults)
@@ -440,7 +489,10 @@ class EngineSettings:
 
     @classmethod
     def studio_3d(cls, **overrides) -> 'EngineSettings':
-        """Return whole-scene 3D studio light transport preset with global bounce, SSAO, and material response."""
+        """Return whole-scene 3D studio light transport preset with global bounce, SSAO, and material response.
+
+        `skin_fidelity` is enabled by default; opt out via `skin_fidelity=SkinFidelityParams(enabled=False)`.
+        """
         defaults = {
             'detail_preservation_mode': 'wavelet',
             'color_transfer_strength': 0.72,
@@ -468,6 +520,13 @@ class EngineSettings:
             'protect_sky': True,
             'preserve_fill_balance': 0.55,
             'lossless_ratio_detail': True,
+            'normal_depth_fusion': True,
+            'clean_depth_skirt': True,
+            'micro_normal_bump': 0.05,
+            'area_shadow_samples': 4,
+            'virtual_studio_reflection': True,
+            'auto_conductor_calibration': True,
+            'skin_fidelity': SkinFidelityParams(enabled=True),
         }
         defaults.update(overrides)
         settings = cls(**defaults)
@@ -573,6 +632,7 @@ class EngineSettings:
             ('ssao_strength', self.ssao_strength),
             ('indirect_specular_strength', self.indirect_specular_strength),
             ('preserve_fill_balance', self.preserve_fill_balance),
+            ('micro_normal_bump', self.micro_normal_bump),
         ):
             if not 0.0 <= unit_val <= 1.0:
                 raise ValueError(f'{unit_name} must be in [0,1].')
@@ -585,6 +645,8 @@ class EngineSettings:
             raise ValueError('source_white_balance must be a finite positive 3-vector.')
         if not isinstance(self.wavelet_levels, int) or not (1 <= self.wavelet_levels <= 6):
             raise ValueError('wavelet_levels must be an integer in [1, 6].')
+        if not isinstance(self.area_shadow_samples, int) or not (1 <= self.area_shadow_samples <= 16):
+            raise ValueError('area_shadow_samples must be an integer in [1, 16].')
         for bname, bval in (
             ('protect_sky', self.protect_sky),
             ('shadow_width_aware', self.shadow_width_aware),
@@ -592,9 +654,16 @@ class EngineSettings:
             ('semantic_material_priors', self.semantic_material_priors),
             ('albedo_guided_source_shading', self.albedo_guided_source_shading),
             ('lossless_ratio_detail', self.lossless_ratio_detail),
+            ('normal_depth_fusion', self.normal_depth_fusion),
+            ('clean_depth_skirt', self.clean_depth_skirt),
+            ('virtual_studio_reflection', self.virtual_studio_reflection),
+            ('auto_conductor_calibration', self.auto_conductor_calibration),
         ):
             if not isinstance(bval, bool):
                 raise ValueError(f'{bname} must be a boolean.')
+        if not isinstance(self.skin_fidelity, SkinFidelityParams):
+            raise ValueError('skin_fidelity must be a SkinFidelityParams instance.')
+        self.skin_fidelity.validate()
 
 
 @dataclass

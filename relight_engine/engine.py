@@ -4,6 +4,7 @@ from collections import OrderedDict
 from copy import copy
 from dataclasses import replace
 import hashlib
+import os
 import threading
 
 import numpy as np
@@ -15,9 +16,20 @@ from .contracts import (
     EngineSettings,
     RelightResult,
 )
-from .geometry import prepare_geometry, refine_depth_to_rgb_edges
+from .geometry import (
+    prepare_geometry,
+    refine_depth_to_rgb_edges,
+    clean_depth_background_skirt,
+    integrate_normals_with_depth_prior,
+    extract_micro_normal_bump,
+)
 from .lighting import evaluate_rig, compute_indirect_bounce, compute_indirect_specular, compute_volumetric_beam
-from .calibration import suggest_material_priors_from_semantics, refine_source_shading_with_albedo
+from .calibration import (
+    suggest_material_priors_from_semantics,
+    refine_source_shading_with_albedo,
+    calibrate_conductor_from_appearance,
+    get_skin_weight_for_scene,
+)
 from .composite import (
     compose_hybrid_neural,
     compose_intrinsic,
@@ -270,25 +282,79 @@ def _effective_source_diffuse(
     med_sh = max(float(np.median(sh_y[active])), 1e-4)
     med_sd = max(float(np.median(sd_y[active])), 1e-4)
     rel_y = np.clip(sh_y / med_sh, 0.42, 2.4)
+    if os.environ.get("RELIGHT_ABLATE_EFF_SD_FLOOR") == "1":
+        # Phase 1 ablation hook: floor source_shading to geometric SH irradiance across all pixels.
+        rel_y = np.maximum(rel_y, 0.90 * (sd_y / med_sd))
+    skin_w = get_skin_weight_for_scene(scene, settings)
+    if skin_w is not None:
+        # Stage 1 (Source floor): prevent skin albedo bias from collapsing eff_sd on skin_w pixels.
+        floor_k = float(settings.skin_fidelity.floor_k)
+        rel_y = (1.0 - skin_w) * rel_y + skin_w * np.maximum(rel_y, floor_k * (sd_y / med_sd))
     chroma = np.clip(sh_smooth / sh_y[..., None], 0.45, 2.0)
     chroma = np.power(chroma, 0.70)
     sh_matched = (rel_y[..., None] * chroma) * med_sd
-    return ((1.0 - blend) * base_src + blend * sh_matched).astype(np.float32)
+    eff_out = ((1.0 - blend) * base_src + blend * sh_matched).astype(np.float32)
+    if skin_w is not None:
+        floor_k = float(settings.skin_fidelity.floor_k)
+        eff_out = ((1.0 - skin_w[..., None]) * eff_out + skin_w[..., None] * np.maximum(eff_out, floor_k * source_d)).astype(np.float32)
+    return eff_out
 
 
-def _prepare_working_scene(scene: SceneBuffers, settings: EngineSettings) -> SceneBuffers:
-    """Apply non-destructive working-buffer enrichments (edge depth, semantic PBR priors, albedo-guided shading)."""
+def _apply_skin_irradiance_cap(
+    scene: SceneBuffers,
+    source_d: np.ndarray | None,
+    target_d: np.ndarray,
+    target_s: np.ndarray,
+    settings: EngineSettings,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Stage 5 (Irradiance cap): softly cap target/source ratio on skin_w pixels; strict no-op where skin_w == 0."""
+    if source_d is None:
+        return target_d, target_s
+    skin_w = get_skin_weight_for_scene(scene, settings)
+    if skin_w is None:
+        return target_d, target_s
+    sf = settings.skin_fidelity
+    td_y = np.maximum(luminance(np.maximum(target_d, 0.0)), 1e-4)
+    sd_y = np.maximum(luminance(np.maximum(source_d, 1e-4)), 1e-4)
+    r_pix = td_y / sd_y
+    s_start = float(sf.shoulder_start)
+    r_ceil = float(sf.ratio_ceiling)
+    span = max(r_ceil - s_start, 0.05)
+    r_cap = np.where(r_pix > s_start, s_start + span * np.tanh((r_pix - s_start) / span), r_pix)
+    skin_scale = np.where(r_pix > s_start, r_cap / r_pix, 1.0).astype(np.float32)
+    eff_scale = ((1.0 - skin_w) * 1.0 + skin_w * skin_scale).astype(np.float32)
+    spec_scale = ((1.0 - skin_w) + skin_w * (0.45 + 0.55 * skin_scale)).astype(np.float32)
+    return (target_d * eff_scale[..., None]).astype(np.float32), (target_s * spec_scale[..., None]).astype(np.float32)
+
+
+def _prepare_working_scene(
+    scene: SceneBuffers,
+    settings: EngineSettings,
+    camera: CameraModel | None = None,
+) -> SceneBuffers:
+    """Apply non-destructive working-buffer enrichments (skirt clean, edge depth, normal-depth fusion, semantic PBR priors, albedo-guided shading)."""
     need_copy = bool(
         settings.refine_depth_edges
+        or getattr(settings, "clean_depth_skirt", False)
+        or (getattr(settings, "normal_depth_fusion", False) and scene.normals is not None and camera is not None)
         or (getattr(settings, "semantic_material_priors", False) and scene.roughness is None and scene.metalness is None)
+        or getattr(settings, "auto_conductor_calibration", False)
         or (getattr(settings, "albedo_guided_source_shading", False) and scene.albedo is not None)
     )
     if not need_copy:
         return scene
 
     work_scene = copy(scene)
+    if getattr(settings, "clean_depth_skirt", False):
+        work_scene.depth = clean_depth_background_skirt(
+            work_scene.depth, work_scene.rgb_srgb, work_scene.semantic_masks
+        )
     if settings.refine_depth_edges:
-        work_scene.depth = refine_depth_to_rgb_edges(scene.depth, scene.rgb_srgb)
+        work_scene.depth = refine_depth_to_rgb_edges(work_scene.depth, work_scene.rgb_srgb)
+    if getattr(settings, "normal_depth_fusion", False) and work_scene.normals is not None and camera is not None:
+        work_scene.depth = integrate_normals_with_depth_prior(
+            work_scene.depth, work_scene.normals, camera
+        )
 
     if getattr(settings, "semantic_material_priors", False) and work_scene.roughness is None and work_scene.metalness is None:
         mat_maps = suggest_material_priors_from_semantics(work_scene)
@@ -303,6 +369,11 @@ def _prepare_working_scene(scene: SceneBuffers, settings: EngineSettings) -> Sce
             work_scene.anisotropy_angle = mat_maps.anisotropy_angle
             work_scene.material_confidence = mat_maps.confidence
             work_scene.material_metadata = dict(mat_maps.metadata)
+
+    if getattr(settings, "auto_conductor_calibration", False):
+        cond_res = calibrate_conductor_from_appearance(work_scene)
+        if cond_res is not None:
+            work_scene.metalness, work_scene.roughness = cond_res
 
     if getattr(settings, "albedo_guided_source_shading", False) and work_scene.albedo is not None:
         work_scene.source_shading = refine_source_shading_with_albedo(work_scene, work_scene.source_shading)
@@ -353,7 +424,7 @@ def relight(
         eff_settings = settings
         preview_side = settings.preview_max_side
 
-    work_scene = _prepare_working_scene(scene, eff_settings)
+    work_scene = _prepare_working_scene(scene, eff_settings, camera=camera)
 
     use_preview_downscale = preview_side is not None and max(work_scene.shape) > int(preview_side)
 
@@ -372,6 +443,13 @@ def relight(
             lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
             valid_n = lens[..., 0] > 1e-6
             normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
+        if float(getattr(eff_settings, "micro_normal_bump", 0.0)) > 0.0:
+            normals = extract_micro_normal_bump(
+                normals,
+                work_scene.rgb_srgb,
+                strength=float(eff_settings.micro_normal_bump),
+                roughness=work_scene.roughness,
+            )
 
     gate_report = None
     if require_geometry_ready:
@@ -410,33 +488,59 @@ def relight(
             lens_ev = np.linalg.norm(smoothed_ev, axis=-1, keepdims=True)
             valid_ev = lens_ev[..., 0] > 1e-6
             eval_normals = np.where(valid_ev[..., None], smoothed_ev / np.maximum(lens_ev, 1e-6), eval_normals).astype(np.float32)
+        if float(getattr(eff_settings, "micro_normal_bump", 0.0)) > 0.0:
+            eval_normals = extract_micro_normal_bump(
+                eval_normals,
+                eval_scene.rgb_srgb,
+                strength=float(eff_settings.micro_normal_bump),
+                roughness=eval_scene.roughness,
+            )
     else:
         eval_scene, eval_cam = work_scene, camera
         if points is None or normals is None or geometry_conf is None:
             points, normals, geometry_conf = prepare_geometry(work_scene, camera)
         eval_points, eval_normals, eval_geom_conf = points, normals, geometry_conf
 
+    # Skin-fidelity shading pipeline order (strict no-op where skin_w == 0):
+    # 1. Source floor (_effective_source_diffuse): removes skin albedo bias from eff_sd.
+    # 2. Wrap (evaluate_rig): kept standard normalized wrap (0.0% error share in Phase 1 ablation).
+    # 3. Bounce (compute_indirect_bounce * (1 - bounce_k * skin_w)): damps excess radiosity bounce on skin.
+    # 4. Fill (preserve_fill_balance): kept standard (-9.3% negative error share in Phase 1 ablation).
+    # 5. Irradiance cap (_apply_skin_irradiance_cap): compresses target/source ratio above shoulder_start on skin.
     add_mode = bool(eff_settings.preserve_source_lighting or eff_settings.operation == "add")
+    skin_w_eval = get_skin_weight_for_scene(eval_scene, eff_settings)
     target_d, target_s, visibility, tgt_details = evaluate_rig(
         eval_scene, eval_cam, eval_points, eval_normals, target_rig, eff_settings,
         return_details=True,
     )
     weighted_vis = tgt_details["shadow_visibility_weighted"]
+    target_d_raw = target_d
+    target_s_raw = target_s
     if float(eff_settings.indirect_bounce_strength) > 0.0:
         bounce_d = compute_indirect_bounce(
             eval_scene, eval_points, eval_normals, target_d, eff_settings
         )
-        target_d = target_d + bounce_d
+        target_d_raw = target_d + bounce_d
+        if skin_w_eval is not None and float(eff_settings.skin_fidelity.bounce_k) > 0.0:
+            bounce_d_skin = (bounce_d * (1.0 - float(eff_settings.skin_fidelity.bounce_k) * skin_w_eval[..., None])).astype(np.float32)
+            target_d = target_d + bounce_d_skin
+        else:
+            target_d = target_d_raw
         if float(getattr(eff_settings, "indirect_specular_strength", 0.0)) > 0.0:
-            target_s = target_s + compute_indirect_specular(
+            spec_b = compute_indirect_specular(
                 eval_scene, eval_points, eval_normals, bounce_d, eff_settings
             )
+            target_s = target_s + spec_b
+            target_s_raw = target_s_raw + spec_b
     if float(getattr(eff_settings, "volumetric_beam_strength", 0.0)) > 0.0:
-        target_d = target_d + compute_volumetric_beam(
+        v_beam = compute_volumetric_beam(
             eval_scene, eval_points, target_rig, visibility, eff_settings
         )
+        target_d = target_d + v_beam
+        target_d_raw = target_d_raw + v_beam
     source_d: np.ndarray | None = None
     source_s: np.ndarray | None = None
+    source_d_off: np.ndarray | None = None
     need_source_eval = (
         add_mode
         or effective_mode in ("ratio", "intrinsic")
@@ -450,17 +554,23 @@ def relight(
         if (not add_mode) and _rigs_identical(source_rig, target_rig) and abs(src_exp - 1.0) < 1e-6 and np.allclose(src_wb, 1.0, atol=1e-6):
             source_d = target_d
             source_s = target_s
+            source_d_off = target_d_raw
         else:
-            source_d, source_s, _ = evaluate_rig(
+            source_d_raw, source_s, _ = evaluate_rig(
                 eval_scene, eval_cam, eval_points, eval_normals, source_rig, eff_settings
             )
-            source_d = (source_d * src_exp * src_wb).astype(np.float32)
+            source_d_raw = (source_d_raw * src_exp * src_wb).astype(np.float32)
             source_s = (source_s * src_exp * src_wb).astype(np.float32)
-            source_d = _effective_source_diffuse(eval_scene, eval_normals, source_d, eff_settings)
+            if skin_w_eval is not None:
+                eff_off_cfg = replace(eff_settings, skin_fidelity=replace(eff_settings.skin_fidelity, enabled=False))
+                source_d_off = _effective_source_diffuse(eval_scene, eval_normals, source_d_raw, eff_off_cfg)
+            source_d = _effective_source_diffuse(eval_scene, eval_normals, source_d_raw, eff_settings)
     if add_mode:
         assert source_d is not None and source_s is not None
         target_d = source_d + target_d
         target_s = source_s + target_s
+    elif (not _rigs_identical(source_rig, target_rig)) and source_d is not None:
+        target_d, target_s = _apply_skin_irradiance_cap(eval_scene, source_d, target_d, target_s, eff_settings)
 
     if use_preview_downscale and eff_settings.preview_upsample:
         if points is None or normals is None or geometry_conf is None:
@@ -483,16 +593,22 @@ def relight(
             idx += 1
         if source_s is not None:
             source_s = up[idx]
+        source_d_off_up = source_d_off
+        if source_d_off is not None and (not add_mode):
+            up_off = depth_guided_upsample_batch([target_d_raw, target_s_raw, source_d_off], work_scene.depth, eval_scene.depth)
+            target_d_raw, target_s_raw, source_d_off_up = up_off[0], up_off[1], up_off[2]
         comp_scene = work_scene
         comp_normals = normals
         comp_geom_conf = geometry_conf
         metric_scene = scene
     elif use_preview_downscale:
+        source_d_off_up = source_d_off
         comp_scene = eval_scene
         comp_normals = eval_normals
         comp_geom_conf = eval_geom_conf
         metric_scene = eval_scene
     else:
+        source_d_off_up = source_d_off
         comp_scene = work_scene
         assert normals is not None and geometry_conf is not None
         comp_normals = normals
@@ -511,6 +627,15 @@ def relight(
             source_specular=source_s,
             target_rig=target_rig,
         )
+        if skin_w_eval is not None and (not add_mode) and source_d_off_up is not None:
+            eff_off_cfg = replace(eff_settings, skin_fidelity=replace(eff_settings.skin_fidelity, enabled=False))
+            out_off, _ = compose_intrinsic(
+                comp_scene, target_d_raw, target_s_raw, comp_geom_conf, eff_off_cfg,
+                source_diffuse=source_d_off_up, source_specular=source_s, target_rig=target_rig,
+            )
+            sw_c = get_skin_weight_for_scene(comp_scene, eff_settings)
+            if sw_c is not None:
+                out = np.where(sw_c[..., None] > 0.0, (1.0 - sw_c[..., None]) * out_off + sw_c[..., None] * out, out_off).astype(np.float32)
         mode_label = "2.5D intrinsic de-lighting and re-rendering"
     elif effective_mode == "hybrid_neural":
         neural_pred = neural_relighter.render(
@@ -550,6 +675,15 @@ def relight(
             eff_settings,
             target_rig=target_rig,
         )
+        if skin_w_eval is not None and (not add_mode) and source_d_off_up is not None:
+            eff_off_cfg = replace(eff_settings, skin_fidelity=replace(eff_settings.skin_fidelity, enabled=False))
+            out_off, _ = compose_source_preserving(
+                comp_scene, source_d_off_up, target_d_raw, source_s, target_s_raw,
+                comp_geom_conf, eff_off_cfg, target_rig=target_rig,
+            )
+            sw_c = get_skin_weight_for_scene(comp_scene, eff_settings)
+            if sw_c is not None:
+                out = np.where(sw_c[..., None] > 0.0, (1.0 - sw_c[..., None]) * out_off + sw_c[..., None] * out, out_off).astype(np.float32)
         mode_label = "2.5D source-to-target relighting"
 
     active = (
@@ -682,7 +816,7 @@ class RelightSession:
         self.base_settings = base_settings
         self.preview_max_side = max(32, int(preview_max_side))
 
-        work_scene = _prepare_working_scene(scene, base_settings)
+        work_scene = _prepare_working_scene(scene, base_settings, camera=camera)
         self.work_scene = work_scene
 
         points, normals, geom_conf = prepare_geometry(work_scene, camera)
@@ -696,6 +830,13 @@ class RelightSession:
             lens = np.linalg.norm(smoothed, axis=-1, keepdims=True)
             valid_n = lens[..., 0] > 1e-6
             normals = np.where(valid_n[..., None], smoothed / np.maximum(lens, 1e-6), normals).astype(np.float32)
+        if float(getattr(base_settings, "micro_normal_bump", 0.0)) > 0.0:
+            normals = extract_micro_normal_bump(
+                normals,
+                work_scene.rgb_srgb,
+                strength=float(base_settings.micro_normal_bump),
+                roughness=work_scene.roughness,
+            )
         self.points = points
         self.normals = normals
         self.geom_conf = geom_conf
@@ -772,12 +913,15 @@ class RelightSession:
             ev_sc, ev_cam, ev_pts, ev_nrm = self.work_scene, self.camera, self.points, self.normals
 
         add_mode = bool(eff.preserve_source_lighting or eff.operation == "add")
+        skin_w_ev = get_skin_weight_for_scene(ev_sc, eff)
         target_d, target_s, visibility, tgt_details = evaluate_rig(
             ev_sc, ev_cam, ev_pts, ev_nrm, target_rig, eff, return_details=True
         )
         weighted_vis = tgt_details["shadow_visibility_weighted"]
         if float(eff.indirect_bounce_strength) > 0.0:
             bounce_d = compute_indirect_bounce(ev_sc, ev_pts, ev_nrm, target_d, eff)
+            if skin_w_ev is not None and float(eff.skin_fidelity.bounce_k) > 0.0:
+                bounce_d = (bounce_d * (1.0 - float(eff.skin_fidelity.bounce_k) * skin_w_ev[..., None])).astype(np.float32)
             target_d = target_d + bounce_d
             if float(getattr(eff, "indirect_specular_strength", 0.0)) > 0.0:
                 target_s = target_s + compute_indirect_specular(ev_sc, ev_pts, ev_nrm, bounce_d, eff)
@@ -808,6 +952,8 @@ class RelightSession:
             assert source_d is not None and source_s is not None
             target_d = source_d + target_d
             target_s = source_s + target_s
+        elif (not _rigs_identical(self.source_rig, target_rig)) and source_d is not None:
+            target_d, target_s = _apply_skin_irradiance_cap(ev_sc, source_d, target_d, target_s, eff)
 
         if use_prev and eff.preview_upsample:
             to_up = [target_d, target_s, visibility, weighted_vis]

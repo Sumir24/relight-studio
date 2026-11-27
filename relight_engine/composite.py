@@ -1,9 +1,11 @@
 from __future__ import annotations
 from collections import OrderedDict
 import hashlib
+import os
 import threading
 import numpy as np
 from scipy.ndimage import gaussian_filter, sobel
+from .calibration import get_skin_weight_for_scene
 from .color import srgb_to_linear, linear_to_srgb, luminance
 from .contracts import SceneBuffers, EngineSettings, LightingRig
 from .wavelet import compose_wavelet_identity_lock
@@ -356,6 +358,7 @@ def _apply_perceptual_color_anchor(
     change_w: np.ndarray,
     settings: EngineSettings,
     eps: float = 1e-4,
+    skin_w: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute perceptual log-luminance & linear-chroma anchored illumination delta.
 
@@ -391,6 +394,9 @@ def _apply_perceptual_color_anchor(
     shadow_preserve = np.clip(0.55 * real_pres + dark_sens * real_pres + 0.35 * fill_bal * (1.0 - real_pres), 0.0, 0.88)
     # Lit saturated colors get partial perceptual brightness support from their peak channel.
     perceptual_ratio = np.maximum(ratio, 0.55 * peak_ratio + 0.45 * ratio)
+    if skin_w is not None:
+        # Phase 1 ablation showed peak_ratio lift adds +17.4% brightness gain; keep skin ratio luminance-true.
+        perceptual_ratio = ((1.0 - skin_w) * perceptual_ratio + skin_w * ratio).astype(np.float32)
     effective_ratio = np.where(
         perceptual_ratio < 1.0,
         1.0 - (1.0 - shadow_preserve) * (1.0 - perceptual_ratio),
@@ -422,6 +428,9 @@ def _apply_perceptual_color_anchor(
         src_sat = 1.0 - np.min(src_lin, axis=-1) / src_max
         neutral_wall_w = np.clip((0.18 - src_sat) / 0.18, 0.0, 1.0)
         c_blend_base = np.clip(c_blend_base + 0.28 * c_strength * lit_conf * neutral_wall_w * conf_norm, 0.0, 0.92)
+    if skin_w is not None:
+        chroma_cap = float(settings.skin_fidelity.chroma_blend_cap)
+        c_blend_base = ((1.0 - skin_w) * c_blend_base + skin_w * np.minimum(c_blend_base, chroma_cap)).astype(np.float32)
     c_blend = c_blend_base[..., None]
     chroma_out = chroma_src * (1.0 - c_blend) + chroma_tgt * c_blend
     chroma_out_y = np.maximum(luminance(chroma_out), eps)[..., None]
@@ -665,6 +674,7 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
         gain_over = np.maximum(rgb_gain - 1.0, 0.0)
         rgb_gain_eff = rgb_gain - gain_over * (0.55 * white_hi[..., None])
 
+    skin_w_sp = get_skin_weight_for_scene(scene, settings)
     ratio, rgb_gain_eff = _apply_perceptual_color_anchor(
         src,
         y,
@@ -676,6 +686,7 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
         change_w,
         settings,
         eps=eps,
+        skin_w=skin_w_sp,
     )
 
     y_sep = np.maximum(base_eff + detail, eps)
@@ -720,6 +731,9 @@ def compose_source_preserving(scene: SceneBuffers, source_diffuse: np.ndarray,
             detail_lock_strength=settings.detail_lock_strength,
             mid_blend=settings.wavelet_mid_blend,
             detail_weight_map=detail_w,
+            organic_skin_mask=skin_w_sp,
+            skin_detail_exponent=float(settings.skin_fidelity.detail_exponent),
+            skin_detail_floor=float(settings.skin_fidelity.detail_floor),
             eps=eps,
         )
 
@@ -1000,19 +1014,22 @@ def _compose_intrinsic_output(
 
     ratio, rgb_gain = _soft_knee_bright_ratio(ratio, rgb_gain, y_src, eps=eps)
 
+    skin_w = get_skin_weight_for_scene(scene, settings)
     change_w = np.ones(scene.shape, dtype=np.float32)
-    ratio, rgb_gain = _apply_perceptual_color_anchor(
-        src,
-        y_src,
-        s_d_in,
-        t_pos,
-        ratio,
-        rgb_gain,
-        geom_conf_w,
-        change_w,
-        settings,
-        eps=eps,
-    )
+    if os.environ.get("RELIGHT_ABLATE_NO_CHROMA_ANCHOR") != "1":
+        ratio, rgb_gain = _apply_perceptual_color_anchor(
+            src,
+            y_src,
+            s_d_in,
+            t_pos,
+            ratio,
+            rgb_gain,
+            geom_conf_w,
+            change_w,
+            settings,
+            eps=eps,
+            skin_w=skin_w,
+        )
 
     # Near-black stability guard: prevent unstable noise amplification when original luminance is near zero.
     near_black_damp = np.clip((y_src - 0.002) / 0.015, 0.25, 1.0)[..., None]
@@ -1021,7 +1038,8 @@ def _compose_intrinsic_output(
     # Separate broad source specular glare cleanly so residual handling never subtracts crisp surface details.
     src_spec_in = np.maximum(source_specular, 0.0) if source_specular is not None else np.zeros_like(target_specular)
     lossless_detail = bool(getattr(settings, "lossless_ratio_detail", False))
-    if residual_layers is not None:
+    use_res_layers = residual_layers is not None and os.environ.get("RELIGHT_ABLATE_NO_GLARE_SEP") != "1"
+    if use_res_layers:
         _, _, res_lobe = residual_layers
         if lossless_detail:
             # Keep 100% of crisp high-frequency textures/dial/brushed metal in src_diff_anchor;
@@ -1040,6 +1058,9 @@ def _compose_intrinsic_output(
         max_glare = 0.28 if lossless_detail else 0.55
         glare_frac = np.clip(eff_lobe / np.maximum(pred_diff + eff_lobe, eps), 0.0, max_glare)
         removed_glare = glare_frac * src
+        if skin_w is not None:
+            # Reduce glare stripping on skin so natural highlights stay intact while responding to new light.
+            removed_glare = removed_glare * (1.0 - 0.70 * skin_w[..., None])
         src_diff_anchor = np.maximum(src - removed_glare, eps)
         # Avoid double-subtracting glare already accounted for by residual separation.
         spec_src_eff = np.maximum(src_spec_in - removed_glare, 0.0)
@@ -1054,7 +1075,20 @@ def _compose_intrinsic_output(
         relit_base = src_diff_anchor * rgb_gain_safe + removed_glare * (lobe_keep[..., None] * glare_tint)
     else:
         spec_src_eff = src_spec_in
-        relit_base = src * rgb_gain_safe
+        if os.environ.get("RELIGHT_ABLATE_ADDITIVE_TEXTURE") == "1":
+            src_lo = np.maximum(gaussian_filter(src, (2.5, 2.5, 0.0), mode="reflect"), eps)
+            relit_base = np.maximum(src_lo * rgb_gain_safe + (src - src_lo), 0.0)
+        else:
+            relit_base = src * rgb_gain_safe
+    if use_res_layers and os.environ.get("RELIGHT_ABLATE_ADDITIVE_TEXTURE") == "1":
+        src_lo = np.maximum(gaussian_filter(src, (2.5, 2.5, 0.0), mode="reflect"), eps)
+        relit_base = np.maximum(gaussian_filter(relit_base, (2.5, 2.5, 0.0), mode="reflect") + (src - src_lo), 0.0)
+    elif skin_w is not None:
+        # Decouple multiplicative linear pore/texture inflation exclusively on skin_w pixels.
+        src_lo = np.maximum(gaussian_filter(src, (1.6, 1.6, 0.0), mode="reflect"), eps)
+        base_lo = gaussian_filter(relit_base, (1.6, 1.6, 0.0), mode="reflect")
+        skin_additive = np.maximum(base_lo + (src - src_lo), 0.0)
+        relit_base = np.where(skin_w[..., None] > 0.0, (1.0 - skin_w[..., None]) * relit_base + skin_w[..., None] * skin_additive, relit_base)
 
     # 2. Controlled signed specular delta (target - source), restricted by geometry & material confidence.
     mat_conf_w = (
@@ -1062,13 +1096,32 @@ def _compose_intrinsic_output(
         if scene.material_confidence is not None
         else np.ones(scene.shape, dtype=np.float32)
     )
+    metal_w = (
+        np.clip((np.asarray(scene.metalness, dtype=np.float32) - 0.30) / 0.55, 0.0, 1.0)[..., None]
+        if scene.metalness is not None
+        else np.zeros((*scene.shape, 1), dtype=np.float32)
+    )
+    if np.any(metal_w > 0.05):
+        # Preserve deep mirror troughs on dark reflective conductors while letting reflection probes illuminate curved flanks.
+        trough_keep = np.clip((0.12 - y_src) / 0.10, 0.0, 1.0)[..., None] * metal_w
+        relit_base = relit_base * (1.0 - 0.35 * trough_keep) + src * (0.35 * trough_keep)
+
     spec_weight = (geom_conf_w * mat_conf_w)[..., None] * settings.specular_scale
-    signed_spec = (np.maximum(t_spec_eff, 0.0) - spec_src_eff) * spec_weight
+    t_spec_skin = t_spec_eff
+    spec_src_skin = spec_src_eff
+    if skin_w is not None:
+        # Suppress pixel-level GGX specular speckle on matte/subsurface skin (while keeping natural
+        # diffuse highlights and leaving all skin_w == 0 metallic/glossy surfaces untouched).
+        sw_spec = skin_w[..., None]
+        spec_weight = spec_weight * np.clip(1.0 - sw_spec, 0.0, 1.0)
+    signed_spec = (np.maximum(t_spec_skin, 0.0) - spec_src_skin) * spec_weight
     reloc_s = float(np.clip(settings.highlight_relocation_strength, 0.0, 2.0))
     if reloc_s > 0.0:
         pos_mask = signed_spec > 0.0
         signed_spec = np.where(pos_mask, signed_spec * (1.0 + 0.55 * reloc_s), signed_spec)
     max_pos = np.maximum(relit_base * (1.5 + 1.0 * reloc_s) + 0.45 * np.maximum(settings.specular_scale, 0.0), eps)
+    if np.any(metal_w > 0.05):
+        max_pos = np.maximum(max_pos, (np.maximum(t_spec_eff, 0.0) * 1.15 + 0.25) * metal_w)
     pos_spec = max_pos * np.tanh(np.maximum(signed_spec, 0.0) / max_pos)
     neg_budget = -np.minimum(
         0.75 * relit_base,
@@ -1088,6 +1141,9 @@ def _compose_intrinsic_output(
             detail_lock_strength=settings.detail_lock_strength,
             mid_blend=settings.wavelet_mid_blend,
             detail_weight_map=detail_w,
+            organic_skin_mask=skin_w,
+            skin_detail_exponent=float(settings.skin_fidelity.detail_exponent),
+            skin_detail_floor=float(settings.skin_fidelity.detail_floor),
             eps=eps,
         )
 

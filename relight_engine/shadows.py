@@ -181,17 +181,15 @@ def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
     ox = (points[..., 0] + normals[..., 0] * normal_offset).astype(np.float32)
     oy = (points[..., 1] + normals[..., 1] * normal_offset).astype(np.float32)
     oz = (points[..., 2] + normals[..., 2] * normal_offset).astype(np.float32)
-    dx = (direction[..., 0] * max_distance).astype(np.float32)
-    dy = (direction[..., 1] * max_distance).astype(np.float32)
-    dz = (direction[..., 2] * max_distance).astype(np.float32)
 
-    visibility = np.ones((h, w), np.float32)
-    blocker_step = np.full((h, w), 1.0, np.float32)
-    max_penetration = np.zeros((h, w), np.float32)
     yy, xx = np.mgrid[0:h, 0:w]
     bayer = (((yy & 1) * 2 + (xx & 1)) * 0.25).astype(np.float32)
 
+    k_area = max(1, int(getattr(settings, "area_shadow_samples", 1)))
+    use_area_samples = k_area > 1 and float(light_radius) > 0.04
     n_steps = max(2, settings.shadow_steps)
+    if use_area_samples and k_area >= 4:
+        n_steps = max(16, int(round(n_steps * 0.85)))
     # Near-field start at 0.025 (with u^1.8 march below) captures tight contact shadows cleanly across blockers.
     step_base = np.linspace(0.025, 0.96, n_steps, dtype=np.float32)
     delta_u = (0.96 - 0.025) / max(n_steps - 1, 1)
@@ -210,142 +208,180 @@ def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
         else None
     )
 
-    def _march_steps(base_u_list: np.ndarray, mask: np.ndarray | None = None) -> None:
-        nonlocal visibility, blocker_step, max_penetration
-        if mask is None:
-            for base_u in base_u_list:
-                u_step = np.clip(np.float32(base_u) + jitter, 0.02, 0.98)
-                step = u_step * np.power(u_step, 0.8, dtype=np.float32)
-                qz = oz + dz * step
-                safe_z = np.maximum(qz, 1e-5)
-                inv_z = np.float32(1.0) / safe_z
-                map_x = fx * (ox + dx * step) * inv_z + cx
-                map_y = cy - fy * (oy + dy * step) * inv_z
-                sampled = cv2.remap(depth_f32, map_x, map_y, cv2.INTER_LINEAR,
-                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                inside = (
-                    (map_x >= 1.0) & (map_x < (w - 1))
-                    & (map_y >= 1.0) & (map_y < (h - 1))
-                    & (qz > 0.0) & (sampled > 0.0)
-                )
-                penetration = (qz - bias_map) - sampled
-                valid_hit = inside & (penetration > 0.0)
-                if not np.any(valid_hit):
-                    continue
-                raw_hit = np.where(valid_hit, np.minimum(penetration * inv_soft_width, 1.0), 0.0)
-                if max_t is not None:
-                    fade = np.clip((max_t - penetration) * inv_fade_w, 0.0, 1.0)
-                    cand = valid_hit & (penetration < max_t)
-                    if np.any(cand):
-                        sy = np.clip(np.rint(map_y[cand]).astype(np.intp), 0, h - 1)
-                        sx = np.clip(np.rint(map_x[cand]).astype(np.intp), 0, w - 1)
-                        near_d = depth_f32[sy, sx]
-                        near_pen = (qz[cand] - bias_map[cand]) - near_d
-                        cliff_diff = np.abs(sampled[cand] - near_d)
-                        phantom = (
-                            ((cliff_diff > np.maximum(0.06 * near_d, 0.05)) & (near_pen <= 0.0))
-                            | ((cliff_diff > max_t * 0.5) & (near_pen >= max_t))
-                            | ((step[cand] < 0.015) & (cliff_diff > np.maximum(0.04 * near_d, 0.03)))
-                        )
-                        f_c = fade[cand]
-                        if blocker_w_map is not None:
-                            local_t = np.minimum(max_t, 1.15 * blocker_w_map[sy, sx] + 0.04 * near_d)
-                            f_w = np.clip((local_t - penetration[cand]) / np.maximum(local_t * 0.35, 1e-4), 0.0, 1.0)
-                            f_c = np.minimum(f_c, f_w)
-                        if np.any(phantom):
-                            f_c[phantom] = 0.0
-                        fade[cand] = f_c
-                    raw_hit *= fade
-                hit_mask = raw_hit > 0.15
-                blocker_step = np.where(hit_mask, np.minimum(blocker_step, step), blocker_step)
-                max_penetration = np.where(hit_mask, np.maximum(max_penetration, penetration), max_penetration)
-                visibility = np.minimum(visibility, 1.0 - raw_hit)
-                if not np.any(visibility > 0.02):
-                    break
+    def _march_single_direction(ray_dir: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        dx = (ray_dir[..., 0] * max_distance).astype(np.float32)
+        dy = (ray_dir[..., 1] * max_distance).astype(np.float32)
+        dz = (ray_dir[..., 2] * max_distance).astype(np.float32)
+        vis_acc = np.ones((h, w), np.float32)
+        blk_acc = np.full((h, w), 1.0, np.float32)
+        pen_acc = np.zeros((h, w), np.float32)
+
+        def _march_steps(base_u_list: np.ndarray, mask: np.ndarray | None = None) -> None:
+            nonlocal vis_acc, blk_acc, pen_acc
+            if mask is None:
+                for base_u in base_u_list:
+                    u_step = np.clip(np.float32(base_u) + jitter, 0.02, 0.98)
+                    step = u_step * np.power(u_step, 0.8, dtype=np.float32)
+                    qz = oz + dz * step
+                    safe_z = np.maximum(qz, 1e-5)
+                    inv_z = np.float32(1.0) / safe_z
+                    map_x = fx * (ox + dx * step) * inv_z + cx
+                    map_y = cy - fy * (oy + dy * step) * inv_z
+                    sampled = cv2.remap(depth_f32, map_x, map_y, cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    inside = (
+                        (map_x >= 1.0) & (map_x < (w - 1))
+                        & (map_y >= 1.0) & (map_y < (h - 1))
+                        & (qz > 0.0) & (sampled > 0.0)
+                    )
+                    penetration = (qz - bias_map) - sampled
+                    valid_hit = inside & (penetration > 0.0)
+                    if not np.any(valid_hit):
+                        continue
+                    raw_hit = np.where(valid_hit, np.minimum(penetration * inv_soft_width, 1.0), 0.0)
+                    if max_t is not None and inv_fade_w is not None:
+                        fade = np.clip((max_t - penetration) * inv_fade_w, 0.0, 1.0)
+                        cand = valid_hit & (penetration < max_t)
+                        if np.any(cand):
+                            sy = np.clip(np.rint(map_y[cand]).astype(np.intp), 0, h - 1)
+                            sx = np.clip(np.rint(map_x[cand]).astype(np.intp), 0, w - 1)
+                            near_d = depth_f32[sy, sx]
+                            near_pen = (qz[cand] - bias_map[cand]) - near_d
+                            cliff_diff = np.abs(sampled[cand] - near_d)
+                            phantom = (
+                                ((cliff_diff > np.maximum(0.06 * near_d, 0.05)) & (near_pen <= 0.0))
+                                | ((cliff_diff > max_t * 0.5) & (near_pen >= max_t))
+                                | ((step[cand] < 0.015) & (cliff_diff > np.maximum(0.04 * near_d, 0.03)))
+                            )
+                            f_c = fade[cand]
+                            if blocker_w_map is not None:
+                                local_t = np.minimum(max_t, 1.15 * blocker_w_map[sy, sx] + 0.04 * near_d)
+                                f_w = np.clip((local_t - penetration[cand]) / np.maximum(local_t * 0.35, 1e-4), 0.0, 1.0)
+                                f_c = np.minimum(f_c, f_w)
+                            if np.any(phantom):
+                                f_c[phantom] = 0.0
+                            fade[cand] = f_c
+                        raw_hit *= fade
+                    hit_mask = raw_hit > 0.15
+                    blk_acc = np.where(hit_mask, np.minimum(blk_acc, step), blk_acc)
+                    pen_acc = np.where(hit_mask, np.maximum(pen_acc, penetration), pen_acc)
+                    vis_acc = np.minimum(vis_acc, 1.0 - raw_hit)
+                    if not np.any(vis_acc > 0.02):
+                        break
+            else:
+                ys_m, xs_m = np.where(mask)
+                n_pts = len(ys_m)
+                if n_pts == 0:
+                    return
+                ox_m, oy_m, oz_m = ox[ys_m, xs_m], oy[ys_m, xs_m], oz[ys_m, xs_m]
+                dx_m, dy_m, dz_m = dx[ys_m, xs_m], dy[ys_m, xs_m], dz[ys_m, xs_m]
+                jit_m = jitter[ys_m, xs_m]
+                bias_m = bias_map[ys_m, xs_m]
+                inv_sw_m = inv_soft_width[ys_m, xs_m]
+                vis_m = vis_acc[ys_m, xs_m]
+                blk_m = blk_acc[ys_m, xs_m]
+                pen_m = pen_acc[ys_m, xs_m]
+
+                # Reshape masked rays into (rows_blk, w) blocks so cv2.remap stays within SHRT_MAX bounds.
+                pad_n = ((n_pts + w - 1) // w) * w
+                mx_buf = np.zeros(pad_n, dtype=np.float32)
+                my_buf = np.zeros(pad_n, dtype=np.float32)
+                rows_blk = pad_n // w
+                for base_u in base_u_list:
+                    u_step = np.clip(np.float32(base_u) + jit_m, 0.02, 0.98)
+                    step = u_step * np.power(u_step, 0.8, dtype=np.float32)
+                    qz = oz_m + dz_m * step
+                    safe_z = np.maximum(qz, 1e-5)
+                    inv_z = np.float32(1.0) / safe_z
+                    mx = fx * (ox_m + dx_m * step) * inv_z + cx
+                    my = cy - fy * (oy_m + dy_m * step) * inv_z
+                    mx_buf[:n_pts] = mx
+                    my_buf[:n_pts] = my
+                    sampled = cv2.remap(
+                        depth_f32, mx_buf.reshape(rows_blk, w), my_buf.reshape(rows_blk, w),
+                        cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+                    ).ravel()[:n_pts]
+                    inside = (
+                        (mx >= 1.0) & (mx < (w - 1))
+                        & (my >= 1.0) & (my < (h - 1))
+                        & (qz > 0.0) & (sampled > 0.0)
+                    )
+                    pen = (qz - bias_m) - sampled
+                    vh = inside & (pen > 0.0)
+                    if not np.any(vh):
+                        continue
+                    rh = np.where(vh, np.minimum(pen * inv_sw_m, 1.0), 0.0)
+                    if max_t is not None and inv_fade_w is not None:
+                        fade_m = np.clip((max_t - pen) * inv_fade_w, 0.0, 1.0)
+                        cand_m = vh & (pen < max_t)
+                        if np.any(cand_m):
+                            sy_m = np.clip(np.rint(my[cand_m]).astype(np.intp), 0, h - 1)
+                            sx_m = np.clip(np.rint(mx[cand_m]).astype(np.intp), 0, w - 1)
+                            near_dm = depth_f32[sy_m, sx_m]
+                            near_pm = (qz[cand_m] - bias_m[cand_m]) - near_dm
+                            cliff_dm = np.abs(sampled[cand_m] - near_dm)
+                            phantom_m = (
+                                ((cliff_dm > np.maximum(0.06 * near_dm, 0.05)) & (near_pm <= 0.0))
+                                | ((cliff_dm > max_t * 0.5) & (near_pm >= max_t))
+                                | ((step[cand_m] < 0.015) & (cliff_dm > np.maximum(0.04 * near_dm, 0.03)))
+                            )
+                            f_cm = fade_m[cand_m]
+                            if blocker_w_map is not None:
+                                local_tm = np.minimum(max_t, 1.15 * blocker_w_map[sy_m, sx_m] + 0.04 * near_dm)
+                                f_wm = np.clip((local_tm - pen[cand_m]) / np.maximum(local_tm * 0.35, 1e-4), 0.0, 1.0)
+                                f_cm = np.minimum(f_cm, f_wm)
+                            if np.any(phantom_m):
+                                f_cm[phantom_m] = 0.0
+                            fade_m[cand_m] = f_cm
+                        rh *= fade_m
+                    hm = rh > 0.15
+                    blk_m = np.where(hm, np.minimum(blk_m, step), blk_m)
+                    pen_m = np.where(hm, np.maximum(pen_m, pen), pen_m)
+                    vis_m = np.minimum(vis_m, 1.0 - rh)
+                vis_acc[ys_m, xs_m] = vis_m
+                blk_acc[ys_m, xs_m] = blk_m
+                pen_acc[ys_m, xs_m] = pen_m
+
+        if bool(settings.shadow_adaptive_sampling) and n_steps >= 16:
+            coarse_steps = step_base[::2]
+            fine_steps = step_base[1::2]
+            _march_steps(coarse_steps)
+            in_penumbra = (vis_acc > 0.02) & (vis_acc < 0.98)
+            shadow_edge = cv2.dilate((vis_acc < 0.98).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+            near_shadow_lit = shadow_edge & (vis_acc > 0.02)
+            _march_steps(fine_steps, mask=(in_penumbra | near_shadow_lit))
         else:
-            ys_m, xs_m = np.where(mask)
-            n_pts = len(ys_m)
-            if n_pts == 0:
-                return
-            ox_m, oy_m, oz_m = ox[ys_m, xs_m], oy[ys_m, xs_m], oz[ys_m, xs_m]
-            dx_m, dy_m, dz_m = dx[ys_m, xs_m], dy[ys_m, xs_m], dz[ys_m, xs_m]
-            jit_m = jitter[ys_m, xs_m]
-            bias_m = bias_map[ys_m, xs_m]
-            inv_sw_m = inv_soft_width[ys_m, xs_m]
-            vis_m = visibility[ys_m, xs_m]
-            blk_m = blocker_step[ys_m, xs_m]
-            pen_m = max_penetration[ys_m, xs_m]
+            _march_steps(step_base)
+        return vis_acc, blk_acc, pen_acc
 
-            # Reshape masked rays into (rows_blk, w) blocks so cv2.remap stays within SHRT_MAX bounds.
-            pad_n = ((n_pts + w - 1) // w) * w
-            mx_buf = np.zeros(pad_n, dtype=np.float32)
-            my_buf = np.zeros(pad_n, dtype=np.float32)
-            rows_blk = pad_n // w
-            for base_u in base_u_list:
-                u_step = np.clip(np.float32(base_u) + jit_m, 0.02, 0.98)
-                step = u_step * np.power(u_step, 0.8, dtype=np.float32)
-                qz = oz_m + dz_m * step
-                safe_z = np.maximum(qz, 1e-5)
-                inv_z = np.float32(1.0) / safe_z
-                mx = fx * (ox_m + dx_m * step) * inv_z + cx
-                my = cy - fy * (oy_m + dy_m * step) * inv_z
-                mx_buf[:n_pts] = mx
-                my_buf[:n_pts] = my
-                sampled = cv2.remap(
-                    depth_f32, mx_buf.reshape(rows_blk, w), my_buf.reshape(rows_blk, w),
-                    cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-                ).ravel()[:n_pts]
-                inside = (
-                    (mx >= 1.0) & (mx < (w - 1))
-                    & (my >= 1.0) & (my < (h - 1))
-                    & (qz > 0.0) & (sampled > 0.0)
-                )
-                pen = (qz - bias_m) - sampled
-                vh = inside & (pen > 0.0)
-                if not np.any(vh):
-                    continue
-                rh = np.where(vh, np.minimum(pen * inv_sw_m, 1.0), 0.0)
-                if max_t is not None:
-                    fade_m = np.clip((max_t - pen) * inv_fade_w, 0.0, 1.0)
-                    cand_m = vh & (pen < max_t)
-                    if np.any(cand_m):
-                        sy_m = np.clip(np.rint(my[cand_m]).astype(np.intp), 0, h - 1)
-                        sx_m = np.clip(np.rint(mx[cand_m]).astype(np.intp), 0, w - 1)
-                        near_dm = depth_f32[sy_m, sx_m]
-                        near_pm = (qz[cand_m] - bias_m[cand_m]) - near_dm
-                        cliff_dm = np.abs(sampled[cand_m] - near_dm)
-                        phantom_m = (
-                            ((cliff_dm > np.maximum(0.06 * near_dm, 0.05)) & (near_pm <= 0.0))
-                            | ((cliff_dm > max_t * 0.5) & (near_pm >= max_t))
-                            | ((step[cand_m] < 0.015) & (cliff_dm > np.maximum(0.04 * near_dm, 0.03)))
-                        )
-                        f_cm = fade_m[cand_m]
-                        if blocker_w_map is not None:
-                            local_tm = np.minimum(max_t, 1.15 * blocker_w_map[sy_m, sx_m] + 0.04 * near_dm)
-                            f_wm = np.clip((local_tm - pen[cand_m]) / np.maximum(local_tm * 0.35, 1e-4), 0.0, 1.0)
-                            f_cm = np.minimum(f_cm, f_wm)
-                        if np.any(phantom_m):
-                            f_cm[phantom_m] = 0.0
-                        fade_m[cand_m] = f_cm
-                    rh *= fade_m
-                hm = rh > 0.15
-                blk_m = np.where(hm, np.minimum(blk_m, step), blk_m)
-                pen_m = np.where(hm, np.maximum(pen_m, pen), pen_m)
-                vis_m = np.minimum(vis_m, 1.0 - rh)
-            visibility[ys_m, xs_m] = vis_m
-            blocker_step[ys_m, xs_m] = blk_m
-            max_penetration[ys_m, xs_m] = pen_m
+    if use_area_samples:
+        ref_up = np.where(
+            np.abs(direction[..., 1:2]) < 0.9,
+            np.array([0.0, 1.0, 0.0], dtype=np.float32),
+            np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        )
+        u_ax = np.cross(ref_up, direction)
+        u_ax /= np.maximum(np.linalg.norm(u_ax, axis=-1, keepdims=True), 1e-8)
+        v_ax = np.cross(direction, u_ax)
+        tan_alpha = np.clip(float(light_radius) / np.maximum(max_distance, 0.25), 0.0, 0.30)[..., None].astype(np.float32)
 
-    if bool(settings.shadow_adaptive_sampling) and n_steps >= 16:
-        coarse_steps = step_base[::2]
-        fine_steps = step_base[1::2]
-        _march_steps(coarse_steps)
-        in_penumbra = (visibility > 0.02) & (visibility < 0.98)
-        shadow_edge = cv2.dilate((visibility < 0.98).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
-        near_shadow_lit = shadow_edge & (visibility > 0.02)
-        _march_steps(fine_steps, mask=(in_penumbra | near_shadow_lit))
+        vis_sum = np.zeros((h, w), np.float32)
+        blk_sum = np.zeros((h, w), np.float32)
+        pen_sum = np.zeros((h, w), np.float32)
+        for k in range(k_area):
+            r_k = np.float32(np.sqrt((k + 0.5) / k_area))
+            theta_k = (k * 2.39996323 + bayer * (2.0 * np.pi))[..., None].astype(np.float32)
+            dir_k = direction + tan_alpha * r_k * (np.cos(theta_k) * u_ax + np.sin(theta_k) * v_ax)
+            dir_k /= np.maximum(np.linalg.norm(dir_k, axis=-1, keepdims=True), 1e-8)
+            vk, bk, pk = _march_single_direction(dir_k)
+            vis_sum += vk
+            blk_sum += bk
+            pen_sum += pk
+        visibility = (vis_sum / float(k_area)).astype(np.float32)
+        blocker_step = (blk_sum / float(k_area)).astype(np.float32)
+        max_penetration = (pen_sum / float(k_area)).astype(np.float32)
     else:
-        _march_steps(step_base)
+        visibility, blocker_step, max_penetration = _march_single_direction(direction)
 
     vis_out = visibility
     for _ in range(max(1, int(settings.shadow_smooth_passes))):
@@ -356,7 +392,8 @@ def ray_visibility(points: np.ndarray, normals: np.ndarray, depth: np.ndarray,
         gap_ratio = blocker_step / np.maximum(1.0 - blocker_step, 0.15)
         depth_gap_ratio = max_penetration / np.maximum(depth_f32 * 0.45, 0.25)
         eff_gap = np.maximum(gap_ratio, depth_gap_ratio)
-        penumbra_px = np.clip(float(light_radius) * eff_gap * 22.0, 0.0, 14.0)
+        penumbra_scale = 22.0 / (max(1.0, 0.65 * np.sqrt(float(k_area))) if use_area_samples else 1.0)
+        penumbra_px = np.clip(float(light_radius) * eff_gap * penumbra_scale, 0.0, 14.0)
         vis_out = _pcss_penumbra_smooth(vis_out, depth_f32, penumbra_px)
     if depth_confidence is not None:
         # Soften false deep shadow halos on uncertain occlusion/silhouette depth pixels.

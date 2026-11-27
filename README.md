@@ -210,6 +210,10 @@ See `LICENSE_MODEL_NOTES.md`, `ENGINE_V1_PLAN.md` and `MATERIAL_RESPONSE_ROADMAP
 - Glass, mirrors, liquids, emissive objects, skin/hair and complex products need specialist response estimation and domain validation.
 - Neural inference and visual quality have not yet been validated across real photographs in this build environment.
 
+## Changelog / Notes
+
+- **Skin Fidelity Guard (`SkinFidelityParams`)**: `EngineSettings.studio_3d()` and `EngineSettings.real_preserving()` now enable `skin_fidelity=SkinFidelityParams(enabled=True)` by default to prevent over-brightening, pore/texture inflation, GGX pixel-speckle, and chroma clipping on detected human skin while leaving pixels where `skin_w == 0` bit-identical. Raw `EngineSettings()` keeps `skin_fidelity.enabled = False`. To opt out on preset builders, pass `skin_fidelity=SkinFidelityParams(enabled=False)`.
+
 ## Validation
 
 ```bash

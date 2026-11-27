@@ -914,10 +914,309 @@ def suggest_material_priors_from_semantics(scene: SceneBuffers) -> MaterialMaps 
             ))
     if not assignments:
         return None
+    if not any(any(t in k.lower() for t in ("face", "skin", "hand", "finger", "palm")) for k in scene.semantic_masks):
+        skin_map = compute_skin_likelihood_map(
+            scene.rgb_srgb,
+            semantic_masks=scene.semantic_masks,
+            depth=scene.depth,
+            material_maps={"metalness": scene.metalness} if scene.metalness is not None else None,
+        )
+        if np.any(skin_map > 0.25):
+            assignments.append(MaterialAssignment(
+                name="auto_inferred_skin",
+                mask=skin_map,
+                roughness=0.54,
+                metalness=0.0,
+                specular_level=0.035,
+                subsurface=0.30,
+                blend=0.80,
+                confidence=0.40,
+            ))
     maps = build_material_maps(scene.shape, assignments)
     maps.metadata["origin"] = "semantic_fallback_priors"
     maps.metadata["confidence_applied"] = False
     return maps
+
+
+def calibrate_conductor_from_appearance(scene: SceneBuffers) -> tuple[np.ndarray, np.ndarray] | None:
+    """Model-agnostic specular-contrast & neutrality calibration for reflective conductors.
+
+    Detects high-dynamic-range specular-to-trough contrast with low chroma saturation
+    (e.g., polished/brushed metals, chrome, jewelry) while excluding organic/dielectric
+    semantic masks, returning updated `(metalness, roughness)` maps.
+    """
+    from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
+
+    rgb = np.asarray(scene.rgb_srgb, dtype=np.float32)
+    c_max = np.max(rgb, axis=-1)
+    c_min = np.min(rgb, axis=-1)
+    y = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float32)
+    sat = (c_max - c_min) / np.maximum(c_max, 1e-4)
+
+    loc_max = maximum_filter(y, size=15)
+    loc_min = minimum_filter(y, size=15)
+    loc_contrast = loc_max - loc_min
+    loc_sat = gaussian_filter(sat, sigma=3.0, mode="reflect")
+    # Require true specular peak (>0.78) + deep trough (<0.24) + multi-pixel highlight support.
+    peak_score = np.clip((loc_max - 0.76) / 0.14, 0.0, 1.0)
+    trough_score = np.clip((0.26 - loc_min) / 0.16, 0.0, 1.0)
+    spec_support = np.clip((gaussian_filter((y > 0.76).astype(np.float32), sigma=1.5, mode="reflect") - 0.10) / 0.25, 0.0, 1.0)
+
+    # Require smooth midtone rolloff and low 1px halftone/stipple grain so 2D illustrations aren't flagged as chrome.
+    midtone_support = np.clip((gaussian_filter(((y > 0.18) & (y < 0.74)).astype(np.float32), sigma=2.5, mode="reflect") - 0.12) / 0.25, 0.0, 1.0)
+    hf_grain = gaussian_filter(np.abs(y - gaussian_filter(y, sigma=1.0, mode="reflect")), sigma=3.0, mode="reflect")
+    smooth_rolloff = np.clip((0.085 - hf_grain) / 0.04, 0.0, 1.0)
+
+    # Sharp specular-contrast cue: strong local dynamic range + neutral chroma + real highlight core.
+    contrast_score = np.clip((loc_contrast - 0.50) / 0.30, 0.0, 1.0) * peak_score * trough_score
+    neutral_score = np.clip((0.24 - loc_sat) / 0.16, 0.0, 1.0)
+    conductor_score = gaussian_filter(
+        contrast_score * neutral_score * spec_support * midtone_support * smooth_rolloff,
+        sigma=2.5,
+        mode="reflect",
+    )
+
+    if scene.normals is not None:
+        n = np.asarray(scene.normals, dtype=np.float32)
+        n_var = (
+            (maximum_filter(n[..., 0], size=9) - minimum_filter(n[..., 0], size=9))
+            + (maximum_filter(n[..., 1], size=9) - minimum_filter(n[..., 1], size=9))
+        )
+        # Flat planes with 2D high-contrast graphics/ink are not curved metallic conductors.
+        curved_surface = np.clip((n_var - 0.03) / 0.08, 0.0, 1.0)
+        conductor_score = conductor_score * curved_surface
+
+    if scene.depth is not None:
+        d = np.asarray(scene.depth, dtype=np.float32)
+        d_max = maximum_filter(d, size=15)
+        d_min = minimum_filter(np.where(d > 0, d, d_max), size=15)
+        # Contrast must come from shading/reflection on a continuous surface, never a fg/bg depth cliff.
+        same_surface = (d > 0) & ((d_max - d_min) < 0.22 * np.maximum(d, 1e-3))
+        conductor_score = np.where(same_surface, conductor_score, 0.0)
+
+    # Never override explicit dielectric/organic semantic regions.
+    if scene.semantic_masks:
+        non_metal = np.zeros(scene.shape, dtype=np.float32)
+        for raw_label, raw_mask in scene.semantic_masks.items():
+            kl = raw_label.lower()
+            if any(
+                t in kl
+                for t in (
+                    "dial", "marker", "numeral", "text", "label", "screen",
+                    "face", "skin", "hand", "arm", "leg", "neck", "ear", "finger",
+                    "hair", "fur", "suit", "trousers", "shirt", "tie", "coat", "jacket",
+                    "wall", "floor", "sky", "mountain", "grass", "stone", "ground", "snow",
+                )
+            ):
+                non_metal = np.maximum(non_metal, np.clip(np.asarray(raw_mask, dtype=np.float32), 0.0, 1.0))
+        conductor_score = conductor_score * np.clip(1.0 - non_metal, 0.0, 1.0)
+
+    if not np.any(conductor_score > 0.30):
+        return None
+
+    w_cond = np.clip((conductor_score - 0.25) / 0.45, 0.0, 1.0).astype(np.float32)
+    base_m = (
+        np.clip(np.asarray(scene.metalness, dtype=np.float32), 0.0, 1.0)
+        if scene.metalness is not None
+        else np.zeros(scene.shape, dtype=np.float32)
+    )
+    base_r = (
+        np.clip(np.asarray(scene.roughness, dtype=np.float32), 0.04, 1.0)
+        if scene.roughness is not None
+        else np.full(scene.shape, 0.50, dtype=np.float32)
+    )
+    target_m = 0.90
+    target_r = 0.14
+    out_m = np.maximum(base_m, w_cond * target_m).astype(np.float32)
+    out_r = (base_r * (1.0 - 0.75 * w_cond) + target_r * (0.75 * w_cond)).astype(np.float32)
+    out_r = np.minimum(base_r, out_r).astype(np.float32)
+    return out_m, np.clip(out_r, 0.04, 1.0).astype(np.float32)
+
+
+def compute_skin_likelihood_map(
+    image: np.ndarray,
+    semantic_masks: dict[str, np.ndarray] | None = None,
+    depth: np.ndarray | None = None,
+    material_maps: object | None = None,
+    *,
+    min_skin_confidence: float = 0.35,
+) -> np.ndarray:
+    """Estimate a smooth [0, 1] human skin weight map, biased toward zero false positives on metals/non-organic surfaces.
+
+    Signal priority:
+    1. Explicit semantic skin/body masks (`face`, `skin`, `hand`, `finger`, `palm`, `arm`, `neck`, `ear`, `leg`).
+    2. Chromatic/texture skin prior restricted to `person`/`man`/`woman` masks or elevated foreground
+       regions outside non-skin material masks (`watch`, `ring`, `metal`, `suit`, `wall`, `sky`, etc.).
+    Excludes hair, eyebrows, lashes, eyes, teeth, lips, jewelry, watch straps, high-texture wood/sand/leather,
+    monochrome halftone illustrations, and metallic pixels (`metalness >= 0.15`).
+    """
+    from scipy.ndimage import binary_dilation, gaussian_filter, grey_closing
+
+    rgb = np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    h, w = rgb.shape[:2]
+    r_c, g_c, b_c = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    y_s = (0.299 * r_c + 0.587 * g_c + 0.114 * b_c).astype(np.float32)
+    c_max = np.maximum(np.maximum(r_c, g_c), b_c)
+    c_min = np.minimum(np.minimum(r_c, g_c), b_c)
+    sat = ((c_max - c_min) / np.maximum(c_max, 1e-4)).astype(np.float32)
+
+    # Smoothness & halftone rejection (slightly softer inside semantic person masks so chin stubble / nose highlights stay covered)
+    y_blur = gaussian_filter(y_s, sigma=1.2, mode="reflect")
+    y_var = np.maximum(gaussian_filter(y_s * y_s, sigma=1.2, mode="reflect") - y_blur * y_blur, 0.0)
+    local_std = np.sqrt(y_var).astype(np.float32)
+    hf_grain = gaussian_filter(np.abs(y_s - gaussian_filter(y_s, sigma=1.0, mode="reflect")), sigma=2.0, mode="reflect")
+    smooth_tex_conf = np.clip((0.070 - local_std) / 0.035, 0.0, 1.0) * np.clip((0.065 - hf_grain) / 0.025, 0.0, 1.0)
+    smooth_person_conf = np.clip((0.095 - local_std) / 0.045, 0.0, 1.0) * np.clip((0.075 - hf_grain) / 0.030, 0.0, 1.0)
+
+    # Reject dark eyebrows/lashes/pupils, white eyes/teeth, and saturated red lips
+    eye_teeth_white = np.clip((y_s - 0.65) / 0.20, 0.0, 1.0) * np.clip((0.12 - sat) / 0.08, 0.0, 1.0)
+    dark_hair_feature = np.clip((0.08 - y_s) / 0.06, 0.0, 1.0)
+    red_lip_chroma = np.clip(((r_c - g_c) - 2.2 * np.maximum(g_c - b_c, 0.0)) / 0.15, 0.0, 1.0) * np.clip((sat - 0.50) / 0.20, 0.0, 1.0)
+    feature_keep = np.clip(1.0 - np.maximum(eye_teeth_white, np.maximum(dark_hair_feature, red_lip_chroma)), 0.0, 1.0)
+
+    # Resolve metalness if supplied via MaterialMaps, SceneBuffers, or dict
+    metal_arr = None
+    if material_maps is not None:
+        if isinstance(material_maps, dict):
+            metal_arr = material_maps.get("metalness")
+        else:
+            metal_arr = getattr(material_maps, "metalness", None)
+    non_metal_conf = (
+        np.clip((0.15 - np.asarray(metal_arr, dtype=np.float32)) / 0.10, 0.0, 1.0)
+        if metal_arr is not None
+        else np.ones((h, w), dtype=np.float32)
+    )
+
+    explicit_skin = np.zeros((h, w), dtype=np.float32)
+    person_union = np.zeros((h, w), dtype=np.float32)
+    exclude_union = np.zeros((h, w), dtype=np.float32)
+    accessory_edge_mask = np.zeros((h, w), dtype=bool)
+    hand_accessory_mask = np.zeros((h, w), dtype=bool)
+
+    skin_tokens = ("face", "skin", "hand", "finger", "palm", "arm", "neck", "ear", "leg")
+    person_tokens = ("man", "woman", "person", "boy", "girl", "human", "hiker")
+    exclude_tokens = (
+        "watch", "ring", "jewelry", "bracelet", "necklace", "strap", "band", "clasp", "buckle",
+        "metal", "chrome", "steel", "gold", "silver", "copper", "dial", "black_dial", "marker", "numeral",
+        "suit", "trousers", "shirt", "tie", "coat", "jacket", "collar", "dress", "skirt",
+        "hair", "his_hair", "fur", "eyebrow", "lash", "eye", "sunglasses", "glasses", "teeth", "lip",
+        "bag", "handbag", "shoe", "footwear", "boot", "hat", "cap",
+        "wall", "floor", "sky", "mountain", "grass", "stone", "ground", "snow", "background",
+        "wood", "sand", "cardboard", "leather", "statue", "sculpture", "design", "rock",
+    )
+    accessory_tokens = ("watch", "ring", "jewelry", "bracelet", "strap", "band", "sunglasses", "glasses", "collar")
+    hand_acc_tokens = ("watch", "ring", "jewelry", "bracelet", "strap", "band")
+
+    if semantic_masks:
+        for raw_label, raw_mask in semantic_masks.items():
+            kl = raw_label.lower()
+            m = np.clip(np.asarray(raw_mask, dtype=np.float32), 0.0, 1.0)
+            if any(t in kl for t in exclude_tokens):
+                exclude_union = np.maximum(exclude_union, m)
+                if any(t in kl for t in accessory_tokens):
+                    accessory_edge_mask |= (m > 0.20)
+                if any(t in kl for t in hand_acc_tokens):
+                    hand_accessory_mask |= (m > 0.20)
+            elif any(t in kl for t in skin_tokens):
+                explicit_skin = np.maximum(explicit_skin, m)
+            elif any(t in kl for t in person_tokens):
+                person_union = np.maximum(person_union, m)
+
+    # Eroded safety border around watch/ring/jewelry straps where wrist vs strap is uncertain -> default low
+    if np.any(accessory_edge_mask):
+        dil = binary_dilation(accessory_edge_mask, iterations=2).astype(np.float32)
+        exclude_union = np.maximum(exclude_union, 0.60 * dil)
+
+    # Priority 1: Explicit semantic skin masks (still filtered against monochrome ink, metal, eyes/teeth/hair/accessories)
+    p1_conf = explicit_skin * np.clip(1.0 - exclude_union, 0.0, 1.0) * non_metal_conf * feature_keep
+    # Guard monochrome illustration 'face' masks (e.g. manga): require either slight skin chroma or smooth photo shading
+    photo_skin_tone = np.clip((sat - 0.06) / 0.10, 0.0, 1.0) * np.clip((0.060 - hf_grain) / 0.025, 0.0, 1.0)
+    p1_conf = p1_conf * np.maximum(photo_skin_tone, 0.0)
+
+    # Priority 2: Chromatic + texture prior inside person masks OR elevated foreground outside exclusions
+    chrom_skin_strict = (
+        (r_c > g_c)
+        & (g_c >= b_c * 0.93)
+        & ((r_c - b_c) > 0.045)
+        & (sat > 0.12)
+        & (sat < 0.65)
+        & (y_s > 0.08)
+        & (y_s < 0.88)
+    ).astype(np.float32)
+    # Inside a semantic person mask (outside clothes/hair/accessories), pale highlight cheeks/noses can have sat >= 0.07
+    chrom_skin_person = (
+        (r_c > g_c)
+        & (g_c >= b_c * 0.93)
+        & ((r_c - b_c) > 0.035)
+        & (sat > 0.07)
+        & (sat < 0.68)
+        & (y_s > 0.08)
+        & (y_s < 0.92)
+    ).astype(np.float32)
+    chrom_skin = np.where(person_union > 0.20, chrom_skin_person, chrom_skin_strict)
+    eff_tex_conf = np.where(person_union > 0.20, smooth_person_conf, smooth_tex_conf)
+    # Tighter skin green ratio: exclude yellow sand/cardboard ((R-G)/(R-B) < 0.20) while keeping fair/pinkish palms (up to ~1.12)
+    rg_frac = (r_c - g_c) / np.maximum(r_c - b_c, 1e-4)
+    hue_win = np.clip((rg_frac - 0.18) / 0.15, 0.0, 1.0) * np.clip((1.16 - rg_frac) / 0.14, 0.0, 1.0)
+
+    has_person_mask = bool(np.any(person_union > 0.15))
+    fg_context = person_union.copy()
+    if depth is not None:
+        d = np.asarray(depth, dtype=np.float32)
+        valid_d = d > 0
+        if np.any(valid_d):
+            z_lo, z_bg = np.percentile(d[valid_d], [5.0, 82.0])
+            # Elevated foreground hand/product context when no person mask exists, or around hand-worn accessories.
+            if z_bg > 1.35 * max(float(z_lo), 1e-4) and np.any(exclude_union > 0.25):
+                fg_elev = np.clip((0.86 * z_bg - d) / max(0.25 * z_bg, 0.2), 0.0, 1.0)
+                if has_person_mask:
+                    if np.any(hand_accessory_mask):
+                        r_px = max(12, int(round(0.30 * min(h, w))))
+                        near_hand_acc = binary_dilation(hand_accessory_mask, iterations=r_px).astype(np.float32)
+                        fg_context = np.maximum(fg_context, fg_elev * near_hand_acc)
+                else:
+                    fg_context = np.maximum(fg_context, fg_elev)
+
+    p2_raw = chrom_skin * hue_win * eff_tex_conf * feature_keep * non_metal_conf * np.clip(1.0 - exclude_union, 0.0, 1.0) * fg_context
+    raw_skin = np.maximum(p1_conf, p2_raw).astype(np.float32)
+    # Close tiny 1-2px interior skin crease/stubble dropouts while strictly preserving metal/accessory exclusions
+    raw_skin = grey_closing(raw_skin, size=(5, 5)) * non_metal_conf * np.clip(1.0 - exclude_union, 0.0, 1.0)
+
+    # Feather edges gently, then enforce confidence floor so non-skin pixels stay exact 0.0
+    # Feather edges gently, ramp smoothly from min_skin_confidence to avoid step edges, and drop tiny noise specks.
+    import cv2
+    feathered = gaussian_filter(raw_skin, sigma=2.0, mode="reflect")
+    if float(min_skin_confidence) > 0.0:
+        mc = float(min_skin_confidence)
+        ramp = np.clip((feathered - mc) / 0.12, 0.0, 1.0)
+        feathered = np.where(feathered >= mc, feathered * ramp, 0.0)
+    nz_u8 = (feathered > 0.02).astype(np.uint8)
+    n_cc, cc_lbl, cc_stats, _ = cv2.connectedComponentsWithStats(nz_u8, connectivity=8)
+    min_cc_area = max(32, int(0.0005 * h * w))
+    if n_cc > 1:
+        keep_cc = np.zeros((h, w), dtype=bool)
+        for idx_c in range(1, n_cc):
+            if int(cc_stats[idx_c, cv2.CC_STAT_AREA]) >= min_cc_area:
+                keep_cc |= (cc_lbl == idx_c)
+        feathered = np.where(keep_cc, feathered, 0.0)
+    return np.clip(feathered, 0.0, 1.0).astype(np.float32)
+
+
+def get_skin_weight_for_scene(scene: SceneBuffers, settings: object | None = None) -> np.ndarray | None:
+    """Resolve `skin_w` when `settings.skin_fidelity.enabled` is True; returns None otherwise."""
+    sf = getattr(settings, "skin_fidelity", None) if settings is not None else None
+    if sf is None or not bool(getattr(sf, "enabled", False)):
+        return None
+    skin_w = compute_skin_likelihood_map(
+        scene.rgb_srgb,
+        semantic_masks=scene.semantic_masks,
+        depth=scene.depth,
+        material_maps={"metalness": scene.metalness} if scene.metalness is not None else None,
+        min_skin_confidence=float(getattr(sf, "min_skin_confidence", 0.35)),
+    )
+    if not np.any(skin_w > 0.0):
+        return None
+    return skin_w
 
 
 def refine_source_shading_with_albedo(
