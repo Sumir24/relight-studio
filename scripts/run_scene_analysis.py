@@ -23,6 +23,8 @@ from relight_engine.image_io import load_image
 from relight_engine.scene_policy import semantic_key
 from relight_engine.scene_domains import SceneDomainHint, SUPPORTED_QA_DOMAINS
 from relight_engine.quality import evaluate_scene_buffers
+from relight_engine.calibration import compute_intrinsic_reconstruction_error, estimate_source_illumination
+from relight_engine.workflows import serialize_scene_artifacts
 from relight_engine.adapters.runtime import is_full_commit_sha, revision_descriptor
 
 
@@ -336,13 +338,16 @@ def main() -> int:
     intr_metalness = None
     intr_spec_level = None
     intr_spec_color = None
+    intr_clearcoat = None
+    intr_cc_rough = None
     intr_anisotropy = None
     intr_mat_conf = None
+    intr_raw_mats: dict[str, np.ndarray] = {}
     intr_meta: dict = {}
     mat_meta: dict = {}
 
     def _record_intrinsic_materials(pred, backend_name: str) -> None:
-        nonlocal intr_roughness, intr_metalness, intr_spec_level, intr_spec_color, intr_anisotropy, intr_mat_conf
+        nonlocal intr_roughness, intr_metalness, intr_spec_level, intr_spec_color, intr_clearcoat, intr_cc_rough, intr_anisotropy, intr_mat_conf
         if pred.roughness is None and pred.metalness is None:
             return
         from relight_engine.calibration import assign_estimated_material_priors
@@ -362,18 +367,25 @@ def main() -> int:
         intr_metalness = assigned.metalness
         intr_spec_level = assigned.specular_level
         intr_spec_color = assigned.specular_color
+        intr_clearcoat = assigned.clearcoat
+        intr_cc_rough = assigned.clearcoat_roughness
         intr_anisotropy = assigned.anisotropy
         intr_mat_conf = assigned.confidence
+        intr_raw_mats.update(assigned.raw_maps)
         unc_src = pred.metadata.get("material_target_semantics", {}).get("uncertainty_source")
         for mname, marr in (
             ("roughness", intr_roughness),
             ("metalness", intr_metalness),
             ("specular_level", intr_spec_level),
             ("specular_color", intr_spec_color),
+            ("clearcoat", intr_clearcoat),
+            ("clearcoat_roughness", intr_cc_rough),
             ("anisotropy", intr_anisotropy),
         ):
             if marr is not None:
                 mat_meta[mname] = {"source": "model_estimated", "backend": backend_name, "calibrated": False}
+        mat_meta["confidence_applied"] = True
+        mat_meta["confidence_blending_stage"] = "pre_blended_in_calibration"
         if intr_mat_conf is not None:
             mat_meta["material_confidence"] = {
                 "source": "model_estimated",
@@ -445,8 +457,10 @@ def main() -> int:
         lightable_mask=seg.lightable_mask, protected_mask=seg.protected_mask,
         class_masks=seg.masks, instance_masks=seg.instance_masks, metadata=seg.metadata,
         roughness=intr_roughness, metalness=intr_metalness, specular_level=intr_spec_level,
-        specular_color=intr_spec_color, anisotropy=intr_anisotropy,
+        specular_color=intr_spec_color, clearcoat=intr_clearcoat, clearcoat_roughness=intr_cc_rough,
+        anisotropy=intr_anisotropy,
         material_confidence=intr_mat_conf, material_metadata=mat_meta,
+        raw_material_maps=intr_raw_mats,
         albedo=intr_albedo, source_shading=intr_shading, non_diffuse_residual=intr_residual,
         intrinsic_metadata=intr_meta,
     )
@@ -473,45 +487,27 @@ def main() -> int:
         save_mask(args.out / f"instance_mask_{safe_filename(instance_id)}.png", mask)
     Image.fromarray(np.round(np.clip(overlay, 0, 1) * 255).astype(np.uint8), mode="RGB").save(args.out / "semantic_overlay.jpg", quality=94)
 
-    buffers = {
-        "rgb_srgb": scene.rgb_srgb,
-        "depth": scene.depth,
-        "depth_confidence": scene.depth_confidence,
-        "geometry_confidence": scene.geometry_confidence,
-        "normals": scene.normals,
-        "lightable_mask": scene.lightable_mask,
-        "protected_mask": seg.protected_mask,
-    }
-    if image_input.alpha_mask is not None:
-        buffers["alpha_mask"] = image_input.alpha_mask
     if scene.albedo is not None:
-        buffers["albedo"] = scene.albedo
         Image.fromarray(np.round(np.clip(scene.albedo, 0, 1) * 255).astype(np.uint8), mode="RGB").save(args.out / "intrinsic_albedo.png")
     if scene.source_shading is not None:
-        buffers["source_shading"] = scene.source_shading
         sh_vis = scene.source_shading if scene.source_shading.ndim == 2 else np.mean(scene.source_shading, axis=-1)
         save_gray(args.out / "intrinsic_shading.png", sh_vis)
-    if scene.non_diffuse_residual is not None:
-        buffers["non_diffuse_residual"] = scene.non_diffuse_residual
-    for mname in ("roughness", "metalness", "specular_level", "specular_color", "anisotropy", "anisotropy_angle", "material_confidence"):
-        mval = getattr(scene, mname)
-        if mval is not None:
-            buffers[mname] = mval
     if scene.roughness is not None:
         save_mask(args.out / "material_roughness.png", scene.roughness)
     if scene.metalness is not None:
         save_mask(args.out / "material_metalness.png", scene.metalness)
     if scene.material_confidence is not None:
         save_mask(args.out / "material_confidence.png", scene.material_confidence)
-    buffers.update({f"mask_{safe_filename(k)}": v for k, v in seg.masks.items()})
-    buffers.update({f"mask_instance_{safe_filename(k)}": v for k, v in seg.instance_masks.items()})
-    np.savez_compressed(args.out / "scene_buffers.npz", **buffers)
 
     # Structural QA catches degenerate model outputs but does not claim ground-truth accuracy.
     quality_report = evaluate_scene_buffers(scene)
     (args.out / "scene_quality_report.json").write_text(
         json.dumps(quality_report, indent=2), encoding="utf-8"
     )
+    recon_err = compute_intrinsic_reconstruction_error(scene)
+    if recon_err is not None:
+        save_gray(args.out / "intrinsic_reconstruction_error.png", recon_err["error_map"])
+    source_proposal = estimate_source_illumination(scene, normals)
 
     manifest = {
         "status": "generic_scene_analysis_complete_not_relighting",
@@ -557,7 +553,9 @@ def main() -> int:
             if mat_meta
             else "not implemented; no physical material labels are inferred by segmentation"
         ),
-        "source_light_estimation": "not implemented; requires user calibration or a separately validated estimator",
+        "source_light_estimation": "automatic unreviewed SH proposal available in source_illumination_proposal; requires review or manual override",
+        "source_illumination_proposal": source_proposal.to_metadata(),
+        "intrinsic_reconstruction_error": quality_report.get("intrinsics", {}).get("reconstruction_error"),
         "limitations": [
             "Depth is relative, not metric; no physical distance claims are valid.",
             "Camera intrinsics are FOV-derived unless calibrated metadata was supplied.",
@@ -572,7 +570,7 @@ def main() -> int:
             "No relit output is generated by this scene-analysis command.",
         ],
     }
-    (args.out / "scene_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    serialize_scene_artifacts(args.out, scene, calibration.camera, manifest)
     print(json.dumps(manifest["metrics"], indent=2))
     print(f"Discovered/used labels: {', '.join(prompts)}")
     print(f"Saved scene analysis to: {args.out.resolve()}")

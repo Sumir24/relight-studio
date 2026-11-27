@@ -89,13 +89,17 @@ class HuggingFaceDepthAnythingV2:
     model is Apache-2.0.
     """
     DEFAULT_RELATIVE_MODEL = 'depth-anything/Depth-Anything-V2-Small-hf'
+    HIGH_PRECISION_RELATIVE_MODEL = 'depth-anything/Depth-Anything-V2-Large-hf'
 
-    def __init__(self, model_id: str = DEFAULT_RELATIVE_MODEL, *,
+    def __init__(self, model_id: str | None = None, *,
+                 quality_tier: Literal['fast', 'studio_high'] = 'fast',
                  output_kind: Literal['relative', 'metric'] = 'relative',
                  relative_near_is_high: Optional[bool] = None,
                  device: str = 'auto',
                  metric_license_reviewed: bool = False,
                  revision: str | None = None) -> None:
+        if model_id is None:
+            model_id = self.HIGH_PRECISION_RELATIVE_MODEL if quality_tier == 'studio_high' else self.DEFAULT_RELATIVE_MODEL
         if output_kind == 'relative' and relative_near_is_high is None:
             raise ValueError('Set relative_near_is_high explicitly for the chosen checkpoint.')
         if output_kind == 'metric' and not metric_license_reviewed:

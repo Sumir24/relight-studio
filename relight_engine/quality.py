@@ -151,6 +151,7 @@ def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
         "emissive_radiance_separation",
         "environment_dependent_reflection",
     ]
+
     return {
         "maps": maps,
         "material_confidence": {
@@ -161,11 +162,22 @@ def describe_material_response(scene: SceneBuffers) -> dict[str, Any]:
             "minimum": float(np.min(confidence_values)) if confidence_values is not None else None,
             "maximum": float(np.max(confidence_values)) if confidence_values is not None else None,
             "semantics": (
-                "Blends supplied material maps toward declared conservative priors."
-                if confidence_values is not None
-                else "No per-pixel confidence blend; supplied maps are used as provided."
+                "Pre-blended in calibration; renderer uses processed maps directly."
+                if bool(metadata.get("confidence_applied", False))
+                else (
+                    "Blends supplied material maps toward declared conservative priors."
+                    if confidence_values is not None
+                    else "No per-pixel confidence blend; supplied maps are used as provided."
+                )
+            ),
+            "confidence_blending_stage": (
+                "pre_blended"
+                if bool(metadata.get("confidence_applied", False))
+                else ("deferred_to_renderer" if confidence_values is not None else "none")
             ),
         },
+        "raw_material_maps_available": sorted(scene.raw_material_maps.keys()),
+        "scene_schema_version": scene.schema_version,
         "implemented_response_families": [
             "lambertian_diffuse_baseline",
             "ggx_rough_dielectric",
@@ -195,6 +207,7 @@ def _confidence_provenance(scene: SceneBuffers) -> dict[str, dict[str, Any]]:
     geometry_source = metadata.get("geometry_confidence_source")
     depth_kind = _confidence_kind(depth_source)
     geometry_kind = _confidence_kind(geometry_source)
+
     return {
         "depth": {
             "source": str(depth_source) if depth_source is not None else "unspecified",
@@ -206,6 +219,81 @@ def _confidence_provenance(scene: SceneBuffers) -> dict[str, dict[str, Any]]:
             "kind": geometry_kind,
             "calibrated": geometry_kind == "calibrated",
         },
+    }
+
+
+def evaluate_preservation(
+    scene: SceneBuffers,
+    relit_rgb_srgb: np.ndarray,
+    *,
+    target_alpha: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Compute quantitative preservation checks comparing relit output against immutable original."""
+    src = np.asarray(scene.rgb_srgb, dtype=np.float32)
+    out = np.asarray(relit_rgb_srgb, dtype=np.float32)
+    dims_ok = tuple(src.shape) == tuple(out.shape)
+    finite_ok = bool(np.isfinite(out).all() and np.all(out >= -1e-6) and np.all(out <= 1.0 + 1e-6))
+    if not dims_ok:
+        return {
+            "dimensions_preserved": False,
+            "finite_and_bounded": finite_ok,
+            "alpha_convention": "straight",
+        }
+
+    abs_diff = np.abs(out - src)
+    prot_max = None
+    prot_mean = None
+    prot_count = 0
+    if scene.protected_mask is not None:
+        prot_bool = np.asarray(scene.protected_mask, dtype=np.float32) >= (1.0 - 1e-6)
+        prot_count = int(np.sum(prot_bool))
+        if prot_count > 0:
+            prot_max = float(np.max(abs_diff[prot_bool]))
+            prot_mean = float(np.mean(abs_diff[prot_bool]))
+
+    trans_max = None
+    trans_count = 0
+    if scene.alpha_mask is not None:
+        trans_bool = np.asarray(scene.alpha_mask, dtype=np.float32) <= 1e-6
+        trans_count = int(np.sum(trans_bool))
+        if trans_count > 0:
+            trans_max = float(np.max(abs_diff[trans_bool]))
+
+    alpha_preserved = True
+    if target_alpha is not None and scene.alpha_mask is not None:
+        alpha_preserved = bool(np.allclose(target_alpha, scene.alpha_mask, atol=1e-6))
+    elif target_alpha is not None and scene.alpha_mask is None:
+        alpha_preserved = bool(np.allclose(target_alpha, 1.0, atol=1e-6))
+
+    unlit_bool = np.asarray(scene.lightable_mask, dtype=np.float32) <= 1e-6
+    unlit_max = float(np.max(abs_diff[unlit_bool])) if np.any(unlit_bool) else None
+
+    # High-frequency structural texture correlation in sRGB luminance.
+    y_src = 0.2126 * src[..., 0] + 0.7152 * src[..., 1] + 0.0722 * src[..., 2]
+    y_out = 0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2]
+    gx_s = np.diff(y_src, axis=1, prepend=y_src[:, :1])
+    gy_s = np.diff(y_src, axis=0, prepend=y_src[:1, :])
+    gx_o = np.diff(y_out, axis=1, prepend=y_out[:, :1])
+    gy_o = np.diff(y_out, axis=0, prepend=y_out[:1, :])
+    grad_s = np.concatenate([gx_s.ravel(), gy_s.ravel()])
+    grad_o = np.concatenate([gx_o.ravel(), gy_o.ravel()])
+    denom = float(np.linalg.norm(grad_s) * np.linalg.norm(grad_o))
+    hf_corr = float(np.dot(grad_s, grad_o) / denom) if denom > 1e-9 else 1.0
+
+    return {
+        "dimensions_preserved": True,
+        "finite_and_bounded": finite_ok,
+        "alpha_convention": "straight",
+        "alpha_preserved": alpha_preserved,
+        "protected_pixel_count": prot_count,
+        "protected_max_abs_error": prot_max,
+        "protected_mean_abs_error": prot_mean,
+        "transparent_pixel_count": trans_count,
+        "transparent_max_abs_error": trans_max,
+        "unlit_max_abs_error": unlit_max,
+        "edge_structure_cosine": float(np.clip(hf_corr, -1.0, 1.0)),
+        "mean_abs_delta": float(np.mean(abs_diff)),
+        "max_abs_delta": float(np.max(abs_diff)),
     }
 
 
@@ -442,6 +530,19 @@ def evaluate_scene_buffers(scene: SceneBuffers) -> dict[str, Any]:
     if errors:
         status = "invalid"
 
+    intr_err_summary = None
+    if scene.albedo is not None and scene.source_shading is not None:
+        from .calibration import compute_intrinsic_reconstruction_error
+        err_info = compute_intrinsic_reconstruction_error(scene)
+        if err_info is not None:
+            intr_err_summary = {
+                "scale_factor": err_info["scale_factor"],
+                "mean_error": err_info["mean_error"],
+                "rmse": err_info["rmse"],
+                "p95_error": err_info["p95_error"],
+                "high_error_fraction": err_info["high_error_fraction"],
+            }
+
     return {
         "schema_version": "1.1",
         "status": status,
@@ -512,6 +613,7 @@ def evaluate_scene_buffers(scene: SceneBuffers) -> dict[str, Any]:
             "albedo_available": scene.albedo is not None,
             "source_shading_available": scene.source_shading is not None,
             "non_diffuse_residual_available": scene.non_diffuse_residual is not None,
+            "reconstruction_error": intr_err_summary,
             "metadata": dict(scene.intrinsic_metadata),
         },
         "warnings": warnings,

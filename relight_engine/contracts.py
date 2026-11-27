@@ -5,10 +5,29 @@ import math
 import numpy as np
 
 DepthKind = Literal['metric', 'relative']
-LightKind = Literal['directional', 'point', 'area']
+LightKind = Literal['directional', 'point', 'area', 'spot']
 RendererMode = Literal['auto', 'ratio', 'intrinsic', 'hybrid_neural']
 DetailPreservationMode = Literal['baseline', 'f3', 'wavelet']
 RenderQualityMode = Literal['standard', 'preview', 'final']
+RelightOperation = Literal['replace', 'add']
+IntensityMode = Literal['artistic', 'physical']
+
+SCENE_SCHEMA_VERSION = '2.0'
+SUPPORTED_SCENE_SCHEMA_VERSIONS = ('1.0', '1.1', '2.0')
+
+
+def validate_scene_schema_version(version: object) -> str:
+    """Validate serialized scene schema compatibility (accepts 1.0, 1.1, and 2.0)."""
+    if version is None:
+        return '1.0'
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError(f'Invalid scene schema version: {version!r}.')
+    ver = version.strip()
+    if ver not in SUPPORTED_SCENE_SCHEMA_VERSIONS:
+        raise ValueError(
+            f'Unsupported scene schema version {ver!r}; supported versions: {SUPPORTED_SCENE_SCHEMA_VERSIONS}.'
+        )
+    return ver
 
 
 def _finite_scalar(name: str, value: float) -> None:
@@ -71,6 +90,9 @@ class SceneBuffers:
     source_shading: Optional[np.ndarray] = None
     non_diffuse_residual: Optional[np.ndarray] = None
     intrinsic_metadata: dict = field(default_factory=dict)
+    # Raw uncalibrated model material predictions (e.g. roughness, metalness) kept separate from processed priors.
+    raw_material_maps: dict[str, np.ndarray] = field(default_factory=dict)
+    schema_version: str = SCENE_SCHEMA_VERSION
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -162,6 +184,20 @@ class SceneBuffers:
             raise ValueError('depth_confidence must be in [0,1].')
         if np.any(self.lightable_mask < 0) or np.any(self.lightable_mask > 1):
             raise ValueError('lightable_mask must be in [0,1].')
+        validate_scene_schema_version(self.schema_version)
+        if not isinstance(self.raw_material_maps, dict):
+            raise ValueError('raw_material_maps must be a dictionary.')
+        for raw_name, raw_arr in self.raw_material_maps.items():
+            arr = np.asarray(raw_arr)
+            if raw_name == 'specular_color':
+                if arr.shape != (h, w, 3):
+                    raise ValueError(f'raw_material_maps[{raw_name!r}] must have shape HxWx3.')
+            elif arr.shape != (h, w):
+                raise ValueError(f'raw_material_maps[{raw_name!r}] must have shape {(h, w)}.')
+            if not np.isfinite(arr).all():
+                raise ValueError(f'raw_material_maps[{raw_name!r}] must contain only finite values.')
+            if raw_name != 'anisotropy_angle' and (np.any(arr < 0) or np.any(arr > 1)):
+                raise ValueError(f'raw_material_maps[{raw_name!r}] values must be in [0,1].')
 
 
 @dataclass(frozen=True)
@@ -170,19 +206,29 @@ class Light:
     kind: LightKind
     color: Tuple[float, float, float] = (1.0, 1.0, 1.0)  # linear RGB
     strength: float = 1.0
-    direction: Optional[Tuple[float, float, float]] = None  # directional: from surface toward light
-    position: Optional[Tuple[float, float, float]] = None   # point/area in camera coordinates
+    direction: Optional[Tuple[float, float, float]] = None  # directional: toward light; spot/area: emitter facing direction
+    position: Optional[Tuple[float, float, float]] = None   # point/area/spot in camera coordinates
     area_size: Tuple[float, float] = (0.5, 0.5)             # area width/height, scene units
     samples: int = 4
     casts_shadows: bool = True
     wrap: float = 0.0                                       # wrapped Lambertian scatter [0, 1]
     radius: float = 0.0                                     # finite source radius for soft penumbras >= 0
+    light_id: Optional[str] = None                          # stable identifier for caching and per-light records
+    spot_inner_angle_deg: float = 20.0                      # spotlight full-intensity cone half-angle (degrees)
+    spot_outer_angle_deg: float = 40.0                      # spotlight zero-intensity cutoff half-angle (degrees)
+    intensity_mode: IntensityMode = 'artistic'              # 'artistic' or calibrated 'physical'
+
+    @property
+    def resolved_id(self) -> str:
+        return self.light_id if (self.light_id and self.light_id.strip()) else self.name
 
     def validate(self) -> None:
         if not self.name.strip():
             raise ValueError('Light name cannot be empty.')
-        if self.kind not in ('directional', 'point', 'area'):
+        if self.kind not in ('directional', 'point', 'area', 'spot'):
             raise ValueError(f'Unsupported light kind: {self.kind}')
+        if self.intensity_mode not in ('artistic', 'physical'):
+            raise ValueError("Light intensity_mode must be 'artistic' or 'physical'.")
         _finite_scalar('Light strength', self.strength)
         if self.strength < 0:
             raise ValueError('Light strength cannot be negative.')
@@ -192,6 +238,10 @@ class Light:
         _finite_scalar('Light radius', self.radius)
         if self.radius < 0.0:
             raise ValueError('Light radius must be non-negative.')
+        _finite_scalar('Light spot_inner_angle_deg', self.spot_inner_angle_deg)
+        _finite_scalar('Light spot_outer_angle_deg', self.spot_outer_angle_deg)
+        if not (0.0 < self.spot_inner_angle_deg <= self.spot_outer_angle_deg <= 180.0):
+            raise ValueError('Spotlight angles must satisfy 0 < spot_inner_angle_deg <= spot_outer_angle_deg <= 180.')
         color = np.asarray(self.color, dtype=np.float64)
         if color.shape != (3,) or not np.isfinite(color).all() or np.any(color < 0):
             raise ValueError('Light color must be a finite non-negative linear RGB triple.')
@@ -201,12 +251,22 @@ class Light:
             direction = np.asarray(self.direction, dtype=np.float64)
             if direction.shape != (3,) or not np.isfinite(direction).all() or np.linalg.norm(direction) < 1e-8:
                 raise ValueError('Directional light direction must be a finite non-zero 3-vector.')
-        if self.kind in ('point', 'area'):
+        if self.kind in ('point', 'area', 'spot'):
             if self.position is None:
                 raise ValueError(f'{self.kind} light requires position.')
             position = np.asarray(self.position, dtype=np.float64)
             if position.shape != (3,) or not np.isfinite(position).all():
                 raise ValueError('Light position must be a finite 3-vector.')
+        if self.kind == 'spot':
+            if self.direction is None:
+                raise ValueError('Spotlight requires an emitter facing direction.')
+            direction = np.asarray(self.direction, dtype=np.float64)
+            if direction.shape != (3,) or not np.isfinite(direction).all() or np.linalg.norm(direction) < 1e-8:
+                raise ValueError('Spotlight direction must be a finite non-zero 3-vector.')
+        if self.kind == 'area' and self.direction is not None:
+            direction = np.asarray(self.direction, dtype=np.float64)
+            if direction.shape != (3,) or not np.isfinite(direction).all() or np.linalg.norm(direction) < 1e-8:
+                raise ValueError('Area light direction must be a finite non-zero 3-vector when set.')
         area_size = np.asarray(self.area_size, dtype=np.float64)
         if area_size.shape != (2,) or not np.isfinite(area_size).all() or np.any(area_size < 0):
             raise ValueError('Area-light dimensions must be a finite non-negative pair.')
@@ -336,10 +396,24 @@ class EngineSettings:
     atmosphere_color: Optional[Tuple[float, float, float]] = None
     color_transfer_strength: float = 1.0
     background_light_influence: float = 1.0
+    environment_light_influence: float = 1.0
     real_image_preservation: float = 0.0
     highlight_relocation_strength: float = 0.0
     wavelet_levels: int = 4
     wavelet_mid_blend: float = 0.55
+    operation: RelightOperation = 'replace'
+    source_exposure_scale: float = 1.0
+    source_white_balance: Tuple[float, float, float] = (1.0, 1.0, 1.0)
+    protect_sky: bool = True
+    volumetric_beam_strength: float = 0.0
+    shadow_width_aware: bool = False
+    shadow_half_res: bool = False
+    semantic_material_priors: bool = False
+    albedo_guided_source_shading: bool = False
+    ssao_strength: float = 0.0
+    indirect_specular_strength: float = 0.0
+    preserve_fill_balance: float = 0.0
+    lossless_ratio_detail: bool = False
 
     @classmethod
     def real_preserving(cls, **overrides) -> 'EngineSettings':
@@ -348,6 +422,7 @@ class EngineSettings:
             'detail_preservation_mode': 'wavelet',
             'color_transfer_strength': 0.50,
             'background_light_influence': 0.25,
+            'environment_light_influence': 0.25,
             'real_image_preservation': 0.45,
             'highlight_relocation_strength': 0.75,
             'auto_sh_source': True,
@@ -356,6 +431,43 @@ class EngineSettings:
             'lighting_smooth_sigma': 1.5,
             'wavelet_levels': 4,
             'wavelet_mid_blend': 0.55,
+            'shadow_width_aware': True,
+        }
+        defaults.update(overrides)
+        settings = cls(**defaults)
+        settings.validate()
+        return settings
+
+    @classmethod
+    def studio_3d(cls, **overrides) -> 'EngineSettings':
+        """Return whole-scene 3D studio light transport preset with global bounce, SSAO, and material response."""
+        defaults = {
+            'detail_preservation_mode': 'wavelet',
+            'color_transfer_strength': 0.72,
+            'background_light_influence': 0.90,
+            'environment_light_influence': 0.95,
+            'real_image_preservation': 0.32,
+            'highlight_relocation_strength': 0.75,
+            'indirect_bounce_strength': 0.55,
+            'indirect_bounce_radius': 32.0,
+            'indirect_specular_strength': 0.45,
+            'ssao_strength': 0.42,
+            'volumetric_beam_strength': 0.08,
+            'auto_sh_source': True,
+            'source_shading_blend': 0.45,
+            'albedo_guided_source_shading': True,
+            'semantic_material_priors': True,
+            'filmic_highlight_rolloff': True,
+            'refine_depth_edges': True,
+            'lighting_smooth_sigma': 1.5,
+            'shadow_steps': 32,
+            'shadow_width_aware': True,
+            'shadow_half_res': True,
+            'wavelet_levels': 4,
+            'wavelet_mid_blend': 0.55,
+            'protect_sky': True,
+            'preserve_fill_balance': 0.55,
+            'lossless_ratio_detail': True,
         }
         defaults.update(overrides)
         settings = cls(**defaults)
@@ -387,6 +499,7 @@ class EngineSettings:
             'real_image_preservation': self.real_image_preservation,
             'highlight_relocation_strength': self.highlight_relocation_strength,
             'wavelet_mid_blend': self.wavelet_mid_blend,
+            'source_exposure_scale': self.source_exposure_scale,
         }
         for name, value in numeric.items():
             _finite_scalar(name, value)
@@ -452,14 +565,36 @@ class EngineSettings:
         for unit_name, unit_val in (
             ('color_transfer_strength', self.color_transfer_strength),
             ('background_light_influence', self.background_light_influence),
+            ('environment_light_influence', self.environment_light_influence),
             ('real_image_preservation', self.real_image_preservation),
             ('highlight_relocation_strength', self.highlight_relocation_strength),
             ('wavelet_mid_blend', self.wavelet_mid_blend),
+            ('volumetric_beam_strength', self.volumetric_beam_strength),
+            ('ssao_strength', self.ssao_strength),
+            ('indirect_specular_strength', self.indirect_specular_strength),
+            ('preserve_fill_balance', self.preserve_fill_balance),
         ):
             if not 0.0 <= unit_val <= 1.0:
                 raise ValueError(f'{unit_name} must be in [0,1].')
+        if self.operation not in ('replace', 'add'):
+            raise ValueError("operation must be 'replace' or 'add'.")
+        if self.source_exposure_scale <= 0.0:
+            raise ValueError('source_exposure_scale must be positive.')
+        wb = np.asarray(self.source_white_balance, dtype=np.float64)
+        if wb.shape != (3,) or not np.isfinite(wb).all() or np.any(wb <= 0.0):
+            raise ValueError('source_white_balance must be a finite positive 3-vector.')
         if not isinstance(self.wavelet_levels, int) or not (1 <= self.wavelet_levels <= 6):
             raise ValueError('wavelet_levels must be an integer in [1, 6].')
+        for bname, bval in (
+            ('protect_sky', self.protect_sky),
+            ('shadow_width_aware', self.shadow_width_aware),
+            ('shadow_half_res', self.shadow_half_res),
+            ('semantic_material_priors', self.semantic_material_priors),
+            ('albedo_guided_source_shading', self.albedo_guided_source_shading),
+            ('lossless_ratio_detail', self.lossless_ratio_detail),
+        ):
+            if not isinstance(bval, bool):
+                raise ValueError(f'{bname} must be a boolean.')
 
 
 @dataclass

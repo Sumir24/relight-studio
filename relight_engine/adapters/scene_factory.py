@@ -11,10 +11,14 @@ class SemanticPrediction:
     metalness: np.ndarray | None = None
     specular_level: np.ndarray | None = None
     specular_color: np.ndarray | None = None
+    clearcoat: np.ndarray | None = None
+    clearcoat_roughness: np.ndarray | None = None
+    subsurface: np.ndarray | None = None
     anisotropy: np.ndarray | None = None
     anisotropy_angle: np.ndarray | None = None
     material_confidence: np.ndarray | None = None
     material_metadata: dict = field(default_factory=dict)
+    raw_material_maps: dict[str, np.ndarray] = field(default_factory=dict)
     albedo: np.ndarray | None = None
     source_shading: np.ndarray | None = None
     non_diffuse_residual: np.ndarray | None = None
@@ -44,6 +48,9 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
         ("roughness", semantics.roughness),
         ("metalness", semantics.metalness),
         ("specular_level", semantics.specular_level),
+        ("clearcoat", semantics.clearcoat),
+        ("clearcoat_roughness", semantics.clearcoat_roughness),
+        ("subsurface", semantics.subsurface),
         ("anisotropy", semantics.anisotropy),
         ("anisotropy_angle", semantics.anisotropy_angle),
         ("material_confidence", semantics.material_confidence),
@@ -82,10 +89,14 @@ def build_scene_buffers(rgb_srgb: np.ndarray, depth: DepthPrediction,
         metalness=None if semantics.metalness is None else semantics.metalness.astype(np.float32),
         specular_level=None if semantics.specular_level is None else semantics.specular_level.astype(np.float32),
         specular_color=None if semantics.specular_color is None else semantics.specular_color.astype(np.float32),
+        clearcoat=None if semantics.clearcoat is None else semantics.clearcoat.astype(np.float32),
+        clearcoat_roughness=None if semantics.clearcoat_roughness is None else semantics.clearcoat_roughness.astype(np.float32),
+        subsurface=None if semantics.subsurface is None else semantics.subsurface.astype(np.float32),
         anisotropy=None if semantics.anisotropy is None else semantics.anisotropy.astype(np.float32),
         anisotropy_angle=None if semantics.anisotropy_angle is None else semantics.anisotropy_angle.astype(np.float32),
         material_confidence=None if semantics.material_confidence is None else semantics.material_confidence.astype(np.float32),
         material_metadata=dict(semantics.material_metadata),
+        raw_material_maps={k: np.asarray(v, dtype=np.float32) for k, v in semantics.raw_material_maps.items()},
         albedo=None if semantics.albedo is None else np.asarray(semantics.albedo, dtype=np.float32),
         source_shading=None if semantics.source_shading is None else np.asarray(semantics.source_shading, dtype=np.float32),
         non_diffuse_residual=None if semantics.non_diffuse_residual is None else np.asarray(semantics.non_diffuse_residual, dtype=np.float32),

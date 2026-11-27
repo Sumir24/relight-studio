@@ -2,18 +2,25 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
 import threading
-from typing import Callable
+from typing import Any, Callable
 import uuid
 
-from .store import SceneStore, validate_scene_id
+from .store import SceneStore, atomic_write_text, validate_scene_id
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ANALYZE_SCRIPT = ROOT_DIR / "scripts" / "run_scene_analysis.py"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -24,6 +31,10 @@ class AnalysisJob:
     stage: str = "queued"
     progress: float = 0.0
     error: str | None = None
+    created_at: str = field(default_factory=_utc_now_iso)
+    updated_at: str = field(default_factory=_utc_now_iso)
+    input_sha256: str | None = None
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 def default_scene_analyzer(
@@ -93,7 +104,7 @@ def default_scene_analyzer(
 
 
 class AnalysisQueue:
-    """Single-worker sequential queue preventing concurrent GPU/MPS model loads."""
+    """Single-worker sequential queue preventing concurrent GPU/MPS model loads, with durable job manifests."""
 
     def __init__(
         self,
@@ -108,10 +119,53 @@ class AnalysisQueue:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="relight-analyzer")
         self._lock = threading.RLock()
         self._jobs: dict[str, AnalysisJob] = {}
+        self._load_persisted_jobs()
+
+    def _job_path(self, job_id: str) -> Path:
+        return self.store.jobs_dir / f"{validate_scene_id(job_id)}.json"
+
+    def _persist_job(self, job: AnalysisJob) -> None:
+        job.updated_at = _utc_now_iso()
+        atomic_write_text(self._job_path(job.job_id), json.dumps(asdict(job), indent=2))
+
+    def _load_persisted_jobs(self) -> None:
+        if not self.store.jobs_dir.is_dir():
+            return
+        for path in sorted(self.store.jobs_dir.glob("*.json")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                job = AnalysisJob(
+                    job_id=str(raw["job_id"]),
+                    scene_id=str(raw["scene_id"]),
+                    status=str(raw.get("status", "failed")),
+                    stage=str(raw.get("stage", "failed")),
+                    progress=float(raw.get("progress", 0.0)),
+                    error=raw.get("error"),
+                    created_at=str(raw.get("created_at", _utc_now_iso())),
+                    updated_at=str(raw.get("updated_at", _utc_now_iso())),
+                    input_sha256=raw.get("input_sha256"),
+                    options=dict(raw.get("options", {})),
+                )
+                if job.status in ("queued", "running"):
+                    job.status = "failed"
+                    job.stage = "interrupted"
+                    job.error = "Analysis interrupted by server restart before completion."
+                    self._persist_job(job)
+                self._jobs[job.job_id] = job
+            except Exception:
+                continue
 
     def active_count(self) -> int:
         with self._lock:
             return sum(1 for j in self._jobs.values() if j.status in ("queued", "running"))
+
+    def list_jobs(self, scene_id: str | None = None) -> list[AnalysisJob]:
+        with self._lock:
+            jobs = list(self._jobs.values())
+        if scene_id is not None:
+            sid = validate_scene_id(scene_id)
+            jobs = [j for j in jobs if j.scene_id == sid]
+        return sorted(jobs, key=lambda j: j.created_at, reverse=True)
 
     def get_job(self, job_id: str) -> AnalysisJob | None:
         with self._lock:
@@ -120,9 +174,19 @@ class AnalysisQueue:
     def submit(self, scene_id: str, image_path: Path, options: dict) -> AnalysisJob:
         sid = validate_scene_id(scene_id)
         job_id = f"job_{uuid.uuid4().hex[:12]}"
-        job = AnalysisJob(job_id=job_id, scene_id=sid, status="queued", stage="queued", progress=0.0)
+        input_sha = hashlib.sha256(image_path.read_bytes()).hexdigest() if image_path.is_file() else None
+        job = AnalysisJob(
+            job_id=job_id,
+            scene_id=sid,
+            status="queued",
+            stage="queued",
+            progress=0.0,
+            input_sha256=input_sha,
+            options=dict(options),
+        )
         with self._lock:
             self._jobs[job_id] = job
+            self._persist_job(job)
         out_dir = self.store.scene_dir_for(sid)
         out_dir.mkdir(parents=True, exist_ok=True)
         self._executor.submit(self._run_job, job, image_path, out_dir, options)
@@ -133,11 +197,13 @@ class AnalysisQueue:
             with self._lock:
                 job.stage = stage
                 job.progress = progress
+                self._persist_job(job)
 
         with self._lock:
             job.status = "running"
             job.stage = "starting"
             job.progress = 0.05
+            self._persist_job(job)
         try:
             self.analyzer_fn(image_path, out_dir, options, self.device, update_progress)
             self.store.invalidate(job.scene_id)
@@ -146,11 +212,13 @@ class AnalysisQueue:
                 job.status = "ready"
                 job.stage = "complete"
                 job.progress = 1.0
+                self._persist_job(job)
         except Exception as exc:
             with self._lock:
                 job.status = "failed"
                 job.stage = "failed"
                 job.error = str(exc)
+                self._persist_job(job)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False)

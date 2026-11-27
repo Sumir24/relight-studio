@@ -205,6 +205,17 @@ class Florence2SceneDiscovery:
             if isinstance(dense, dict):
                 collect_candidates(dense.get("labels", []), dense.get("bboxes", []))
 
+        if caption:
+            # Grounding/OD sometimes omits body contact surfaces (e.g. "hand", "finger") mentioned in
+            # the model's own caption; promote explicitly mentioned contact parts so SAM2 segments them.
+            cap_words = set(re.findall(r"[a-z]+", caption.lower()))
+            for body_tok in ("hand", "hands", "finger", "fingers", "palm", "wrist", "arm", "face", "skin"):
+                if body_tok in cap_words and len(prompts) < self.max_prompts:
+                    norm_key = semantic_key(body_tok)
+                    if norm_key not in seen_keys:
+                        seen_keys.add(norm_key)
+                        prompts.append(body_tok)
+
         if not prompts:
             raise RuntimeError(
                 "Florence-2 did not return region labels for this image. "

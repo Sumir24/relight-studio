@@ -17,7 +17,8 @@ class SourceCalibrationSchema(BaseModel):
 
 class LightSchema(BaseModel):
     name: Optional[str] = None
-    kind: Literal["directional", "point", "area"]
+    light_id: Optional[str] = None
+    kind: Literal["directional", "point", "area", "spot"]
     strength: float = Field(1.0, ge=0.0)
     color: Optional[tuple[float, float, float]] = None
     color_temperature_kelvin: Optional[float] = Field(None, ge=1000.0, le=40000.0)
@@ -28,6 +29,14 @@ class LightSchema(BaseModel):
     casts_shadows: bool = True
     wrap: float = Field(0.0, ge=0.0, le=1.0)
     radius: float = Field(0.0, ge=0.0)
+    spot_inner_angle_deg: float = Field(20.0, gt=0.0, le=180.0)
+    spot_outer_angle_deg: float = Field(40.0, gt=0.0, le=180.0)
+    intensity_mode: Literal["artistic", "physical"] = "artistic"
+    placement_mode: Literal["manual_xyz", "image_uv", "studio_orbit"] = "manual_xyz"
+    uv: Optional[tuple[float, float]] = None
+    azimuth_deg: float = -48.0
+    elevation_deg: float = 24.0
+    distance_scale: float = Field(1.35, gt=0.1, le=10.0)
 
 
 class EnvironmentLightSchema(BaseModel):
@@ -73,7 +82,22 @@ class MaterialAssignmentSchema(BaseModel):
     confidence: float = Field(1.0, ge=0.0, le=1.0)
 
 
+class SourceIlluminationSchema(BaseModel):
+    lights: list[LightSchema] = Field(default_factory=list)
+    ambient_strength: float = Field(0.15, ge=0.0)
+    ambient_color: Optional[tuple[float, float, float]] = None
+    ambient_temperature_kelvin: Optional[float] = Field(None, ge=1000.0, le=40000.0)
+    ambient_ground_color: Optional[tuple[float, float, float]] = None
+    environment: Optional[EnvironmentLightSchema] = None
+    sh_coefficients: Optional[list[list[float]]] = None
+    exposure_scale: float = Field(1.0, gt=0.0)
+    white_balance: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    confidence: float = Field(1.0, ge=0.0, le=1.0)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+
+
 class EngineSettingsSchema(BaseModel):
+    preset: Optional[Literal["standard", "real_preserving", "studio_3d"]] = None
     base_blur_sigma: float = Field(18.0, gt=0.0)
     detail_power: float = Field(1.0, ge=0.0)
     ratio_min: float = Field(0.25, gt=0.0)
@@ -109,14 +133,27 @@ class EngineSettingsSchema(BaseModel):
     atmosphere_color: Optional[tuple[float, float, float]] = None
     color_transfer_strength: float = Field(1.0, ge=0.0, le=1.0)
     background_light_influence: float = Field(1.0, ge=0.0, le=1.0)
+    environment_light_influence: float = Field(1.0, ge=0.0, le=1.0)
     real_image_preservation: float = Field(0.0, ge=0.0, le=1.0)
     highlight_relocation_strength: float = Field(0.0, ge=0.0, le=1.0)
     wavelet_levels: int = Field(4, ge=1, le=6)
     wavelet_mid_blend: float = Field(0.55, ge=0.0, le=1.0)
+    operation: Literal["replace", "add"] = "replace"
+    source_exposure_scale: float = Field(1.0, gt=0.0)
+    source_white_balance: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    protect_sky: bool = True
+    volumetric_beam_strength: float = Field(0.0, ge=0.0, le=1.0)
+    shadow_width_aware: bool = False
+    shadow_half_res: bool = False
+    semantic_material_priors: bool = False
+    albedo_guided_source_shading: bool = False
+    ssao_strength: float = Field(0.0, ge=0.0, le=1.0)
+    indirect_specular_strength: float = Field(0.0, ge=0.0, le=1.0)
 
 
 class RelightRequest(BaseModel):
-    source_calibration: SourceCalibrationSchema
+    source_calibration: Optional[SourceCalibrationSchema] = None
+    source_illumination: Optional[SourceIlluminationSchema] = None
     target_rig: TargetRigSchema
     material_assignments: list[MaterialAssignmentSchema] = Field(default_factory=list)
     settings: EngineSettingsSchema = Field(default_factory=EngineSettingsSchema)
@@ -124,6 +161,21 @@ class RelightRequest(BaseModel):
     relighter_backend: Optional[str] = None
     relighter_options: dict[str, Any] = Field(default_factory=dict)
     preview_max_side: Optional[int] = Field(None, ge=32, le=4096)
+    client_session_id: Optional[str] = None
+    revision_id: Optional[int] = Field(None, ge=0)
+    persist: Optional[bool] = None
+    bit_depth: Literal[8, 16] = 8
+
+
+class CancelRelightRequest(BaseModel):
+    client_session_id: str = "default"
+    min_revision_id: int = Field(0, ge=0)
+
+
+class CancelRelightResponse(BaseModel):
+    scene_id: str
+    client_session_id: str
+    cancelled_below_revision: int
 
 
 class HealthResponse(BaseModel):

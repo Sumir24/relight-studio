@@ -16,16 +16,19 @@ def _resize_map(arr: np.ndarray, target_wh: tuple[int, int], *, is_mask: bool = 
     return out.astype(np.float32)
 
 
-def downsample_scene_buffers_for_preview(
+def downsample_scene_and_arrays_for_preview(
     scene: SceneBuffers,
     camera: CameraModel,
     max_side: int,
-) -> tuple[SceneBuffers, CameraModel]:
-    """Proportionally downscale scene buffers and pinhole intrinsics for fast interactive preview."""
+    *,
+    arrays: dict[str, np.ndarray] | None = None,
+) -> tuple[SceneBuffers, CameraModel, dict[str, np.ndarray]]:
+    """Canonical preview downsampler for scene buffers, camera intrinsics, and optional NPZ mask dicts."""
     h, w = scene.shape
     longest = max(h, w)
     if longest <= max_side:
-        return copy(scene), camera
+        copied_arrays = {k: np.array(v, copy=True) for k, v in arrays.items()} if arrays is not None else {}
+        return copy(scene), camera, copied_arrays
 
     scale = float(max_side) / float(longest)
     tw = max(4, int(round(w * scale)))
@@ -56,6 +59,20 @@ def downsample_scene_buffers_for_preview(
             return None
         resized = _resize_map(arr, (tw, th), is_mask=mask)
         return np.clip(resized, 0.0, 1.0).astype(np.float32) if clip01 else resized
+
+    scaled_arrays: dict[str, np.ndarray] = {}
+    if arrays is not None:
+        for key, val in arrays.items():
+            if key.startswith("mask_") or key in ("lightable_mask", "protected_mask", "alpha_mask", "depth_confidence", "geometry_confidence", "material_confidence"):
+                scaled_arrays[key] = np.clip(_resize_map(val, (tw, th), is_mask=True), 0.0, 1.0)
+            elif key == "normals" and scaled_normals is not None:
+                scaled_arrays[key] = scaled_normals
+            elif key in ("depth", "source_shading", "non_diffuse_residual"):
+                scaled_arrays[key] = np.maximum(_resize_map(val, (tw, th)), 0.0)
+            elif key == "anisotropy_angle":
+                scaled_arrays[key] = _resize_map(val, (tw, th))
+            else:
+                scaled_arrays[key] = np.clip(_resize_map(val, (tw, th)), 0.0, 1.0)
 
     scaled_scene = SceneBuffers(
         rgb_srgb=np.clip(_resize_map(scene.rgb_srgb, (tw, th)), 0.0, 1.0),
@@ -99,7 +116,27 @@ def downsample_scene_buffers_for_preview(
             else np.maximum(_resize_map(scene.non_diffuse_residual, (tw, th)), 0.0)
         ),
         intrinsic_metadata=dict(scene.intrinsic_metadata),
+        raw_material_maps={
+            k: (
+                _resize_map(v, (tw, th))
+                if k == "anisotropy_angle"
+                else np.clip(_resize_map(v, (tw, th)), 0.0, 1.0)
+            )
+            for k, v in scene.raw_material_maps.items()
+        },
+        schema_version=scene.schema_version,
     )
+    scaled_scene.validate()
+    return scaled_scene, scaled_camera, scaled_arrays
+
+
+def downsample_scene_buffers_for_preview(
+    scene: SceneBuffers,
+    camera: CameraModel,
+    max_side: int,
+) -> tuple[SceneBuffers, CameraModel]:
+    """Proportionally downscale scene buffers and pinhole intrinsics for fast interactive preview."""
+    scaled_scene, scaled_camera, _ = downsample_scene_and_arrays_for_preview(scene, camera, max_side)
     return scaled_scene, scaled_camera
 
 

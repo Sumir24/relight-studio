@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from copy import copy
 from dataclasses import dataclass
+import hashlib
+import json
+import os
 from pathlib import Path
 import re
 import threading
-import cv2
+from typing import Any
 import numpy as np
 
-from ..contracts import CameraModel, SceneBuffers
+from ..contracts import CameraModel, EngineSettings, LightingRig, SceneBuffers
+from ..engine import RelightSession
+from ..preview import downsample_scene_and_arrays_for_preview
 from ..workflows import load_scene_artifacts
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -29,6 +33,23 @@ def validate_artifact_name(filename: str) -> str:
     return filename
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write bytes atomically via a temporary sibling file and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Write UTF-8 text atomically via a temporary sibling file and os.replace."""
+    atomic_write_bytes(path, text.encode(encoding))
+
+
 @dataclass
 class CachedScene:
     scene_id: str
@@ -39,13 +60,10 @@ class CachedScene:
     arrays: dict[str, np.ndarray]
 
 
-def _resize_map(arr: np.ndarray, target_wh: tuple[int, int], *, is_mask: bool = False) -> np.ndarray:
-    tw, th = target_wh
-    interp = cv2.INTER_LINEAR if is_mask else cv2.INTER_AREA
-    out = cv2.resize(arr.astype(np.float32), (tw, th), interpolation=interp)
-    if arr.ndim == 2 and out.ndim == 3:
-        out = out[..., 0]
-    return out.astype(np.float32)
+@dataclass
+class CachedSessionEntry:
+    session: RelightSession
+    material_meta: dict[str, Any]
 
 
 def downsample_scene_for_preview(
@@ -54,93 +72,33 @@ def downsample_scene_for_preview(
     arrays: dict[str, np.ndarray],
     max_side: int,
 ) -> tuple[SceneBuffers, CameraModel, dict[str, np.ndarray]]:
-    """Proportionally downscale scene buffers and pinhole intrinsics for fast interactive preview."""
-    h, w = scene.shape
-    longest = max(h, w)
-    if longest <= max_side:
-        return copy(scene), camera, arrays
-
-    scale = float(max_side) / float(longest)
-    tw = max(4, int(round(w * scale)))
-    th = max(4, int(round(h * scale)))
-    sx = float(tw) / float(w)
-    sy = float(th) / float(h)
-
-    scaled_camera = CameraModel(
-        fx=camera.fx * sx,
-        fy=camera.fy * sy,
-        cx=camera.cx * sx,
-        cy=camera.cy * sy,
-    )
-    scaled_normals = None
-    if scene.normals is not None:
-        nrm = _resize_map(scene.normals, (tw, th))
-        lens = np.linalg.norm(nrm, axis=-1, keepdims=True)
-        valid = lens[..., 0] > 1e-6
-        nrm = np.where(valid[..., None], nrm / np.maximum(lens, 1e-6), np.array([0.0, 0.0, -1.0], np.float32))
-        scaled_normals = nrm.astype(np.float32)
-
-    scaled_arrays: dict[str, np.ndarray] = {}
-    for key, val in arrays.items():
-        if key.startswith("mask_") or key in ("lightable_mask", "protected_mask", "alpha_mask"):
-            scaled_arrays[key] = np.clip(_resize_map(val, (tw, th), is_mask=True), 0.0, 1.0)
-        elif key == "normals" and scaled_normals is not None:
-            scaled_arrays[key] = scaled_normals
-        else:
-            scaled_arrays[key] = _resize_map(val, (tw, th))
-
-    def _opt(arr: np.ndarray | None, *, mask: bool = False, clip01: bool = False) -> np.ndarray | None:
-        if arr is None:
-            return None
-        resized = _resize_map(arr, (tw, th), is_mask=mask)
-        return np.clip(resized, 0.0, 1.0).astype(np.float32) if clip01 else resized
-
-    scaled_scene = SceneBuffers(
-        rgb_srgb=np.clip(_resize_map(scene.rgb_srgb, (tw, th)), 0.0, 1.0),
-        depth=np.maximum(_resize_map(scene.depth, (tw, th)), 0.0),
-        depth_confidence=np.clip(_resize_map(scene.depth_confidence, (tw, th), is_mask=True), 0.0, 1.0),
-        lightable_mask=np.clip(_resize_map(scene.lightable_mask, (tw, th), is_mask=True), 0.0, 1.0),
-        depth_kind=scene.depth_kind,
-        roughness=_opt(scene.roughness, clip01=True),
-        metalness=_opt(scene.metalness, clip01=True),
-        specular_level=_opt(scene.specular_level, clip01=True),
-        clearcoat=_opt(scene.clearcoat, clip01=True),
-        clearcoat_roughness=_opt(scene.clearcoat_roughness, clip01=True),
-        subsurface=_opt(scene.subsurface, clip01=True),
-        anisotropy=_opt(scene.anisotropy, clip01=True),
-        anisotropy_angle=_opt(scene.anisotropy_angle),
-        normals=scaled_normals,
-        geometry_confidence=_opt(scene.geometry_confidence, mask=True, clip01=True),
-        alpha_mask=_opt(scene.alpha_mask, mask=True, clip01=True),
-        metadata=dict(scene.metadata),
-        protected_mask=_opt(scene.protected_mask, mask=True, clip01=True),
-        semantic_masks={k: np.clip(_resize_map(v, (tw, th), is_mask=True), 0.0, 1.0) for k, v in scene.semantic_masks.items()},
-        instance_masks={k: np.clip(_resize_map(v, (tw, th), is_mask=True), 0.0, 1.0) for k, v in scene.instance_masks.items()},
-        specular_color=_opt(scene.specular_color, clip01=True),
-        material_confidence=_opt(scene.material_confidence, mask=True, clip01=True),
-        material_metadata=dict(scene.material_metadata),
-        albedo=_opt(scene.albedo, clip01=True),
-        source_shading=None if scene.source_shading is None else np.maximum(_resize_map(scene.source_shading, (tw, th)), 0.0),
-        non_diffuse_residual=None if scene.non_diffuse_residual is None else np.maximum(_resize_map(scene.non_diffuse_residual, (tw, th)), 0.0),
-        intrinsic_metadata=dict(scene.intrinsic_metadata),
-    )
-    scaled_scene.validate()
-    return scaled_scene, scaled_camera, scaled_arrays
+    """Delegate preview downscaling to the single shared preview implementation."""
+    return downsample_scene_and_arrays_for_preview(scene, camera, max_side, arrays=arrays)
 
 
 class SceneStore:
-    """Disk-backed scene & render repository with an LRU memory cache."""
+    """Disk-backed scene, job, and render repository with LRU scene & RelightSession caches."""
 
-    def __init__(self, root_dir: str | Path, *, max_cached_scenes: int = 8) -> None:
+    def __init__(
+        self,
+        root_dir: str | Path,
+        *,
+        max_cached_scenes: int = 8,
+        max_cached_sessions: int = 16,
+    ) -> None:
         self.root_dir = Path(root_dir).resolve()
         self.scenes_dir = self.root_dir / "scenes"
         self.renders_dir = self.root_dir / "renders"
         self.uploads_dir = self.root_dir / "uploads"
-        for d in (self.scenes_dir, self.renders_dir, self.uploads_dir):
+        self.jobs_dir = self.root_dir / "jobs"
+        for d in (self.scenes_dir, self.renders_dir, self.uploads_dir, self.jobs_dir):
             d.mkdir(parents=True, exist_ok=True)
         self.max_cached_scenes = max(1, int(max_cached_scenes))
+        self.max_cached_sessions = max(1, int(max_cached_sessions))
         self._lock = threading.RLock()
         self._cache: OrderedDict[str, CachedScene] = OrderedDict()
+        self._sessions: OrderedDict[tuple[str, str], CachedSessionEntry] = OrderedDict()
+        self._rev_watermarks: dict[tuple[str, str], int] = {}
         self._external_dirs: dict[str, Path] = {}
 
     def register_preload_dir(self, base_dir: str | Path) -> list[str]:
@@ -180,6 +138,140 @@ class SceneStore:
         with self._lock:
             return len(self._cache)
 
+    def session_cache_count(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def _session_signature(
+        self,
+        source_rig: LightingRig,
+        material_dicts: list[dict[str, Any]],
+        settings: EngineSettings,
+        preview_max_side: int,
+        require_geometry_ready: bool,
+    ) -> str:
+        payload = {
+            "source_rig": {
+                "ambient_color": [float(c) for c in source_rig.ambient_color],
+                "ambient_strength": float(source_rig.ambient_strength),
+                "lights": [
+                    {
+                        "light_id": l.light_id,
+                        "name": l.name,
+                        "kind": l.kind,
+                        "position": list(l.position) if l.position is not None else None,
+                        "direction": list(l.direction) if l.direction is not None else None,
+                        "color": list(l.color),
+                        "strength": float(l.strength),
+                        "radius": float(l.radius),
+                        "area_size": list(l.area_size),
+                        "samples": int(l.samples),
+                        "casts_shadows": bool(l.casts_shadows),
+                        "spot_inner_angle_deg": float(l.spot_inner_angle_deg),
+                        "spot_outer_angle_deg": float(l.spot_outer_angle_deg),
+                        "intensity_mode": str(l.intensity_mode),
+                    }
+                    for l in source_rig.lights
+                ],
+                "environment": (
+                    None
+                    if source_rig.environment is None
+                    else {
+                        "zenith_color": list(source_rig.environment.zenith_color),
+                        "horizon_color": list(source_rig.environment.horizon_color),
+                        "ground_color": list(source_rig.environment.ground_color),
+                        "strength": float(source_rig.environment.strength),
+                        "sh_coeffs": None if source_rig.environment.sh_coeffs is None else np.asarray(source_rig.environment.sh_coeffs).tolist(),
+                    }
+                ),
+            },
+            "materials": material_dicts,
+            "session_settings": {
+                "refine_depth_edges": bool(settings.refine_depth_edges),
+                "normal_smooth_sigma": float(settings.normal_smooth_sigma),
+                "min_geometry_confidence": float(settings.min_geometry_confidence),
+                "detail_preservation_mode": str(settings.detail_preservation_mode),
+                "detail_lock_strength": float(settings.detail_lock_strength),
+                "base_blur_sigma": float(settings.base_blur_sigma),
+                "edge_aware_base": bool(settings.edge_aware_base),
+                "renderer_mode": "intrinsic" if settings.renderer_mode == "intrinsic" else "auto",
+                "preview_max_side": int(preview_max_side),
+                "require_geometry_ready": bool(require_geometry_ready),
+            },
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+
+    def get_or_create_relight_session(
+        self,
+        scene_id: str,
+        source_rig: LightingRig,
+        material_dicts: list[dict[str, Any]],
+        settings: EngineSettings,
+        *,
+        preview_max_side: int = 384,
+        require_geometry_ready: bool = False,
+        apply_materials_fn: Any = None,
+    ) -> tuple[CachedSessionEntry, bool]:
+        """Return (CachedSessionEntry, cache_hit) keyed by scene, materials, source rig, and geometry settings."""
+        sid = validate_scene_id(scene_id)
+        sig = self._session_signature(source_rig, material_dicts, settings, preview_max_side, require_geometry_ready)
+        key = (sid, sig)
+        with self._lock:
+            hit = self._sessions.get(key)
+            if hit is not None:
+                self._sessions.move_to_end(key)
+                return hit, True
+
+        cached = self.get_scene(sid)
+        from copy import copy
+        work_scene = copy(cached.scene)
+        material_meta = (
+            apply_materials_fn(work_scene, cached.arrays, material_dicts)
+            if apply_materials_fn is not None
+            else {}
+        )
+        session = RelightSession(
+            work_scene,
+            cached.camera,
+            source_rig,
+            settings,
+            preview_max_side=preview_max_side,
+            require_geometry_ready=require_geometry_ready,
+        )
+        entry = CachedSessionEntry(session=session, material_meta=material_meta)
+        with self._lock:
+            self._sessions[key] = entry
+            self._sessions.move_to_end(key)
+            while len(self._sessions) > self.max_cached_sessions:
+                self._sessions.popitem(last=False)
+        return entry, False
+
+    def register_revision(self, scene_id: str, client_session_id: str, revision_id: int) -> bool:
+        """Advance monotonic revision watermark; return False if revision is already stale."""
+        sid = validate_scene_id(scene_id)
+        k = (sid, str(client_session_id or "default"))
+        with self._lock:
+            cur = self._rev_watermarks.get(k, -1)
+            if revision_id < cur:
+                return False
+            self._rev_watermarks[k] = int(revision_id)
+            return True
+
+    def is_revision_stale(self, scene_id: str, client_session_id: str, revision_id: int) -> bool:
+        sid = validate_scene_id(scene_id)
+        k = (sid, str(client_session_id or "default"))
+        with self._lock:
+            return int(revision_id) < self._rev_watermarks.get(k, -1)
+
+    def cancel_revisions(self, scene_id: str, client_session_id: str, min_revision_id: int) -> int:
+        sid = validate_scene_id(scene_id)
+        k = (sid, str(client_session_id or "default"))
+        with self._lock:
+            cur = self._rev_watermarks.get(k, -1)
+            nxt = max(cur, int(min_revision_id))
+            self._rev_watermarks[k] = nxt
+            return nxt
+
     def get_scene(self, scene_id: str) -> CachedScene:
         sid = validate_scene_id(scene_id)
         with self._lock:
@@ -204,3 +296,7 @@ class SceneStore:
         sid = validate_scene_id(scene_id)
         with self._lock:
             self._cache.pop(sid, None)
+            for k in [key for key in self._sessions if key[0] == sid]:
+                self._sessions.pop(k, None)
+            for k in [key for key in self._rev_watermarks if key[0] == sid]:
+                self._rev_watermarks.pop(k, None)

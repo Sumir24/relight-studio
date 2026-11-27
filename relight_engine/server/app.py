@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -19,21 +20,32 @@ from PIL import Image
 from ..adapters.registry import available_backends, create_relighter_backend
 from ..contracts import EngineSettings
 from ..engine import relight
-from ..image_io import save_image
+from ..geometry import place_point_light_at_uv, place_studio_light
+from ..image_io import ALPHA_CONVENTION, save_image
 from ..workflows import (
     apply_user_material_assignments,
     source_calibration_from_dict,
+    source_illumination_from_dict,
     target_rig_from_dict,
 )
 from .schemas import (
     AnalyzeResponse,
+    CancelRelightRequest,
+    CancelRelightResponse,
     HealthResponse,
     JobStatusResponse,
     RelightRequest,
     RelightResponse,
     SceneSummaryResponse,
 )
-from .store import SceneStore, downsample_scene_for_preview, validate_artifact_name, validate_scene_id
+from .store import (
+    SceneStore,
+    atomic_write_bytes,
+    atomic_write_text,
+    downsample_scene_for_preview,
+    validate_artifact_name,
+    validate_scene_id,
+)
 from .worker import AnalysisQueue
 
 
@@ -162,8 +174,10 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         ext = Path(file.filename or "upload.png").suffix.lower()
         if ext not in (".png", ".jpg", ".jpeg", ".webp", ".tiff", ".bmp"):
             ext = ".png"
-        upload_path = store.uploads_dir / f"{sid}{ext}"
-        upload_path.write_bytes(raw)
+        upload_sha = hashlib.sha256(raw).hexdigest()
+        upload_path = store.uploads_dir / f"{sid}__{upload_sha[:12]}{ext}"
+        if not upload_path.exists():
+            atomic_write_bytes(upload_path, raw)
 
         def _split_csv(value: str | None) -> list[str] | None:
             if not value:
@@ -240,6 +254,37 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Artifact {fname!r} not found for scene {sid!r}.")
         return FileResponse(path)
 
+    @app.get("/v1/jobs", response_model=list[JobStatusResponse], dependencies=[Depends(require_auth)])
+    def list_jobs(scene_id: str | None = Query(default=None)) -> list[JobStatusResponse]:
+        try:
+            jobs = queue.list_jobs(scene_id=scene_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return [
+            JobStatusResponse(
+                job_id=j.job_id,
+                scene_id=j.scene_id,
+                status=j.status,  # type: ignore[arg-type]
+                stage=j.stage,
+                progress=j.progress,
+                error=j.error,
+                scene_url=f"/v1/scenes/{j.scene_id}" if j.status == "ready" else None,
+            )
+            for j in jobs
+        ]
+
+    @app.post("/v1/scenes/{scene_id}/relight/cancel", response_model=CancelRelightResponse, dependencies=[Depends(require_auth)])
+    def cancel_relight(scene_id: str, req: CancelRelightRequest) -> CancelRelightResponse:
+        try:
+            nxt = store.cancel_revisions(scene_id, req.client_session_id, req.min_revision_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return CancelRelightResponse(
+            scene_id=validate_scene_id(scene_id),
+            client_session_id=req.client_session_id,
+            cancelled_below_revision=nxt,
+        )
+
     @app.post("/v1/scenes/{scene_id}/relight", dependencies=[Depends(require_auth)])
     def relight_scene(
         scene_id: str,
@@ -247,6 +292,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         raw: bool = Query(default=False, description="Return image/png bytes directly instead of JSON metadata."),
     ) -> Response:
         started = perf_counter()
+        client_sid = req.client_session_id or "default"
+        if req.revision_id is not None:
+            try:
+                if not store.register_revision(scene_id, client_sid, req.revision_id):
+                    raise HTTPException(status_code=409, detail=f"Stale relight revision {req.revision_id} superseded.")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         try:
             cached = store.get_scene(scene_id)
         except ValueError as exc:
@@ -254,78 +307,180 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+        session_hit = False
         try:
-            source_rig = source_calibration_from_dict(req.source_calibration.model_dump()).to_rig()
-            target_rig_data = req.target_rig.model_dump(exclude_none=True)
-            target_rig_data["lights"] = [l.model_dump(exclude_none=True) for l in req.target_rig.lights]
-            target_rig = target_rig_from_dict(target_rig_data)
-            settings = EngineSettings(**req.settings.model_dump())
-            settings.validate()
-
-            if req.preview_max_side is not None:
-                work_scene, work_cam, work_arrays = downsample_scene_for_preview(
-                    cached.scene, cached.camera, cached.arrays, req.preview_max_side
-                )
+            placement_keys = {"placement_mode", "uv", "azimuth_deg", "elevation_deg", "distance_scale"}
+            if req.source_illumination is not None:
+                illum_data = req.source_illumination.model_dump(exclude_none=True)
+                src_lights = []
+                for l in req.source_illumination.lights:
+                    ld = l.model_dump(exclude_none=True)
+                    for pk in placement_keys:
+                        ld.pop(pk, None)
+                    src_lights.append(ld)
+                illum_data["lights"] = src_lights
+                source_rig = source_illumination_from_dict(illum_data).to_rig()
+            elif req.source_calibration is not None:
+                source_rig = source_calibration_from_dict(req.source_calibration.model_dump()).to_rig()
             else:
-                work_scene = copy(cached.scene)
-                work_cam = cached.camera
-                work_arrays = cached.arrays
+                raise ValueError("Provide either source_calibration or source_illumination.")
+            target_rig_data = req.target_rig.model_dump(exclude_none=True)
+            resolved_lights = []
+            for l_schema, l_dict in zip(req.target_rig.lights, [l.model_dump(exclude_none=True) for l in req.target_rig.lights]):
+                for pk in placement_keys:
+                    l_dict.pop(pk, None)
+                if l_schema.placement_mode == "image_uv":
+                    u_v = l_schema.uv if l_schema.uv is not None else (0.25, 0.25)
+                    l_dict["position"] = list(place_point_light_at_uv(cached.scene, cached.camera, float(u_v[0]), float(u_v[1])))
+                elif l_schema.placement_mode == "studio_orbit":
+                    pos_o, aim_o = place_studio_light(
+                        cached.scene,
+                        cached.camera,
+                        azimuth_deg=float(l_schema.azimuth_deg),
+                        elevation_deg=float(l_schema.elevation_deg),
+                        distance_scale=float(l_schema.distance_scale),
+                    )
+                    l_dict["position"] = list(pos_o)
+                    if "direction" not in l_dict and l_schema.kind in ("spot", "area", "point"):
+                        l_dict["direction"] = list(aim_o)
+                resolved_lights.append(l_dict)
+            target_rig_data["lights"] = resolved_lights
+            target_rig = target_rig_from_dict(target_rig_data)
 
+            explicit_fields = set(getattr(req.settings, "model_fields_set", set())) - {"preset"}
+            s_dump = req.settings.model_dump()
+            preset_name = s_dump.pop("preset", None)
+            overrides = {k: s_dump[k] for k in explicit_fields if k in s_dump}
+            if preset_name == "studio_3d":
+                settings = EngineSettings.studio_3d(**overrides)
+            elif preset_name == "real_preserving":
+                settings = EngineSettings.real_preserving(**overrides)
+            else:
+                settings = EngineSettings(**s_dump)
+            settings.validate()
             material_dicts = [m.model_dump(exclude_none=True) for m in req.material_assignments]
-            material_meta = apply_user_material_assignments(work_scene, work_arrays, material_dicts)
 
-            relighter = None
             if settings.renderer_mode == "hybrid_neural":
                 if not req.relighter_backend:
                     raise ValueError("renderer_mode='hybrid_neural' requires relighter_backend.")
+                if req.preview_max_side is not None:
+                    work_scene, work_cam, work_arrays = downsample_scene_for_preview(
+                        cached.scene, cached.camera, cached.arrays, req.preview_max_side
+                    )
+                else:
+                    work_scene = copy(cached.scene)
+                    work_cam = cached.camera
+                    work_arrays = cached.arrays
+                material_meta = apply_user_material_assignments(work_scene, work_arrays, material_dicts)
                 opts = dict(req.relighter_options)
                 if cfg.device != "auto" or "device" not in opts:
                     opts["device"] = cfg.device
                 relighter = create_relighter_backend(req.relighter_backend, **opts)
-
-            try:
-                result = relight(
-                    work_scene,
-                    work_cam,
-                    source_rig,
-                    target_rig,
-                    settings,
-                    require_geometry_ready=req.require_geometry_ready,
-                    neural_relighter=relighter,
-                )
-            finally:
-                if relighter is not None:
+                try:
+                    result = relight(
+                        work_scene,
+                        work_cam,
+                        source_rig,
+                        target_rig,
+                        settings,
+                        require_geometry_ready=req.require_geometry_ready,
+                        neural_relighter=relighter,
+                    )
+                    out_alpha = work_scene.alpha_mask
+                finally:
                     relighter.close()
+            else:
+                sess_preview_side = req.preview_max_side if req.preview_max_side is not None else (settings.preview_max_side or 384)
+                render_settings = (
+                    replace(settings, preview_max_side=req.preview_max_side, preview_upsample=False)
+                    if req.preview_max_side is not None
+                    else settings
+                )
+                entry, session_hit = store.get_or_create_relight_session(
+                    scene_id,
+                    source_rig,
+                    material_dicts,
+                    settings,
+                    preview_max_side=sess_preview_side,
+                    require_geometry_ready=req.require_geometry_ready,
+                    apply_materials_fn=apply_user_material_assignments,
+                )
+                material_meta = entry.material_meta
+                result = entry.session.render(target_rig, render_settings)
+                out_alpha = (
+                    entry.session.prev_scene.alpha_mask
+                    if result.rgb_srgb.shape[:2] == entry.session.prev_scene.shape
+                    else entry.session.work_scene.alpha_mask
+                )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        if req.revision_id is not None and store.is_revision_stale(scene_id, client_sid, req.revision_id):
+            raise HTTPException(status_code=409, detail=f"Relight revision {req.revision_id} cancelled or superseded.")
+
         elapsed_ms = round((perf_counter() - started) * 1000.0, 2)
         render_id = f"ren_{uuid.uuid4().hex[:12]}"
-        render_path = store.renders_dir / f"{render_id}.png"
-        report_path = store.renders_dir / f"{render_id}.json"
+        out_h, out_w = result.rgb_srgb.shape[:2]
+        persist = req.persist if req.persist is not None else not (raw and req.preview_max_side is not None)
 
-        save_image(render_path, result.rgb_srgb, alpha_mask=work_scene.alpha_mask)
-        report: dict[str, Any] = {
-            "scene_id": cached.scene_id,
-            "render_id": render_id,
-            "elapsed_ms": elapsed_ms,
-            "resolution": [int(work_scene.shape[1]), int(work_scene.shape[0])],
-            "material_assignments": material_meta,
-            "engine_metrics": result.metrics,
-        }
-        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if persist:
+            render_path = store.renders_dir / f"{render_id}.png"
+            tmp_render = store.renders_dir / f".{render_id}.{uuid.uuid4().hex[:6]}.png"
+            report_path = store.renders_dir / f"{render_id}.json"
+            save_image(tmp_render, result.rgb_srgb, alpha_mask=out_alpha, bit_depth=req.bit_depth)
+            tmp_render.replace(render_path)
+
+            req_digest = hashlib.sha256(
+                json.dumps(req.model_dump(mode="json"), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            report: dict[str, Any] = {
+                "render_report_version": "2.0",
+                "scene_schema_version": cached.scene.schema_version,
+                "scene_id": cached.scene_id,
+                "render_id": render_id,
+                "elapsed_ms": elapsed_ms,
+                "resolution": [int(out_w), int(out_h)],
+                "bit_depth": int(req.bit_depth),
+                "alpha_convention": ALPHA_CONVENTION,
+                "session_cache_hit": bool(session_hit),
+                "revision_id": req.revision_id,
+                "request_sha256": req_digest,
+                "material_assignments": material_meta,
+                "engine_metrics": result.metrics,
+            }
+            atomic_write_text(report_path, json.dumps(report, indent=2))
 
         if raw:
-            return Response(content=render_path.read_bytes(), media_type="image/png", headers={"X-Render-Id": render_id, "X-Elapsed-Ms": str(elapsed_ms)})
+            if persist:
+                png_bytes = render_path.read_bytes()
+            else:
+                rgb_u8 = np.round(np.clip(result.rgb_srgb, 0.0, 1.0) * 255.0).astype(np.uint8)
+                buf = io.BytesIO()
+                if out_alpha is not None:
+                    a_u8 = np.round(np.clip(out_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+                    Image.fromarray(np.dstack([rgb_u8, a_u8]), mode="RGBA").save(buf, format="PNG")
+                else:
+                    Image.fromarray(rgb_u8, mode="RGB").save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+            return Response(
+                content=png_bytes,
+                media_type="image/png",
+                headers={
+                    "X-Render-Id": render_id,
+                    "X-Elapsed-Ms": str(elapsed_ms),
+                    "X-Render-Persisted": "true" if persist else "false",
+                    "X-Session-Cache-Hit": "true" if session_hit else "false",
+                },
+            )
 
         payload = RelightResponse(
             scene_id=cached.scene_id,
             render_id=render_id,
-            render_url=f"/v1/renders/{render_id}.png",
-            report_url=f"/v1/renders/{render_id}.json",
+            render_url=f"/v1/renders/{render_id}.png" if persist else "",
+            report_url=f"/v1/renders/{render_id}.json" if persist else "",
             elapsed_ms=elapsed_ms,
-            resolution=[int(work_scene.shape[1]), int(work_scene.shape[0])],
-            metrics=result.metrics,
+            resolution=[int(out_w), int(out_h)],
+            metrics={**result.metrics, "session_cache_hit": bool(session_hit), "persisted": bool(persist)},
         )
         return JSONResponse(content=payload.model_dump())
 

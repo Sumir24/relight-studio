@@ -23,6 +23,7 @@ class IntrinsicPrediction:
     albedo: np.ndarray
     source_shading: np.ndarray
     non_diffuse_residual: np.ndarray | None = None
+    reconstruction_error: np.ndarray | None = None
     roughness: np.ndarray | None = None
     metalness: np.ndarray | None = None
     specular_level: np.ndarray | None = None

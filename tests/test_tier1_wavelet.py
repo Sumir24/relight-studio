@@ -318,3 +318,73 @@ def test_tier2a_flux_iclight_adapter_protocol_registry_and_radiance_hint(monkeyp
     monkeypatch.delenv("FAL_KEY", raising=False)
     with pytest.raises(RuntimeError, match="FAL_KEY"):
         relight(scene, camera, rig, rig, EngineSettings(renderer_mode="hybrid_neural"), neural_relighter=no_key)
+
+
+def test_source_anchored_intrinsic_protects_biased_wall_albedo_and_navy_garment():
+    """Verify Marigold-style biased albedo does not darken walls or turn dark navy garments purple."""
+    from relight_engine.composite import _estimate_background_weight
+
+    h, w = 48, 64
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    # Centered foreground subject (<45% area) over a flat background wall (>55% area)
+    subj = (xx >= 20) & (xx <= 42) & (yy >= 8)
+    depth = np.where(subj, 1.6, 4.0).astype(np.float32)
+    normals = np.zeros((h, w, 3), dtype=np.float32)
+    normals[..., 2] = -1.0
+    normals[subj & (xx < 31)] = np.array([-0.55, 0.0, -0.83], dtype=np.float32)
+    normals[subj & (xx >= 31)] = np.array([0.55, 0.0, -0.83], dtype=np.float32)
+
+    # Real photo: medium grey wall (0.37 lin) + dark navy suit (0.008, 0.009, 0.020 lin)
+    src_lin = np.full((h, w, 3), 0.37, dtype=np.float32)
+    src_lin[subj] = np.array([0.008, 0.009, 0.020], dtype=np.float32)
+    # Biased Marigold-like albedo: over-bright wall (0.88 lin), undershot suit
+    biased_alb_lin = np.full((h, w, 3), 0.88, dtype=np.float32)
+    biased_alb_lin[subj] = np.array([0.003, 0.008, 0.042], dtype=np.float32)
+
+    scene = SceneBuffers(
+        rgb_srgb=linear_to_srgb(src_lin),
+        depth=depth,
+        depth_confidence=np.full((h, w), 0.45, dtype=np.float32),
+        lightable_mask=np.ones((h, w), dtype=np.float32),
+        depth_kind="relative",
+        normals=normals,
+        geometry_confidence=np.full((h, w), 0.75, dtype=np.float32),
+        albedo=linear_to_srgb(biased_alb_lin),
+        source_shading=np.full((h, w), 0.45, dtype=np.float32),
+    )
+    # Bimodal flat wall (>55% area) must still resolve background weight cleanly
+    bg_w = _estimate_background_weight(scene)
+    assert float(bg_w[4:20, 4:14].mean()) > 0.85
+
+    camera = CameraModel(60.0, 60.0, w / 2, h / 2)
+    src_rig = LightingRig((1, 1, 1), 0.70, (
+        Light("src", "directional", direction=(0.0, 0.0, -1.0), strength=0.45, casts_shadows=False),
+    ))
+    red_rig = LightingRig((0.10, 0.03, 0.03), 0.06, (
+        Light("red_pt", "point", position=(-1.8, 0.18, 1.9), color=(1.0, 0.05, 0.08), strength=3.6, casts_shadows=True),
+    ))
+
+    cfg = EngineSettings.real_preserving()
+    res = relight(scene, camera, src_rig, red_rig, cfg)
+    res_old = relight(scene, camera, src_rig, red_rig, EngineSettings(renderer_mode="intrinsic"))
+
+    # Wall preserves original luminance and avoids flooding red
+    wall_orig_mean = float(scene.rgb_srgb[4:20, 48:60].mean())
+    wall_new_mean = float(res.rgb_srgb[4:20, 48:60].mean())
+    assert abs(wall_new_mean - wall_orig_mean) < 0.08
+    wall_old_red = float((res_old.rgb_srgb[4:20, 4:14, 0] - res_old.rgb_srgb[4:20, 4:14, 2]).mean())
+    wall_new_red = float((res.rgb_srgb[4:20, 4:14, 0] - res.rgb_srgb[4:20, 4:14, 2]).mean())
+    assert wall_new_red < wall_old_red * 0.45
+
+    # Unlit right side of dark navy garment stays navy (B > R) and readable instead of turning dark purple/black
+    unlit_suit = res.rgb_srgb[20:40, 34:40]
+    assert float(unlit_suit[..., 2].mean()) > float(unlit_suit[..., 0].mean())
+    assert float(unlit_suit.mean()) > float(res_old.rgb_srgb[20:40, 34:40].mean()) + 0.03
+
+    # Lit left side of suit visibly utilizes the red light relative to unlit right side
+    lit_suit = res.rgb_srgb[20:40, 22:28]
+    assert float(lit_suit[..., 0].mean()) > float(unlit_suit[..., 0].mean()) + 0.03
+
+    # Session parity holds
+    sess = prepare_relight_session(scene, camera, src_rig, cfg)
+    assert np.allclose(sess.render(red_rig).rgb_srgb, res.rgb_srgb, atol=1e-5)

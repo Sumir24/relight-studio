@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 import math
 import numpy as np
 
-from .contracts import Light, LightingRig
-from .color import srgb_to_linear
+from .contracts import EnvironmentLight, Light, LightingRig, SceneBuffers
+from .color import luminance, srgb_to_linear
 
 
 def kelvin_to_linear_rgb(kelvin: float) -> tuple[float, float, float]:
@@ -97,6 +97,317 @@ class SourceLightCalibration:
 
 
 @dataclass(frozen=True)
+class SourceIllumination:
+    """General multi-light + environment + SH source-illumination contract.
+
+    Backward-compatible with `SourceLightCalibration` via `from_single_key()`.
+    Automatic estimates carry `provenance["reviewed"] = False` and confidence in [0, 1].
+    """
+    lights: tuple[Light, ...] = ()
+    ambient_color: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    ambient_strength: float = 0.15
+    ambient_ground_color: tuple[float, float, float] | None = None
+    environment: EnvironmentLight | None = None
+    sh_coefficients: np.ndarray | None = field(default=None, repr=False, compare=False)
+    source_shading: np.ndarray | None = field(default=None, repr=False, compare=False)
+    exposure_scale: float = 1.0
+    white_balance: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    confidence: float = 1.0
+    provenance: dict = field(default_factory=dict, compare=False)
+
+    def validate(self) -> None:
+        if not math.isfinite(self.ambient_strength) or self.ambient_strength < 0.0:
+            raise ValueError("SourceIllumination ambient_strength must be finite and non-negative.")
+        if not math.isfinite(self.exposure_scale) or self.exposure_scale <= 0.0:
+            raise ValueError("SourceIllumination exposure_scale must be finite and positive.")
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("SourceIllumination confidence must be in [0, 1].")
+        for cname, cval in (("ambient_color", self.ambient_color), ("white_balance", self.white_balance)):
+            arr = np.asarray(cval, dtype=np.float64)
+            if arr.shape != (3,) or not np.isfinite(arr).all() or np.any(arr < 0.0):
+                raise ValueError(f"SourceIllumination {cname} must be a finite non-negative 3-vector.")
+        if np.any(np.asarray(self.white_balance, dtype=np.float64) <= 0.0):
+            raise ValueError("SourceIllumination white_balance channels must be strictly positive.")
+        if self.ambient_ground_color is not None:
+            g = np.asarray(self.ambient_ground_color, dtype=np.float64)
+            if g.shape != (3,) or not np.isfinite(g).all() or np.any(g < 0.0):
+                raise ValueError("SourceIllumination ambient_ground_color must be a finite non-negative 3-vector.")
+        if self.environment is not None:
+            self.environment.validate()
+        for light in self.lights:
+            light.validate()
+        if self.sh_coefficients is not None:
+            sh = np.asarray(self.sh_coefficients, dtype=np.float32)
+            if sh.shape != (9, 3) or not np.isfinite(sh).all():
+                raise ValueError("SourceIllumination sh_coefficients must have finite shape (9, 3).")
+
+    @classmethod
+    def from_single_key(cls, calib: SourceLightCalibration) -> SourceIllumination:
+        calib.validate()
+        rig = calib.to_rig()
+        return cls(
+            lights=rig.lights,
+            ambient_color=rig.ambient_color,
+            ambient_strength=rig.ambient_strength,
+            confidence=1.0,
+            provenance=calib.to_metadata(),
+        )
+
+    def to_rig(self) -> LightingRig:
+        self.validate()
+        wb = np.asarray(self.white_balance, dtype=np.float64)
+        exp_s = float(self.exposure_scale)
+        norm_lights = []
+        for light in self.lights:
+            c = tuple(float(x) for x in (np.asarray(light.color, dtype=np.float64) * wb))
+            norm_lights.append(
+                Light(
+                    name=light.name,
+                    kind=light.kind,
+                    color=c,  # type: ignore[arg-type]
+                    strength=float(light.strength) * exp_s,
+                    direction=light.direction,
+                    position=light.position,
+                    area_size=light.area_size,
+                    samples=light.samples,
+                    casts_shadows=light.casts_shadows,
+                    wrap=light.wrap,
+                    radius=light.radius,
+                    light_id=light.light_id,
+                    spot_inner_angle_deg=light.spot_inner_angle_deg,
+                    spot_outer_angle_deg=light.spot_outer_angle_deg,
+                    intensity_mode=light.intensity_mode,
+                )
+            )
+        amb_col = tuple(float(x) for x in (np.asarray(self.ambient_color, dtype=np.float64) * wb))
+        g_col = (
+            tuple(float(x) for x in (np.asarray(self.ambient_ground_color, dtype=np.float64) * wb))
+            if self.ambient_ground_color is not None
+            else None
+        )
+        rig = LightingRig(
+            ambient_color=amb_col,  # type: ignore[arg-type]
+            ambient_strength=float(self.ambient_strength) * exp_s,
+            lights=tuple(norm_lights),
+            ambient_ground_color=g_col,  # type: ignore[arg-type]
+            environment=self.environment,
+        )
+        rig.validate()
+        return rig
+
+    def to_metadata(self) -> dict:
+        self.validate()
+        return {
+            "light_count": len(self.lights),
+            "ambient_strength": float(self.ambient_strength),
+            "exposure_scale": float(self.exposure_scale),
+            "white_balance": [float(x) for x in self.white_balance],
+            "has_environment": self.environment is not None,
+            "has_sh_coefficients": self.sh_coefficients is not None,
+            "confidence": float(self.confidence),
+            "provenance": dict(self.provenance),
+        }
+
+
+def compute_intrinsic_reconstruction_error(scene: SceneBuffers) -> dict | None:
+    """Compute scale-normalized linear reconstruction error map and diagnostics when intrinsic buffers exist."""
+    if scene.albedo is None or scene.source_shading is None:
+        return None
+    eps = 1e-4
+    src_lin = srgb_to_linear(scene.rgb_srgb)
+    alb_lin = srgb_to_linear(scene.albedo)
+    sh = np.asarray(scene.source_shading, dtype=np.float32)
+    if sh.ndim == 2:
+        sh = np.repeat(sh[..., None], 3, axis=-1)
+    pred = alb_lin * np.maximum(sh, 0.0)
+    if scene.non_diffuse_residual is not None:
+        pred = pred + np.maximum(scene.non_diffuse_residual, 0.0)
+
+    valid = (scene.depth > 0) & (scene.lightable_mask > 0.05)
+    if scene.alpha_mask is not None:
+        valid = valid & (scene.alpha_mask > 0.05)
+    if not np.any(valid):
+        valid = np.ones(scene.shape, dtype=bool)
+
+    y_src = np.maximum(luminance(src_lin), eps)
+    y_pred = np.maximum(luminance(pred), eps)
+    scale = float(np.median(y_src[valid]) / max(float(np.median(y_pred[valid])), eps))
+    scale = float(np.clip(scale, 0.1, 10.0))
+    err_map = np.mean(np.abs(pred * scale - src_lin), axis=-1).astype(np.float32)
+    valid_err = err_map[valid]
+    return {
+        "error_map": err_map,
+        "scale_factor": scale,
+        "mean_error": float(np.mean(valid_err)),
+        "rmse": float(np.sqrt(np.mean(valid_err * valid_err))),
+        "p95_error": float(np.percentile(valid_err, 95)),
+        "high_error_fraction": float(np.mean(valid_err > 0.08)),
+    }
+
+
+def estimate_source_illumination(
+    scene: SceneBuffers,
+    normals: np.ndarray,
+    *,
+    source_shading: np.ndarray | None = None,
+) -> SourceIllumination:
+    """Propose multi-light + SH source illumination from normals, albedo, and observed shading.
+
+    Excludes/down-weights clipped highlights, transparent pixels, uncertain materials, and
+    potential emissive regions during SH fitting. Returned object is an unreviewed proposal.
+    """
+    eps = 1e-4
+    src_lin = srgb_to_linear(scene.rgb_srgb)
+    y_src = np.maximum(luminance(src_lin), eps)
+
+    sh_in = source_shading if source_shading is not None else scene.source_shading
+    if sh_in is not None:
+        obs_sh = np.asarray(sh_in, dtype=np.float32)
+        if obs_sh.ndim == 2:
+            obs_sh = np.repeat(obs_sh[..., None], 3, axis=-1)
+    elif scene.albedo is not None:
+        alb_lin = np.maximum(srgb_to_linear(scene.albedo), 0.04)
+        obs_sh = np.clip(src_lin / alb_lin, 0.02, 4.0).astype(np.float32)
+    else:
+        obs_sh = np.broadcast_to(y_src[..., None], (*scene.shape, 3)).copy()
+
+    # Build strict exclusion mask & soft fit weights (highlights, alpha, uncertain material, sky, emissive outliers).
+    from .scene_policy import detect_sky_horizon_mask
+    sky_mask = detect_sky_horizon_mask(scene)
+    active = (scene.depth > 0) & (scene.lightable_mask > 0.05) & (sky_mask < 0.25)
+    if scene.protected_mask is not None:
+        active = active & (scene.protected_mask < 0.95)
+    if scene.alpha_mask is not None:
+        active = active & (scene.alpha_mask >= 0.05)
+    not_clipped = np.max(scene.rgb_srgb, axis=-1) < 0.92
+
+    weights = active.astype(np.float64) * not_clipped.astype(np.float64)
+    if scene.alpha_mask is not None:
+        weights *= np.clip(scene.alpha_mask.astype(np.float64), 0.0, 1.0)
+    if scene.geometry_confidence is not None:
+        weights *= np.clip(scene.geometry_confidence.astype(np.float64), 0.0, 1.0)
+    if scene.material_confidence is not None:
+        weights *= np.where(scene.material_confidence >= 0.25, np.clip(scene.material_confidence, 0.0, 1.0), 0.05)
+
+    # Down-weight suspected emissive/glare outliers relative to albedo-implied brightness.
+    obs_y = luminance(obs_sh)
+    if np.any(weights > 0.05):
+        med_obs = max(float(np.median(obs_y[weights > 0.05])), eps)
+        emissive_outlier = obs_y > (3.5 * med_obs)
+        weights = np.where(emissive_outlier, 0.0, weights)
+
+    fit_mask = weights > 0.05
+    if np.sum(fit_mask) < 16:
+        fit_mask = scene.depth > 0
+        weights = np.ones(scene.shape, dtype=np.float64)
+
+    nx, ny, nz = normals[..., 0], normals[..., 1], normals[..., 2]
+    # Inverse-density stratification over (nx, ny) bins prevents large flat walls/floors
+    # from silencing diverse subject surface normals during source light estimation.
+    bx = np.clip(((nx[fit_mask] + 1.0) * 4.0).astype(np.int32), 0, 7)
+    by = np.clip(((ny[fit_mask] + 1.0) * 4.0).astype(np.int32), 0, 7)
+    bin_ids = by * 8 + bx
+    bin_counts = np.bincount(bin_ids, minlength=64).astype(np.float64)
+    strat_w = 1.0 / np.sqrt(np.maximum(bin_counts[bin_ids], 1.0))
+
+    basis = np.stack([
+        np.ones_like(nx), ny, nz, nx,
+        nx * ny, ny * nz, 3.0 * nz * nz - 1.0, nx * nz, nx * nx - ny * ny,
+    ], axis=-1).astype(np.float64)
+
+    w_pts = weights[fit_mask] * strat_w
+    b_pts = basis[fit_mask]
+    n_pts = normals[fit_mask].astype(np.float64)
+    y_pts = obs_sh[fit_mask].astype(np.float64)
+    if b_pts.shape[0] > 20000:
+        step = max(1, b_pts.shape[0] // 20000)
+        w_pts, b_pts, n_pts, y_pts = w_pts[::step], b_pts[::step], n_pts[::step], y_pts[::step]
+
+    sw = np.sqrt(w_pts)[:, None]
+    bw = b_pts * sw
+    yw = y_pts * sw
+    reg_diag = np.array([0.02, 0.25, 0.25, 0.25, 0.8, 0.8, 0.8, 0.8, 0.8], dtype=np.float64)
+    gram = bw.T @ bw + np.diag(reg_diag * max(b_pts.shape[0] * 1e-3, 1.0))
+    coeffs = np.linalg.solve(gram, bw.T @ yw)  # shape (9, 3)
+
+    # Front-hemisphere constrained NNLS fit (L_z <= -0.18) prevents behind-wall source estimates.
+    from scipy.optimize import nnls
+    dome_dirs = [np.array([0.0, 0.0, -1.0], dtype=np.float64)]
+    for az_deg in range(0, 360, 60):
+        az = math.radians(az_deg)
+        dome_dirs.append(np.array([0.55 * math.cos(az), 0.55 * math.sin(az), -math.sqrt(1.0 - 0.55 ** 2)], dtype=np.float64))
+        dome_dirs.append(np.array([0.88 * math.cos(az + 0.52), 0.88 * math.sin(az + 0.52), -math.sqrt(1.0 - 0.88 ** 2)], dtype=np.float64))
+    dome_mat = np.stack(dome_dirs, axis=0)  # (K, 3)
+    lambert_cols = [np.ones((n_pts.shape[0],), dtype=np.float64)]
+    for dvec in dome_mat:
+        lambert_cols.append(np.maximum(n_pts @ dvec, 0.0))
+    design = np.stack(lambert_cols, axis=1)  # (N, 1+K)
+    design_w = design * sw
+
+    dome_weights_rgb = np.zeros((1 + len(dome_mat), 3), dtype=np.float64)
+    pred_nnls = np.zeros_like(y_pts)
+    for ch in range(3):
+        sol_c, _ = nnls(design_w, yw[:, ch])
+        dome_weights_rgb[:, ch] = sol_c
+        pred_nnls[:, ch] = np.maximum(design @ sol_c, 1e-4)
+
+    ss_res = float(np.sum(w_pts[:, None] * np.square(y_pts - pred_nnls)))
+    mean_y = np.sum(w_pts[:, None] * y_pts, axis=0, keepdims=True) / max(float(np.sum(w_pts)), eps)
+    ss_tot = float(np.sum(w_pts[:, None] * np.square(y_pts - mean_y)))
+    r2 = float(np.clip(1.0 - ss_res / max(ss_tot, 1e-6), 0.0, 1.0))
+    rmse_rel = float(np.sqrt(ss_res / max(float(np.sum(w_pts)), eps)) / max(float(np.mean(mean_y)), eps))
+    fit_conf = float(np.clip(0.55 * r2 + 0.45 * math.exp(-rmse_rel * 1.5), 0.05, 0.98))
+
+    # Extract dominant front-hemisphere key light & ambient from NNLS lobe decomposition.
+    dc = np.maximum(dome_weights_rgb[0], 0.08)
+    lobe_w_lum = 0.2126 * dome_weights_rgb[1:, 0] + 0.7152 * dome_weights_rgb[1:, 1] + 0.0722 * dome_weights_rgb[1:, 2]
+    total_dir_energy = float(np.sum(lobe_w_lum))
+    if total_dir_energy > 1e-4:
+        # Energy-weighted vector sum over dominant top lobes (stays in front hemisphere because all lobes have Z <= -0.18).
+        weighted_vec = np.sum(dome_mat * lobe_w_lum[:, None], axis=0)
+        key_dir = weighted_vec / max(float(np.linalg.norm(weighted_vec)), 1e-8)
+        key_dir[2] = min(float(key_dir[2]), -0.15)
+        key_dir = key_dir / max(float(np.linalg.norm(key_dir)), 1e-8)
+        key_color_raw = np.maximum(np.sum(dome_weights_rgb[1:], axis=0), 0.02)
+    else:
+        key_dir = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        key_color_raw = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+
+    key_color_norm = key_color_raw / max(float(np.max(key_color_raw)), 1e-4)
+    dc_norm = dc / max(float(np.max(dc)), 1e-4)
+    dc_lum = max(float(0.2126 * dc[0] + 0.7152 * dc[1] + 0.0722 * dc[2]), 0.08)
+    key_str = float(np.clip(total_dir_energy / max(dc_lum, 0.20), 0.15, 2.5))
+    amb_str = float(np.clip(dc_lum * 0.55, 0.15, 1.5))
+
+    return SourceIllumination(
+        lights=(
+            Light(
+                name="estimated_source_key",
+                kind="directional",
+                direction=tuple(float(x) for x in key_dir),
+                color=tuple(float(x) for x in key_color_norm),  # type: ignore[arg-type]
+                strength=key_str,
+                casts_shadows=False,
+            ),
+        ),
+        ambient_color=tuple(float(x) for x in dc_norm),  # type: ignore[arg-type]
+        ambient_strength=amb_str,
+        sh_coefficients=coeffs.astype(np.float32),
+        source_shading=obs_sh,
+        exposure_scale=1.0,
+        white_balance=(1.0, 1.0, 1.0),
+        confidence=fit_conf,
+        provenance={
+            "source": "automatic_sh_source_proposal",
+            "reviewed": False,
+            "weighted_r2": r2,
+            "relative_rmse": rmse_rel,
+            "low_confidence_warning": fit_conf < 0.45,
+        },
+    )
+
+
+@dataclass(frozen=True)
 class MaterialAssignment:
     """User-selected material values applied through a scene mask."""
     name: str
@@ -152,6 +463,7 @@ class MaterialMaps:
     anisotropy: np.ndarray | None = None
     anisotropy_angle: np.ndarray | None = None
     metadata: dict = field(default_factory=dict)
+    raw_maps: dict[str, np.ndarray] = field(default_factory=dict)
 
 
 def build_material_maps(
@@ -265,6 +577,8 @@ def build_material_maps(
                 for a in assignments
             ],
             "neural_material_estimation_used": False,
+            "confidence_applied": False,
+            "confidence_blending_stage": "deferred_to_renderer",
         },
     )
 
@@ -314,6 +628,17 @@ def assign_estimated_material_priors(
 
     r_raw = np.clip(np.asarray(roughness, dtype=np.float32), 0.04, 0.98) if roughness is not None else None
     m_raw = np.clip(np.asarray(metalness, dtype=np.float32), 0.0, 1.0) if metalness is not None else None
+    raw_maps: dict[str, np.ndarray] = {}
+    if r_raw is not None:
+        raw_maps["roughness"] = r_raw.copy()
+    if m_raw is not None:
+        raw_maps["metalness"] = m_raw.copy()
+    if specular_level is not None:
+        raw_maps["specular_level"] = np.clip(np.asarray(specular_level, dtype=np.float32), 0.0, 1.0)
+    if specular_color is not None:
+        raw_maps["specular_color"] = np.clip(np.asarray(specular_color, dtype=np.float32), 0.0, 1.0)
+    if anisotropy is not None:
+        raw_maps["anisotropy"] = np.clip(np.asarray(anisotropy, dtype=np.float32), 0.0, 1.0)
 
     if r_raw is not None:
         eff_roughness = (0.75 * (1.0 - conf) + r_raw * conf).astype(np.float32)
@@ -451,5 +776,201 @@ def assign_estimated_material_priors(
                 "category_rules_used": False,
             },
             "neural_material_estimation_used": True,
+            "confidence_applied": True,
+            "confidence_blending_stage": "pre_blended_in_calibration",
         },
+        raw_maps=raw_maps,
     )
+
+
+def suggest_material_priors_from_semantics(scene: SceneBuffers) -> MaterialMaps | None:
+    """Build conservative semantic PBR material priors when legacy scenes lack material maps.
+
+    Never overrides explicit model maps or user-authored material maps; marks low-to-moderate
+    confidence (`0.42`) and `origin="semantic_fallback_priors"`.
+    """
+    if not scene.semantic_masks:
+        return None
+    h, w = scene.shape
+    # Collect dielectric / organic sub-masks first so overlapping parent metal masks
+    # (e.g. a watch mask spanning crystal, black dial, painted markers, and surrounding fingers)
+    # do not crush dial diffuse or bleed conductive metalness onto curved skin boundaries.
+    non_metal_union = np.zeros((h, w), dtype=np.float32)
+    for raw_label, raw_mask in scene.semantic_masks.items():
+        kl = raw_label.lower()
+        if any(
+            t in kl
+            for t in (
+                "dial", "marker", "numeral", "text", "label", "screen",
+                "glass", "crystal", "lens", "visor",
+                "face", "skin", "hand", "arm", "leg", "neck", "ear", "finger",
+                "hair", "fur", "leather", "bag", "handbag", "shoe", "boot",
+                "suit", "trousers", "shirt", "tie", "coat", "jacket",
+            )
+        ):
+            m = np.clip(np.asarray(raw_mask, dtype=np.float32), 0.0, 1.0)
+            non_metal_union = np.maximum(non_metal_union, m)
+
+    assignments: list[MaterialAssignment] = []
+    for raw_label, raw_mask in scene.semantic_masks.items():
+        kl = raw_label.lower()
+        mask = np.clip(np.asarray(raw_mask, dtype=np.float32), 0.0, 1.0)
+        if not np.any(mask > 0.05):
+            continue
+        if any(t in kl for t in ("dial", "screen")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.22,
+                metalness=0.0,
+                specular_level=0.06,
+                clearcoat=0.65,
+                clearcoat_roughness=0.06,
+                blend=0.90,
+                confidence=0.45,
+            ))
+        elif any(t in kl for t in ("marker", "numeral", "text", "label")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.28,
+                metalness=0.20,
+                specular_level=0.18,
+                blend=0.90,
+                confidence=0.45,
+            ))
+        elif any(t in kl for t in ("watch", "ring", "clasp", "buckle", "metal", "chrome", "steel", "gold", "jewelry", "silver")):
+            # Suppress soft feathered halos beyond the crisp object boundary and subtract
+            # overlapping dielectric/organic sub-parts so dials and adjacent fingers stay intact.
+            crisp_mask = np.clip((mask - 0.30) / 0.55, 0.0, 1.0).astype(np.float32)
+            crisp_mask = np.power(crisp_mask, 1.25) * np.clip(1.0 - 0.90 * non_metal_union, 0.0, 1.0)
+            if not np.any(crisp_mask > 0.05):
+                continue
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=crisp_mask,
+                roughness=0.24,
+                metalness=0.85,
+                specular_level=0.85,
+                anisotropy=0.35,
+                blend=0.85,
+                confidence=0.45,
+            ))
+        elif any(t in kl for t in ("sunglasses", "glasses", "crystal", "glass", "lens", "visor")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.16,
+                metalness=0.0,
+                specular_level=0.06,
+                clearcoat=0.85,
+                clearcoat_roughness=0.06,
+                blend=0.85,
+                confidence=0.45,
+            ))
+        elif any(t in kl for t in ("face", "skin", "hand", "arm", "leg", "neck", "ear", "finger")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.52,
+                metalness=0.0,
+                specular_level=0.045,
+                subsurface=0.35,
+                blend=0.80,
+                confidence=0.42,
+            ))
+        elif any(t in kl for t in ("hair", "his_hair", "fur")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.42,
+                metalness=0.0,
+                specular_level=0.05,
+                anisotropy=0.45,
+                blend=0.80,
+                confidence=0.40,
+            ))
+        elif any(t in kl for t in ("bag", "handbag", "leather", "footwear", "shoe", "boot")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.44,
+                metalness=0.0,
+                specular_level=0.05,
+                clearcoat=0.22,
+                clearcoat_roughness=0.25,
+                blend=0.75,
+                confidence=0.40,
+            ))
+        elif any(t in kl for t in ("suit", "trousers", "shirt", "tie", "coat", "jacket", "wall", "floor", "asphalt", "stone", "mountain", "grass", "ground")):
+            assignments.append(MaterialAssignment(
+                name=f"auto_{raw_label}",
+                mask=mask,
+                roughness=0.84,
+                metalness=0.0,
+                specular_level=0.03,
+                blend=0.70,
+                confidence=0.40,
+            ))
+    if not assignments:
+        return None
+    maps = build_material_maps(scene.shape, assignments)
+    maps.metadata["origin"] = "semantic_fallback_priors"
+    maps.metadata["confidence_applied"] = False
+    return maps
+
+
+def refine_source_shading_with_albedo(
+    scene: SceneBuffers,
+    source_shading: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Reconcile smooth estimated source_shading with albedo-guided `src / albedo` to recover sharp gobo/blind shadows.
+
+    Uses `log_luminance(albedo)` as structural guide so sharp painted/textural albedo borders do not blur,
+    while sharp shadow bars across uniform walls/floors (e.g. window blinds) are faithfully preserved in shading.
+    """
+    if scene.albedo is None:
+        return source_shading
+    from scipy.ndimage import gaussian_filter
+
+    eps = 1e-4
+    src_lin = srgb_to_linear(scene.rgb_srgb)
+    alb_lin = np.maximum(srgb_to_linear(scene.albedo), 0.04)
+    implied = np.clip(src_lin / alb_lin, 0.08, 3.0).astype(np.float32)
+
+    guide = np.log(np.maximum(luminance(alb_lin), eps)).astype(np.float32)
+    sigma = 6.0
+    eps_guide = 0.008
+    mean_i = gaussian_filter(guide, sigma, mode="reflect")
+    mean_ii = gaussian_filter(guide * guide, sigma, mode="reflect")
+    var_i = np.maximum(mean_ii - mean_i * mean_i, 0.0)
+
+    def _gf2d(p: np.ndarray) -> np.ndarray:
+        mean_p = gaussian_filter(p, sigma, mode="reflect")
+        mean_ip = gaussian_filter(guide * p, sigma, mode="reflect")
+        cov_ip = mean_ip - mean_i * mean_p
+        a = cov_ip / (var_i + eps_guide)
+        b = mean_p - a * mean_i
+        return gaussian_filter(a, sigma, mode="reflect") * guide + gaussian_filter(b, sigma, mode="reflect")
+
+    imp_refined = np.stack([_gf2d(implied[..., c]) for c in range(3)], axis=-1)
+    imp_refined = np.clip(imp_refined, 0.08, 3.0).astype(np.float32)
+
+    # Suppress blending where albedo itself has strong texture edges (let base source_shading govern there)
+    # and weight higher on smooth albedo walls/surfaces where gobo/blind shadows exist.
+    alb_tex = np.sqrt(var_i)
+    flat_alb_w = np.clip((0.18 - alb_tex) / 0.14, 0.15, 0.85).astype(np.float32)[..., None]
+
+    sh_in = source_shading if source_shading is not None else scene.source_shading
+    if sh_in is None:
+        return imp_refined
+    sh_arr = np.asarray(sh_in, dtype=np.float32)
+    if sh_arr.ndim == 2:
+        sh_arr = np.repeat(sh_arr[..., None], 3, axis=-1)
+    active = (scene.depth > 0) & (scene.lightable_mask > 0.05)
+    if not np.any(active):
+        active = scene.depth > 0
+    sh_med = max(float(np.median(luminance(sh_arr)[active])), eps)
+    imp_med = max(float(np.median(luminance(imp_refined)[active])), eps)
+    imp_scaled = np.clip(imp_refined * (sh_med / imp_med), 0.05, 3.0).astype(np.float32)
+    return np.clip((1.0 - flat_alb_w) * sh_arr + flat_alb_w * imp_scaled, 0.02, 3.0).astype(np.float32)

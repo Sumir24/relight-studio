@@ -1,18 +1,30 @@
 from __future__ import annotations
+from collections import OrderedDict
+import hashlib
 import math
+import threading
 import cv2
 import numpy as np
-from .color import srgb_to_linear
+from .color import luminance, srgb_to_linear
 from .contracts import CameraModel, EnvironmentLight, Light, LightingRig, SceneBuffers, EngineSettings
 from .shadows import scene_shadow_visibility
+
+_ENV_IBL_CACHE: OrderedDict[tuple, tuple[list[np.ndarray], np.ndarray]] = OrderedDict()
+_ENV_IBL_CACHE_LOCK = threading.Lock()
+_ENV_IBL_CACHE_MAX = 4
+
 
 def _normalize(v: np.ndarray) -> np.ndarray:
     return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-8)
 
+
 def _area_samples(light: Light, target_point: np.ndarray | None = None) -> list[np.ndarray]:
     center = np.asarray(light.position, np.float32)
-    target = np.array([0.0, 0.0, 1.0], np.float32) if target_point is None else np.asarray(target_point, np.float32)
-    toward_scene = target - center
+    if light.direction is not None:
+        toward_scene = np.asarray(light.direction, np.float32)
+    else:
+        target = np.array([0.0, 0.0, 1.0], np.float32) if target_point is None else np.asarray(target_point, np.float32)
+        toward_scene = target - center
     norm = float(np.linalg.norm(toward_scene))
     if norm < 1e-6:
         toward_scene = np.array([0.0, 0.0, 1.0], np.float32)
@@ -25,8 +37,13 @@ def _area_samples(light: Light, target_point: np.ndarray | None = None) -> list[
     right /= max(float(np.linalg.norm(right)), 1e-8)
     up_axis = np.cross(toward_scene, right)
     up_axis /= max(float(np.linalg.norm(up_axis)), 1e-8)
+
+    if light.samples <= 1:
+        return [center]
+
     n = int(math.ceil(math.sqrt(light.samples)))
-    offsets = np.linspace(-0.5, 0.5, n, dtype=np.float32)
+    # Centered, symmetric stratified bin centers in (-0.5, +0.5) so multi-sample grids are unbiased.
+    offsets = (np.arange(n, dtype=np.float32) + 0.5) / float(n) - 0.5
     result = []
     for iy in range(n):
         for ix in range(n):
@@ -35,14 +52,11 @@ def _area_samples(light: Light, target_point: np.ndarray | None = None) -> list[
             result.append(center + right * offsets[ix] * light.area_size[0] + up_axis * offsets[iy] * light.area_size[1])
     return result
 
-def _effective_material_maps(
-    scene: SceneBuffers,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Resolve authored/estimated maps against explicit conservative renderer priors.
+def resolve_effective_materials(scene: SceneBuffers) -> dict[str, np.ndarray | None]:
+    """Resolve effective rendering material properties with single-stage confidence blending.
 
-    A supplied material_confidence map blends supplied properties toward the priors.
-    Without that map, supplied maps are applied as provided but their provenance remains
-    the caller's responsibility. No material is inferred from its semantic label.
+    If `scene.material_metadata.get('confidence_applied')` is True, supplied maps were
+    already blended in calibration and are not attenuated a second time by `material_confidence`.
     """
     h, w = scene.depth.shape
     priors = {
@@ -54,12 +68,14 @@ def _effective_material_maps(
         "clearcoat_roughness": 0.15,
         "subsurface": 0.0,
     }
+    already_applied = bool(scene.material_metadata.get("confidence_applied", False))
     confidence = (
         np.clip(np.asarray(scene.material_confidence, dtype=np.float32), 0.0, 1.0)
-        if scene.material_confidence is not None else None
+        if (scene.material_confidence is not None and not already_applied)
+        else None
     )
 
-    def resolve(name: str, supplied: np.ndarray | None, prior: float):
+    def resolve(name: str, supplied: np.ndarray | None, prior: float) -> np.ndarray:
         if supplied is None:
             return np.full((h, w), prior, dtype=np.float32) if name != "specular_color" else np.full((h, w, 3), prior, dtype=np.float32)
         values = np.asarray(supplied, dtype=np.float32)
@@ -69,36 +85,55 @@ def _effective_material_maps(
             elif values.ndim == 1 and values.shape[0] == 3:
                 values = np.broadcast_to(values, (h, w, 3)).copy()
         if confidence is None:
-            return values
+            return np.clip(values, 0.0, 1.0).astype(np.float32)
         weight = confidence if values.ndim == 2 else confidence[..., None]
         base = prior if values.ndim == 2 else np.full((1, 1, 3), prior, dtype=np.float32)
-        return (base + weight * (values - base)).astype(np.float32)
+        return np.clip(base + weight * (values - base), 0.0, 1.0).astype(np.float32)
 
-    return (
-        resolve("roughness", scene.roughness, priors["roughness"]),
-        resolve("metalness", scene.metalness, priors["metalness"]),
-        resolve("specular_level", scene.specular_level, priors["specular_level"]),
-        resolve("specular_color", scene.specular_color, priors["specular_color"]),
-        resolve("clearcoat", scene.clearcoat, priors["clearcoat"]),
-        resolve("clearcoat_roughness", scene.clearcoat_roughness, priors["clearcoat_roughness"]),
-        resolve("subsurface", scene.subsurface, priors["subsurface"]),
-    )
+    aniso = None
+    if scene.anisotropy is not None:
+        aniso = np.clip(np.asarray(scene.anisotropy, dtype=np.float32), 0.0, 1.0)
+        if confidence is not None:
+            aniso = (aniso * confidence).astype(np.float32)
 
-
-def _effective_anisotropy_maps(scene: SceneBuffers) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Resolve optional anisotropy magnitude [0, 1] (confidence-gated) and tangent rotation angle."""
-    if scene.anisotropy is None:
-        return None, None
-    aniso = np.clip(np.asarray(scene.anisotropy, dtype=np.float32), 0.0, 1.0)
-    if scene.material_confidence is not None:
-        conf = np.clip(np.asarray(scene.material_confidence, dtype=np.float32), 0.0, 1.0)
-        aniso = (aniso * conf).astype(np.float32)
-    angle = (
+    aniso_angle = (
         np.asarray(scene.anisotropy_angle, dtype=np.float32)
         if scene.anisotropy_angle is not None
         else None
     )
-    return aniso, angle
+    return {
+        "roughness": resolve("roughness", scene.roughness, priors["roughness"]),
+        "metalness": resolve("metalness", scene.metalness, priors["metalness"]),
+        "specular_level": resolve("specular_level", scene.specular_level, priors["specular_level"]),
+        "specular_color": resolve("specular_color", scene.specular_color, priors["specular_color"]),
+        "clearcoat": resolve("clearcoat", scene.clearcoat, priors["clearcoat"]),
+        "clearcoat_roughness": resolve("clearcoat_roughness", scene.clearcoat_roughness, priors["clearcoat_roughness"]),
+        "subsurface": resolve("subsurface", scene.subsurface, priors["subsurface"]),
+        "anisotropy": aniso,
+        "anisotropy_angle": aniso_angle,
+    }
+
+
+def _effective_material_maps(
+    scene: SceneBuffers,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return effective rendering maps resolved with single-stage confidence handling."""
+    eff = resolve_effective_materials(scene)
+    return (
+        eff["roughness"],            # type: ignore[return-value]
+        eff["metalness"],            # type: ignore[return-value]
+        eff["specular_level"],       # type: ignore[return-value]
+        eff["specular_color"],       # type: ignore[return-value]
+        eff["clearcoat"],            # type: ignore[return-value]
+        eff["clearcoat_roughness"],  # type: ignore[return-value]
+        eff["subsurface"],           # type: ignore[return-value]
+    )
+
+
+def _effective_anisotropy_maps(scene: SceneBuffers) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Resolve optional anisotropy magnitude [0, 1] (single-stage confidence-gated) and tangent angle."""
+    eff = resolve_effective_materials(scene)
+    return eff["anisotropy"], eff["anisotropy_angle"]
 
 
 def _build_tangent_frame(
@@ -242,10 +277,15 @@ def _evaluate_specular_lobe(
         h, w = roughness.shape
         zeros = np.zeros((h, w), dtype=np.float32)
         f04 = np.full((h, w), 0.04, dtype=np.float32)
+        half_vec = _normalize(light_dir + view)
+        vdoth = np.clip(np.sum(view * half_vec, axis=-1), 0.0, 1.0)
+        coat_fresnel = 0.04 + 0.96 * np.power(1.0 - vdoth, 5.0)
+        # Attenuate underlying base specular layer by clearcoat Fresnel reflection before adding top coat.
+        coat_trans = 1.0 - clearcoat[..., None] * np.clip((coat_fresnel[..., None] - 0.04) * 2.5, 0.0, 0.75)
         coat_spec = _ggx_specular(
             normals, view, light_dir, clearcoat_roughness, zeros, f04, specular_color
         )
-        spec = spec + clearcoat[..., None] * coat_spec
+        spec = spec * coat_trans + clearcoat[..., None] * coat_spec
     return spec.astype(np.float32)
 
 
@@ -284,8 +324,16 @@ def _sample_equirectangular(
 
 
 def _prefilter_equirectangular_env(env_map: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
-    """Build roughness-prefiltered specular mip chain and cosine-weighted diffuse irradiance map."""
-    env_lin = np.maximum(np.asarray(env_map, dtype=np.float32), 0.0)
+    """Build (or fetch from content-keyed cache) roughness-prefiltered specular mip chain and diffuse irradiance."""
+    buf = np.ascontiguousarray(np.maximum(np.asarray(env_map, dtype=np.float32), 0.0))
+    key = (buf.shape, hashlib.blake2b(memoryview(buf), digest_size=16).digest())
+    with _ENV_IBL_CACHE_LOCK:
+        cached = _ENV_IBL_CACHE.get(key)
+        if cached is not None:
+            _ENV_IBL_CACHE.move_to_end(key)
+            return cached
+
+    env_lin = buf
     he, we = env_lin.shape[:2]
     # Preserve crisp mip 0 up to 256px wide; downsample wider maps so prefiltering stays sub-5ms.
     base_w = min(we, 256)
@@ -324,6 +372,14 @@ def _prefilter_equirectangular_env(env_map: np.ndarray) -> tuple[list[np.ndarray
     weighted_rad = (src_small.reshape(-1, 3) * domega[:, None]).astype(np.float32)
     cos_mat = np.clip(dirs @ dirs.T, 0.0, 1.0)
     irrad = ((cos_mat @ weighted_rad) / np.pi).reshape(ih, iw, 3).astype(np.float32)
+    for m in mips:
+        m.setflags(write=False)
+    irrad.setflags(write=False)
+    with _ENV_IBL_CACHE_LOCK:
+        _ENV_IBL_CACHE[key] = (mips, irrad)
+        _ENV_IBL_CACHE.move_to_end(key)
+        while len(_ENV_IBL_CACHE) > _ENV_IBL_CACHE_MAX:
+            _ENV_IBL_CACHE.popitem(last=False)
     return mips, irrad
 
 
@@ -462,10 +518,12 @@ def evaluate_environment_lighting(
         rc_eff = np.clip(clearcoat_roughness, 0.045, 1.0)[..., None]
         coat_fresnel = 0.04 + (np.maximum(1.0 - rc_eff, 0.04) - 0.04) * np.power(1.0 - ndotv, 5.0)
         coat_spec = coat_radiance * coat_fresnel * np.clip(1.0 - 0.85 * (rc_eff * rc_eff), 0.10, 1.0)
-        env_specular = env_specular + clearcoat[..., None] * coat_spec
+        coat_trans = 1.0 - clearcoat[..., None] * np.clip(coat_fresnel * 2.5, 0.0, 0.75)
+        env_specular = env_specular * coat_trans + clearcoat[..., None] * coat_spec
 
     env_specular = (env_specular * float(env.specular_strength)).astype(np.float32)
-    env_diffuse = (irrad_total * np.clip(1.0 - 0.88 * metal, 0.08, 1.0) * float(env.diffuse_strength)).astype(np.float32)
+    coat_diff_atten = (1.0 - 0.15 * clearcoat[..., None] * (1.0 - ndotv)) if has_coat and clearcoat is not None else 1.0
+    env_diffuse = (irrad_total * np.clip(1.0 - 0.88 * metal, 0.08, 1.0) * coat_diff_atten * float(env.diffuse_strength)).astype(np.float32)
     return env_diffuse, env_specular
 
 
@@ -485,25 +543,48 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
     anisotropy, anisotropy_angle = _effective_anisotropy_maps(scene)
     has_aniso = anisotropy is not None and bool(np.any(anisotropy > 1e-4))
     tangent, bitangent = _build_tangent_frame(normals, anisotropy_angle) if has_aniso else (None, None)
+    # Energy sharing between diffuse and Fresnel specular + grazing clearcoat transmission.
     diffuse_energy = np.clip(1.0 - 0.88 * metalness, 0.08, 1.0).astype(np.float32)[..., None]
+    diffuse_energy = diffuse_energy * (1.0 - 0.5 * np.clip(spec_level, 0.0, 0.35)[..., None])
     has_coat = bool(np.any(clearcoat > 1e-4))
     has_sss = bool(np.any(subsurface > 1e-4))
     view = _normalize(-points)
+    if has_coat:
+        ndotv_coat = np.clip(np.sum(normals * view, axis=-1), 0.0, 1.0)
+        diffuse_energy = diffuse_energy * (1.0 - 0.25 * clearcoat * (1.0 - ndotv_coat))[..., None]
     diffuse = np.zeros((h, w, 3), np.float32)
     specular = np.zeros((h, w, 3), np.float32)
     visibility_sum = np.zeros((h, w), np.float32)
 
+    eff_strength = (
+        float(light.strength) / math.pi
+        if (light.intensity_mode == 'physical' and light.kind in ('point', 'area', 'spot'))
+        else float(light.strength)
+    )
+    eff_radius = float(light.radius)
+    if light.kind == 'area':
+        eff_radius = max(eff_radius, 0.35 * math.hypot(float(light.area_size[0]), float(light.area_size[1])))
+
+    spot_dir = None
+    spot_cos_in = 1.0
+    spot_cos_out = -1.0
     if light.kind == 'directional':
         toward = np.asarray(light.direction, np.float32)
         toward /= max(float(np.linalg.norm(toward)), 1e-8)
         dirs = [np.broadcast_to(toward, (h, w, 3))]
         positions = [None]
-    elif light.kind == 'point':
+    elif light.kind in ('point', 'spot'):
         lp = np.asarray(light.position, np.float32)
         vec = lp[None, None, :] - points
         dist = np.linalg.norm(vec, axis=-1)
         dirs = [vec / np.maximum(dist[..., None], 1e-8)]
         positions = [np.broadcast_to(lp, (h, w, 3))]
+        if light.kind == 'spot':
+            assert light.direction is not None
+            sd = np.asarray(light.direction, np.float32)
+            spot_dir = sd / max(float(np.linalg.norm(sd)), 1e-8)
+            spot_cos_in = math.cos(math.radians(float(light.spot_inner_angle_deg)))
+            spot_cos_out = math.cos(math.radians(float(light.spot_outer_angle_deg)))
     else:
         valid = scene.depth > 0
         scene_target = np.mean(points[valid], axis=0).astype(np.float32) if np.any(valid) else None
@@ -528,18 +609,67 @@ def _light_contribution(scene: SceneBuffers, camera: CameraModel, points: np.nda
         else:
             ndotl_diffuse = ndotl
         if light.kind == 'directional':
-            attenuation = np.full((h, w), light.strength, np.float32)
+            attenuation = np.full((h, w), eff_strength, np.float32)
         elif scene.depth_kind == 'metric':
-            attenuation = light.strength / np.maximum(dist * dist, 0.04)
+            attenuation = eff_strength / np.maximum(dist * dist, 0.04)
         else:
-            # Relative depth has unknown scale: use a stable normalized falloff, not fake inverse-square metres.
-            attenuation = light.strength / (1.0 + 0.15 * dist * dist)
+            # Normalize distance by both median scene depth and light standoff distance so
+            # close studio lights keep natural local falloff while distant sky/sun-scale
+            # landscape lights illuminate valley and peaks evenly without starving the horizon.
+            valid_d = scene.depth > 0
+            z_ref = max(float(np.median(scene.depth[valid_d])) if np.any(valid_d) else 2.0, 1.0)
+            dist_ref = float(np.median(dist[valid_d])) if np.any(valid_d) else z_ref
+            rel_scale = max(0.45 * z_ref, 0.48 * dist_ref, 1.0)
+            d_scaled = dist / rel_scale
+            attenuation = eff_strength / (1.0 + 0.30 * d_scaled * d_scaled)
+        if spot_dir is not None:
+            cos_theta = np.sum((-d) * spot_dir[None, None, :], axis=-1)
+            t_cone = np.clip((cos_theta - spot_cos_out) / max(spot_cos_in - spot_cos_out, 1e-5), 0.0, 1.0)
+            attenuation = attenuation * (t_cone * t_cone * (3.0 - 2.0 * t_cone)).astype(np.float32)
         if light.casts_shadows:
-            visibility = scene_shadow_visibility(
-                scene, camera, points, normals, pos,
-                d if light.kind == 'directional' else None,
-                settings, light_radius=float(light.radius),
-            )
+            if getattr(settings, "shadow_half_res", False) and max(h, w) > 512:
+                scale_s = 448.0 / float(max(h, w))
+                hs = max(32, int(round(h * scale_s)))
+                ws = max(32, int(round(w * scale_s)))
+                from .preview import depth_guided_upsample_batch
+                sc_s = SceneBuffers(
+                    rgb_srgb=cv2.resize(scene.rgb_srgb, (ws, hs), interpolation=cv2.INTER_AREA),
+                    depth=cv2.resize(scene.depth, (ws, hs), interpolation=cv2.INTER_NEAREST),
+                    depth_confidence=cv2.resize(scene.depth_confidence, (ws, hs), interpolation=cv2.INTER_AREA),
+                    lightable_mask=cv2.resize(scene.lightable_mask, (ws, hs), interpolation=cv2.INTER_AREA),
+                    depth_kind=scene.depth_kind,
+                    semantic_masks={
+                        k: cv2.resize(m, (ws, hs), interpolation=cv2.INTER_AREA)
+                        for k, m in scene.semantic_masks.items()
+                        if any(t in k.lower() for t in ("sky", "cloud", "heaven"))
+                    },
+                )
+                cam_s = CameraModel(
+                    camera.fx * (ws / float(w)),
+                    camera.fy * (hs / float(h)),
+                    camera.cx * (ws / float(w)),
+                    camera.cy * (hs / float(h)),
+                )
+                pts_s = cv2.resize(points, (ws, hs), interpolation=cv2.INTER_NEAREST)
+                nrm_s = _normalize(cv2.resize(normals, (ws, hs), interpolation=cv2.INTER_NEAREST))
+                pos_s = np.broadcast_to(pos[:1, :1, :], (hs, ws, 3)) if pos is not None else None
+                dir_s = (
+                    np.broadcast_to(d[:1, :1, :], (hs, ws, 3))
+                    if (pos is None and light.kind == 'directional')
+                    else (cv2.resize(d, (ws, hs), interpolation=cv2.INTER_AREA) if pos is None else None)
+                )
+                vis_lo = scene_shadow_visibility(
+                    sc_s, cam_s, pts_s, nrm_s, pos_s, dir_s, settings, light_radius=eff_radius,
+                )
+                visibility = np.clip(
+                    depth_guided_upsample_batch([vis_lo], scene.depth, sc_s.depth, depth_sigma=0.025)[0], 0.0, 1.0
+                ).astype(np.float32)
+            else:
+                visibility = scene_shadow_visibility(
+                    scene, camera, points, normals, pos,
+                    d if light.kind == 'directional' else None,
+                    settings, light_radius=eff_radius,
+                )
         else:
             visibility = np.ones((h, w), np.float32)
         if has_sss:
@@ -573,27 +703,95 @@ def compute_indirect_bounce(
     direct_diffuse: np.ndarray,
     settings: EngineSettings,
 ) -> np.ndarray:
-    """1-bounce screen-space indirect inter-reflection (SSGI color bleed) between surfaces."""
+    """Multi-scale 3D global VPL surfel radiosity + local ring inter-surface bounce (SSGI).
+
+    Propagates colored direct illumination across the entire 3D scene (floor <-> subject <-> wall)
+    using two-sided emitter/receiver normal form factors and depth-scaled emitter areas, while
+    excluding infinite sky pixels when `settings.protect_sky` is enabled.
+    """
     strength = float(settings.indirect_bounce_strength)
     if strength <= 0.0:
         return np.zeros_like(direct_diffuse, dtype=np.float32)
 
     h, w = scene.depth.shape
-    albedo_lin = (
-        srgb_to_linear(scene.albedo)
-        if scene.albedo is not None
-        else np.clip(srgb_to_linear(scene.rgb_srgb), 0.02, 0.85)
-    )
-    radiance = (albedo_lin * np.maximum(direct_diffuse, 0.0)).astype(np.float32)
+    if scene.albedo is not None:
+        albedo_lin = srgb_to_linear(scene.albedo)
+    else:
+        # Without intrinsic albedo, desaturate source RGB toward neutral luminance so source casts don't bleed.
+        src_lin = srgb_to_linear(scene.rgb_srgb)
+        src_y = luminance(src_lin)[..., None]
+        albedo_lin = np.clip(0.65 * src_y + 0.35 * src_lin, 0.04, 0.65).astype(np.float32)
+
+    # Softly bound bounce radiance so increasing light count cannot cause indirect energy blowup.
+    bounded_direct = np.maximum(direct_diffuse, 0.0)
+    bounded_direct = bounded_direct / (1.0 + 0.25 * bounded_direct)
+    radiance = (albedo_lin * bounded_direct).astype(np.float32)
+
     valid = scene.depth > 0
+    if getattr(settings, "protect_sky", True):
+        from .scene_policy import detect_sky_horizon_mask
+        sky_w = detect_sky_horizon_mask(scene)
+        non_sky = (1.0 - sky_w).astype(np.float32)
+        radiance = radiance * non_sky[..., None]
+        valid_emit = valid & (sky_w < 0.25)
+    else:
+        non_sky = np.ones((h, w), dtype=np.float32)
+        valid_emit = valid
+
     log_d = np.log(np.maximum(scene.depth, 1e-4)).astype(np.float32)
     z_med = max(float(np.median(scene.depth[valid])) if np.any(valid) else 1.0, 1e-3)
-    world_scale = z_med * 0.35
+    world_scale = max(0.55 * z_med, 0.65)
 
+    # 1. Global full-scene VPL surfel radiosity gather across downsampled 3D surfels (fast CPU path).
+    global_bounce = np.zeros_like(radiance, dtype=np.float32)
+    if np.any(valid_emit):
+        # Emitter grid: ~16x16 surfels (<= 256 emitters covering full room/floor/subject).
+        eh = max(4, min(16, h))
+        ew = max(4, min(16, w))
+        emit_rad = cv2.resize(radiance, (ew, eh), interpolation=cv2.INTER_AREA).reshape(-1, 3)
+        emit_pts = cv2.resize(points, (ew, eh), interpolation=cv2.INTER_AREA).reshape(-1, 3)
+        emit_nrm = _normalize(cv2.resize(normals, (ew, eh), interpolation=cv2.INTER_AREA)).reshape(-1, 3)
+        emit_val = (cv2.resize(valid_emit.astype(np.float32), (ew, eh), interpolation=cv2.INTER_AREA).ravel() > 0.25)
+        if np.any(emit_val):
+            e_rad = emit_rad[emit_val]
+            e_pts = emit_pts[emit_val]
+            e_nrm = emit_nrm[emit_val]
+            e_area = np.clip((np.maximum(e_pts[:, 2], 0.1) / z_med) ** 2, 0.25, 4.0).astype(np.float32)
+
+            # Receiver grid capped at <= 128 px max side, then depth-aware upsampled cleanly.
+            scale_r = min(1.0, 128.0 / float(max(h, w)))
+            rh = max(4, int(round(h * scale_r)))
+            rw = max(4, int(round(w * scale_r)))
+            r_pts = cv2.resize(points, (rw, rh), interpolation=cv2.INTER_AREA).reshape(-1, 3)
+            r_nrm = _normalize(cv2.resize(normals, (rw, rh), interpolation=cv2.INTER_AREA)).reshape(-1, 3)
+            r_val = (cv2.resize(valid.astype(np.float32), (rw, rh), interpolation=cv2.INTER_AREA).ravel() > 0.25)
+
+            delta = e_pts[None, :, :] - r_pts[:, None, :]  # (R, E, 3)
+            dist2 = np.sum(delta * delta, axis=-1)
+            dist = np.sqrt(np.maximum(dist2, 1e-6))
+            d_hat = delta / dist[..., None]
+
+            cos_r = np.clip(np.sum(r_nrm[:, None, :] * d_hat, axis=-1), 0.08, 1.0)
+            cos_e = np.clip(np.sum(e_nrm[None, :, :] * (-d_hat), axis=-1), 0.15, 1.0)
+            soft2 = (0.18 * world_scale) ** 2
+            att = 1.0 / (1.0 + (dist2 + soft2) / max(world_scale * world_scale, 1e-4))
+            # Allow cross-object bounce between floor/subject/wall while gently tapering massive horizon chasms.
+            log_gap = np.abs(
+                np.log(np.maximum(e_pts[None, :, 2], 0.1)) - np.log(np.maximum(r_pts[:, None, 2], 0.1))
+            )
+            gap_atten = np.where(log_gap <= 1.25, 1.0, np.exp(-(log_gap - 1.25) * 1.5))
+
+            w_mat = (cos_r * cos_e * e_area[None, :] * att * gap_atten * r_val[:, None]).astype(np.float32)
+            w_tot = np.maximum(np.sum(w_mat, axis=1, keepdims=True), 1e-4)
+            g_lo = ((w_mat @ e_rad) / w_tot).reshape(rh, rw, 3).astype(np.float32)
+            global_bounce = cv2.resize(g_lo, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+    # 2. Local multi-radius ring for crisp contact corners (under-chin, floor-wall seam, collar).
     r_max = max(2, int(round(settings.indirect_bounce_radius)))
     r_mid = max(1, r_max // 2)
+    r_near = max(1, r_max // 4)
     offsets = []
-    for rad in (r_mid, r_max):
+    for rad in (r_near, r_mid, r_max):
         diag = max(1, int(round(rad * 0.7071)))
         offsets.extend([
             (0, rad), (0, -rad), (rad, 0), (-rad, 0),
@@ -605,8 +803,9 @@ def compute_indirect_bounce(
     for dy, dx in offsets:
         rad_s = np.roll(np.roll(radiance, dy, axis=0), dx, axis=1)
         pts_s = np.roll(np.roll(points, dy, axis=0), dx, axis=1)
+        nrm_s = np.roll(np.roll(normals, dy, axis=0), dx, axis=1)
         log_s = np.roll(np.roll(log_d, dy, axis=0), dx, axis=1)
-        val_s = np.roll(np.roll(valid, dy, axis=0), dx, axis=1).copy()
+        val_s = np.roll(np.roll(valid_emit, dy, axis=0), dx, axis=1).copy()
         if dy > 0:
             val_s[:dy, :] = False
         elif dy < 0:
@@ -621,38 +820,197 @@ def compute_indirect_bounce(
         dist = np.sqrt(np.maximum(dist2, 1e-8))
         dir_to_src = delta / dist[..., None]
         facing = np.clip(np.sum(normals * dir_to_src, axis=-1), 0.10, 1.0)
-        depth_weight = np.exp(-np.abs(log_s - log_d) / 0.25)
+        emit_facing = np.clip(np.sum(nrm_s * (-dir_to_src), axis=-1), 0.15, 1.0)
+        # Allow cross-object corner bounce across typical studio depth steps (~0.85 log units).
+        depth_weight = np.exp(-np.abs(log_s - log_d) / 0.85)
         dist_weight = 1.0 / (1.0 + dist2 / max(world_scale * world_scale, 1e-4))
-        weight = np.where(valid & val_s, facing * depth_weight * dist_weight, 0.0).astype(np.float32)
+        weight = np.where(valid & val_s, facing * emit_facing * depth_weight * dist_weight, 0.0).astype(np.float32)
         accum += rad_s * weight[..., None]
         w_sum += weight
 
-    indirect = accum / np.maximum(w_sum[..., None], 1.0)
-    return (indirect * strength).astype(np.float32)
+    local_bounce = accum / np.maximum(w_sum[..., None], 1.0)
+    combined = (0.60 * global_bounce + 0.40 * local_bounce) * non_sky[..., None]
+    # Soft energy conservation cap keeps shadow lift natural without washing contrast.
+    combined = combined / (1.0 + 0.35 * combined)
+    return (combined * strength).astype(np.float32)
+
+
+def compute_volumetric_beam(
+    scene: SceneBuffers,
+    points: np.ndarray,
+    rig: LightingRig,
+    visibility: np.ndarray,
+    settings: EngineSettings,
+) -> np.ndarray:
+    """Subtle depth- and occlusion-aware 3D radial air glow around active point and spot studio lights."""
+    strength = float(getattr(settings, "volumetric_beam_strength", 0.0))
+    if strength <= 0.0 or not rig.lights:
+        return np.zeros((*scene.shape, 3), dtype=np.float32)
+
+    from .scene_policy import classify_scene_scale
+    scale_info = classify_scene_scale(scene)
+    if bool(scale_info["is_landscape"]):
+        # Suppress artificial foreground studio fog pools/cones on macroscopic mountain/landscape scenes.
+        return np.zeros((*scene.shape, 3), dtype=np.float32)
+
+    h, w = scene.shape
+    valid = scene.depth > 0
+    z_med = max(float(np.median(scene.depth[valid])) if np.any(valid) else 2.0, 1.0)
+    scale = max(0.65 * z_med, 0.8)
+    vis_gate = (0.30 + 0.70 * np.clip(visibility, 0.0, 1.0))[..., None]
+
+    glow = np.zeros((h, w, 3), dtype=np.float32)
+    for light in rig.lights:
+        if light.kind not in ("point", "spot", "area") or light.position is None:
+            continue
+        lp = np.asarray(light.position, dtype=np.float32)
+        vec = points - lp[None, None, :]
+        dist2 = np.sum(vec * vec, axis=-1)
+        radial = 1.0 / (1.0 + dist2 / (scale * scale))
+        if light.kind == "spot" and light.direction is not None:
+            sd = np.asarray(light.direction, dtype=np.float32)
+            sd = sd / max(float(np.linalg.norm(sd)), 1e-8)
+            d_ray = vec / np.maximum(np.sqrt(dist2)[..., None], 1e-8)
+            cos_t = np.sum(d_ray * sd[None, None, :], axis=-1)
+            cos_in = math.cos(math.radians(float(light.spot_inner_angle_deg)))
+            cos_out = math.cos(math.radians(float(light.spot_outer_angle_deg)))
+            cone = np.clip((cos_t - cos_out) / max(cos_in - cos_out, 1e-5), 0.0, 1.0)
+            radial = radial * (cone * cone)
+        col = np.asarray(light.color, dtype=np.float32)[None, None, :]
+        glow += (radial[..., None] * col) * (0.20 * min(float(light.strength), 4.0) * strength)
+
+    glow = glow * vis_gate
+    if getattr(settings, "protect_sky", True):
+        from .scene_policy import detect_sky_horizon_mask
+        sky_w = detect_sky_horizon_mask(scene)
+        glow = glow * (1.0 - sky_w)[..., None]
+    return np.clip(glow, 0.0, 0.45).astype(np.float32)
+
+
+def compute_indirect_specular(
+    scene: SceneBuffers,
+    points: np.ndarray,
+    normals: np.ndarray,
+    bounce_diffuse: np.ndarray,
+    settings: EngineSettings,
+) -> np.ndarray:
+    """Apply Fresnel-weighted bounced room radiance to glossy/metallic/clearcoat surfaces."""
+    strength = float(getattr(settings, "indirect_specular_strength", 0.0))
+    if strength <= 0.0 or not np.any(bounce_diffuse > 1e-6):
+        return np.zeros_like(bounce_diffuse, dtype=np.float32)
+
+    roughness, metalness, spec_level, specular_color, clearcoat, clearcoat_roughness, _ = _effective_material_maps(scene)
+    view = _normalize(-points)
+    ndotv = np.clip(np.sum(normals * view, axis=-1), 1e-4, 1.0)[..., None]
+
+    f0_d = np.clip(spec_level, 0.0, 1.0)[..., None]
+    f0_m = np.clip(specular_color, 0.0, 1.0)
+    m_w = np.clip(metalness, 0.0, 1.0)[..., None]
+    f0 = f0_d * (1.0 - m_w) + f0_m * m_w
+    fresnel = f0 + (np.maximum(1.0 - roughness[..., None], f0) - f0) * np.power(1.0 - ndotv, 5.0)
+    gloss_w = np.clip(1.0 - 0.78 * (roughness * roughness), 0.08, 1.0)[..., None]
+    spec_bounce = bounce_diffuse * fresnel * gloss_w
+
+    if bool(np.any(clearcoat > 1e-4)):
+        rc = np.clip(clearcoat_roughness, 0.045, 1.0)[..., None]
+        coat_f = 0.04 + (np.maximum(1.0 - rc, 0.04) - 0.04) * np.power(1.0 - ndotv, 5.0)
+        spec_bounce = spec_bounce + bounce_diffuse * coat_f * clearcoat[..., None] * 0.65
+
+    return (spec_bounce * strength).astype(np.float32)
+
 
 def evaluate_rig(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
-                 normals: np.ndarray, rig: LightingRig, settings: EngineSettings) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                 normals: np.ndarray, rig: LightingRig, settings: EngineSettings,
+                 *, return_details: bool = False):
     rig.validate()
     h, w = scene.depth.shape
     roughness, metalness, spec_level, specular_color, clearcoat, clearcoat_roughness, _ = _effective_material_maps(scene)
-    diffuse_energy = np.clip(1.0 - 0.88 * metalness, 0.08, 1.0).astype(np.float32)[..., None]
+    # Without an HDRI environment map, discrete studio lights miss broad grazing solid angles
+    # that keep polished/brushed metals readable; keep a bounded diffuse floor when no env map is bound.
+    metal_cut = 0.88 if rig.environment is not None else 0.58
+    diffuse_energy = np.clip(1.0 - metal_cut * metalness, 0.08 if rig.environment is not None else 0.32, 1.0).astype(np.float32)[..., None]
+    diffuse_energy = diffuse_energy * (1.0 - 0.5 * np.clip(spec_level, 0.0, 0.35)[..., None])
+    if bool(np.any(clearcoat > 1e-4)):
+        view_amb = _normalize(-points)
+        ndotv_amb = np.clip(np.sum(normals * view_amb, axis=-1), 0.0, 1.0)
+        diffuse_energy = diffuse_energy * (1.0 - 0.25 * clearcoat * (1.0 - ndotv_amb))[..., None]
+    fill_bal = float(np.clip(getattr(settings, "preserve_fill_balance", 0.0), 0.0, 1.0))
+    eff_amb_str = rig.ambient_strength
+    if fill_bal > 0.0 and rig.lights:
+        # Preserve soft omnidirectional room fill on grazing/crevice surfaces when replacing source light.
+        eff_amb_str = max(rig.ambient_strength, rig.ambient_strength + 0.24 * fill_bal)
+
     sky_color = np.asarray(rig.ambient_color, np.float32)[None, None, :]
     if rig.ambient_ground_color is not None:
         ground_color = np.asarray(rig.ambient_ground_color, np.float32)[None, None, :]
         sky_t = np.clip(0.5 * (normals[..., 1] + 1.0), 0.0, 1.0)[..., None]
-        ambient = (ground_color * (1.0 - sky_t) + sky_color * sky_t) * rig.ambient_strength
+        ambient = (ground_color * (1.0 - sky_t) + sky_color * sky_t) * eff_amb_str
+    elif (float(settings.indirect_bounce_strength) > 0.0 or fill_bal > 0.0) and rig.lights:
+        # Subtle hemisphere studio fill weighted toward light warmth for downward-facing undersides.
+        l_cols = np.mean([np.asarray(lt.color, np.float32) for lt in rig.lights], axis=0)[None, None, :]
+        l_cols = l_cols / max(float(np.max(l_cols)), 1e-4)
+        ground_color = (0.72 * sky_color + 0.28 * l_cols).astype(np.float32)
+        sky_t = np.clip(0.5 * (normals[..., 1] + 1.0), 0.0, 1.0)[..., None]
+        ambient = (ground_color * (1.0 - sky_t) + sky_color * sky_t) * eff_amb_str
     else:
-        ambient = sky_color * rig.ambient_strength
-    ambient_term = (np.broadcast_to(ambient, (h, w, 3)).astype(np.float32, copy=True) * diffuse_energy).astype(np.float32)
+        ambient = sky_color * eff_amb_str
+
+    eff_ao = 1.0
+    ssao_s = float(getattr(settings, "ssao_strength", 0.0))
+    if ssao_s > 0.0:
+        from .geometry import compute_screen_space_ao
+        ao_map = compute_screen_space_ao(points, normals, scene.depth)
+        if scene.source_shading is not None:
+            # Suppress redundant SSAO darkening inside already-dark baked source crevices (e.g. finger gaps).
+            sh_arr = scene.source_shading if scene.source_shading.ndim == 2 else luminance(scene.source_shading)
+            ao_gate = np.clip((sh_arr - 0.14) / 0.22, 0.0, 1.0).astype(np.float32)
+        else:
+            ao_gate = 1.0
+        eff_ao = (1.0 - ssao_s * ao_gate * (1.0 - ao_map))[..., None].astype(np.float32)
+
+    ambient_term = (np.broadcast_to(ambient, (h, w, 3)).astype(np.float32, copy=True) * diffuse_energy * eff_ao).astype(np.float32)
 
     direct_diffuse = np.zeros((h, w, 3), np.float32)
     specular = np.zeros((h, w, 3), np.float32)
+    ind_spec_s = float(getattr(settings, "indirect_specular_strength", 0.0))
+    if rig.environment is None and ind_spec_s > 0.0 and rig.lights and np.any(metalness > 0.25):
+        # Provide gentle room-ambient metallic reflection when no explicit HDRI environment map is bound
+        # so bare steel/jewelry does not drop abnormally dark between discrete point-light specular peaks.
+        amb_gloss = np.clip(1.0 - 0.55 * roughness, 0.15, 1.0).astype(np.float32)
+        amb_metal_w = np.clip((metalness - 0.15) / 0.85, 0.0, 1.0).astype(np.float32)
+        specular += (
+            np.broadcast_to(ambient, (h, w, 3))
+            * specular_color
+            * (amb_metal_w * amb_gloss * min(ind_spec_s, 0.65))[..., None]
+            * eff_ao
+        ).astype(np.float32)
     visibility = np.ones((h, w), np.float32)
+    vis_weight_sum = np.zeros((h, w), np.float32)
+    vis_weighted_acc = np.zeros((h, w), np.float32)
+    per_light_records: list[dict] = []
+    per_light_vis: dict[str, np.ndarray] = {}
+
     for light in rig.lights:
         d, s, v = _light_contribution(scene, camera, points, normals, light, settings)
         direct_diffuse += d
         specular += s
         visibility = np.minimum(visibility, v)
+        d_mag = luminance(d) + 1e-4
+        vis_weighted_acc += v * d_mag
+        vis_weight_sum += d_mag
+        lid = light.resolved_id
+        per_light_vis[lid] = v
+        per_light_records.append({
+            "light_id": lid,
+            "name": light.name,
+            "kind": light.kind,
+            "intensity_mode": light.intensity_mode,
+            "diffuse_mean": float(np.mean(d)),
+            "specular_mean": float(np.mean(s)),
+            "visibility_mean": float(np.mean(v)),
+        })
+
+    weighted_vis = (vis_weighted_acc / np.maximum(vis_weight_sum, 1e-6)).astype(np.float32) if rig.lights else visibility
 
     env = rig.environment
     env_active = env is not None and (
@@ -674,8 +1032,14 @@ def evaluate_rig(scene: SceneBuffers, camera: CameraModel, points: np.ndarray,
             (float(env.strength) + (float(env.env_map_strength) if env.env_map is not None else 0.0))
             * float(env.diffuse_strength),
         )
-        diffuse = (ambient_term * (1.0 - env_diff_cov) + direct_diffuse + env_d).astype(np.float32)
+        diffuse = (ambient_term * (1.0 - env_diff_cov) + direct_diffuse + env_d * eff_ao).astype(np.float32)
         specular += env_s
     else:
         diffuse = (ambient_term + direct_diffuse).astype(np.float32)
+    if return_details:
+        return diffuse, specular, visibility, {
+            "per_light_contributions": per_light_records,
+            "per_light_visibility": per_light_vis,
+            "shadow_visibility_weighted": weighted_vis,
+        }
     return diffuse, specular, visibility
